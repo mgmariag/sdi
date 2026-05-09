@@ -23,7 +23,7 @@
                         <Text id="t23" text="{moisture}" />
                         <Text id="t24" text="{temperature}" />
                         <Text id="t25" text="{humidity}" />
-                        <Text text="{irrigation_active}" />
+                        <Text id="t26" text="{irrigation_active}" />
                     </cells>
                 </ColumnListItem>
             </items>

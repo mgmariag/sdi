@@ -6,9 +6,9 @@ import sys   #!!!!
 import matplotlib.pyplot as plt
 
 # ensure project root is on sys.path when running from tools/
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+ROOT = Path(__file__).resolve().parents[1]  #!!!!
+if str(ROOT) not in sys.path:   #!!!!
+    sys.path.insert(0, str(ROOT))    #!!!!
 
 from DigitalTwin import DigitalTwin
 from Simulator import generate_sensor_data
