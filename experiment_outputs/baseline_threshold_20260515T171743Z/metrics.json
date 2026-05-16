@@ -1,0 +1,7 @@
+{
+  "steps": 1000,
+  "timestep_sec": 60,
+  "irrigation_steps": 178,
+  "irrigation_event_count": 155,
+  "percent_time_irrigation": 17.8
+}

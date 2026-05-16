@@ -1,0 +1,6 @@
+PyPDF2
+PyMuPDF
+easyocr
+torch
+matplotlib
+pandas

@@ -1,0 +1,86 @@
+<mvc:View controllerName="disertatie.controller.View1"
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns="sap.m"
+    xmlns:viz="sap.viz.ui5.controls"
+    xmlns:viz.data="sap.viz.ui5.data"
+    xmlns:viz.feeds="sap.viz.ui5.controls.common.feeds">
+    <Page id="page1" title="Digital Twin Experiment">
+        <VBox id="v1" class="sapUiSmallMargin">
+            <Text id="helloMessage" text="{/helloMessage}" />
+            <Panel id="panel1" headerText="Experiment Settings" expandable="false" class="sapUiSmallMarginTop">
+                <VBox id="v2">
+                    <HBox id="h1" alignItems="Center" justifyContent="SpaceBetween">
+                        <Label id="l1" text="Threshold" labelFor="thresholdInput" />
+                        <Input id="thresholdInput" value="{/experimentSettings/threshold}" type="Number" width="8rem" />
+                        <Label id="l2" text="Hysteresis" labelFor="hysteresisInput" />
+                        <Input id="hysteresisInput" value="{/experimentSettings/hysteresis}" type="Number" width="8rem" />
+                        <Label id="l3" text="Flow (L/step)" labelFor="flowInput" />
+                        <Input id="flowInput" value="{/experimentSettings/flow_rate}" type="Number" width="8rem" />
+                        <Button id="b1" text="Run experiment" press="onRunExperiment" type="Emphasized" />
+                    </HBox>
+                </VBox>
+            </Panel>
+            <Panel id="panel2" headerText="Experiment Summary" expandable="false" class="sapUiSmallMarginTop">
+                <VBox id="v3">
+                    <Text id="t1" text="{= 'Total entries: ' + ${/summary/totalEntries}}" />
+                    <Text id="t2" text="{= 'Irrigation events: ' + ${/summary/irrigationEvents}}" />
+                    <Text id="t3" text="{= 'Irrigation steps: ' + ${/summary/irrigationSteps}}" />
+                    <Text id="t4" text="{= 'Total water usage (L): ' + ${/summary/totalWaterUsage}}" />
+                    <Text id="t5" text="{= 'Percent time irrigated: ' + ${/summary/percentTimeIrrigated} + '%'}" />
+                </VBox>
+            </Panel>
+            <Panel id="panel3" headerText="Experiment Charts" expandable="false" class="sapUiSmallMarginTop">
+                <VBox id="v4">
+                    <viz:VizFrame id="dtChart" uiConfig="{applicationSet:'fiori'}" vizType="line" height="400px" width="100%">
+                        <viz:dataset>
+                            <viz.data:FlattenedDataset id="dtDataset" data="{/processedEntries}">
+                                <viz.data:dimensions>
+                                    <viz.data:DimensionDefinition id="stepDim" name="Step" value="{step}" />
+                                </viz.data:dimensions>
+                                <viz.data:measures>
+                                    <viz.data:MeasureDefinition id="m1" name="Moisture" value="{moisture}" />
+                                    <viz.data:MeasureDefinition id="m2" name="Water Usage" value="{water_usage_l}" />
+                                </viz.data:measures>
+                            </viz.data:FlattenedDataset>
+                        </viz:dataset>
+                        <viz:feeds>
+                            <viz.feeds:FeedItem id="fi1" uid="valueAxis" type="Measure" values="Moisture,Water Usage" />
+                            <viz.feeds:FeedItem id="fi2" uid="categoryAxis" type="Dimension" values="Step" />
+                        </viz:feeds>
+                    </viz:VizFrame>
+                </VBox>
+            </Panel>
+            <Panel id="panel4" headerText="Digital Twin Results" expandable="false" class="sapUiSmallMarginTop">
+                <Table id="dtTable" items="{/processedEntries}">
+                    <headerToolbar>
+                        <Toolbar id="_IDGenToolbar">
+                            <Title id="title1" text="Digital Twin Entry Log" />
+                        </Toolbar>
+                    </headerToolbar>
+                    <columns>
+                        <Column id="c1"><Text text="Timestamp" id="Timestamp" /></Column>
+                        <Column id="c2"><Text text="Moisture" id="Moisture" /></Column>
+                        <Column id="c3"><Text text="Temperature" id="Temperature" /></Column>
+                        <Column id="c4"><Text text="Humidity" id="Humidity" /></Column>
+                        <Column id="c5"><Text text="Rain" id="Rain" /></Column>
+                        <Column id="c6"><Text text="Irrigation" id="Irrigation" /></Column>
+                        <Column id="c7"><Text text="Water (L)" id="Water" /></Column>
+                    </columns>
+                    <items>
+                        <ColumnListItem id="_IDGenColumnListItem">
+                            <cells>
+                                <Text id="t7" text="{timestamp}" />
+                                <Text id="t8" text="{moisture}" />
+                                <Text id="t9" text="{temperature}" />
+                                <Text id="t10" text="{humidity}" />
+                                <Text id="t11" text="{= ${rain_prediction} ? 'Yes' : 'No'}" />
+                                <Text id="t12" text="{= ${irrigation_active} ? 'Yes' : 'No'}" />
+                                <Text id="t13" text="{water_usage_l}" />
+                            </cells>
+                        </ColumnListItem>
+                    </items>
+                </Table>
+            </Panel>
+        </VBox>
+    </Page>
+</mvc:View>
