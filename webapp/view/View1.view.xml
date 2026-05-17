@@ -4,78 +4,221 @@
     xmlns:viz="sap.viz.ui5.controls"
     xmlns:viz.data="sap.viz.ui5.data"
     xmlns:viz.feeds="sap.viz.ui5.controls.common.feeds">
-    <Page id="page1" title="Digital Twin Experiment">
-        <VBox id="v1" class="sapUiSmallMargin">
-            <Text id="helloMessage" text="{/helloMessage}" />
-            <Panel id="panel1" headerText="Experiment Settings" expandable="false" class="sapUiSmallMarginTop">
-                <VBox id="v2">
-                    <HBox id="h1" alignItems="Center" justifyContent="SpaceBetween">
-                        <Label id="l1" text="Threshold" labelFor="thresholdInput" />
-                        <Input id="thresholdInput" value="{/experimentSettings/threshold}" type="Number" width="8rem" />
-                        <Label id="l2" text="Hysteresis" labelFor="hysteresisInput" />
-                        <Input id="hysteresisInput" value="{/experimentSettings/hysteresis}" type="Number" width="8rem" />
-                        <Label id="l3" text="Flow (L/step)" labelFor="flowInput" />
-                        <Input id="flowInput" value="{/experimentSettings/flow_rate}" type="Number" width="8rem" />
-                        <Button id="b1" text="Run experiment" press="onRunExperiment" type="Emphasized" />
+    <Page id="page1" title="Digital Twin (DT) for Irrigation Systems - Experiments">
+        <VBox id="v1" class="sapUiSmallMargin experimentPage">
+            <Text id="helloMessage" text="{/helloMessage}" class="experimentHeadline" />
+            <Panel id="settingsPanel" headerText="Parameters" expandable="false" class="sapUiSmallMarginTop experimentPanel">
+                <VBox>
+                    <HBox alignItems="Center" justifyContent="SpaceBetween" class="experimentControlRow">
+                        <VBox>
+                            <Label text="Threshold" labelFor="thresholdInput" />
+                            <Input id="thresholdInput" value="{/experimentSettings/threshold}" type="Number" width="8rem" />
+                        </VBox>
+                        <VBox>
+                            <Label text="Hysteresis" labelFor="hysteresisInput" />
+                            <Input id="hysteresisInput" value="{/experimentSettings/hysteresis}" type="Number" width="8rem" />
+                        </VBox>
+                        <VBox>
+                            <Label text="Flow (mL/step)" labelFor="flowInput" />
+                            <Input id="flowInput" value="{/experimentSettings/flow_rate_ml}" type="Number" width="8rem" />
+                        </VBox>
+                        <VBox>
+                            <Label text="Scenario seed" labelFor="seedInput" />
+                            <Input id="seedInput" value="{/experimentSettings/scenario_seed}" type="Number" width="8rem" />
+                        </VBox>
+                        <HBox class="experimentButtonGroup" alignItems="Center" justifyContent="SpaceBetween">
+                            <Button text="Baseline" press="onRunExperiment" type="Accept" class="experimentButton baselineButton" />
+                            <Button text="Sampling" press="onRunSamplingExperiment" type="Emphasized" class="experimentButton samplingButton" />
+                            <Button text="ANFIS-GA" press="onRunAnfisExperiment" type="Accept" class="experimentButton anfisButton" />
+                        </HBox>
                     </HBox>
                 </VBox>
             </Panel>
-            <Panel id="panel2" headerText="Experiment Summary" expandable="false" class="sapUiSmallMarginTop">
-                <VBox id="v3">
-                    <Text id="t1" text="{= 'Total entries: ' + ${/summary/totalEntries}}" />
-                    <Text id="t2" text="{= 'Irrigation events: ' + ${/summary/irrigationEvents}}" />
-                    <Text id="t3" text="{= 'Irrigation steps: ' + ${/summary/irrigationSteps}}" />
-                    <Text id="t4" text="{= 'Total water usage (L): ' + ${/summary/totalWaterUsage}}" />
-                    <Text id="t5" text="{= 'Percent time irrigated: ' + ${/summary/percentTimeIrrigated} + '%'}" />
+
+            <Text id="activeText" class="sapUiSmallMarginTop" text="{= ${/activeExperiment} === 'baseline' ? 'Threshold experiment results' : ${/activeExperiment} === 'sampling' ? 'Sampling experiment results' : ${/activeExperiment} === 'anfis' ? 'ANFIS decision experiment results' : 'Choose an experiment to run from the buttons above.' }" />
+
+            <Panel id="baselinePanel" headerText="Baseline Simulation" expandable="false" visible="{= ${/activeExperiment} === 'baseline'}" class="sapUiSmallMarginTop baselinePanel experimentPanel">
+                <VBox class="busyWrapper" visible="{/isLoading}">
+                    <BusyIndicator visible="{/isLoading}" text="Running threshold experiment..." />
                 </VBox>
-            </Panel>
-            <Panel id="panel3" headerText="Experiment Charts" expandable="false" class="sapUiSmallMarginTop">
-                <VBox id="v4">
-                    <viz:VizFrame id="dtChart" uiConfig="{applicationSet:'fiori'}" vizType="line" height="400px" width="100%">
-                        <viz:dataset>
-                            <viz.data:FlattenedDataset id="dtDataset" data="{/processedEntries}">
-                                <viz.data:dimensions>
-                                    <viz.data:DimensionDefinition id="stepDim" name="Step" value="{step}" />
-                                </viz.data:dimensions>
-                                <viz.data:measures>
-                                    <viz.data:MeasureDefinition id="m1" name="Moisture" value="{moisture}" />
-                                    <viz.data:MeasureDefinition id="m2" name="Water Usage" value="{water_usage_l}" />
-                                </viz.data:measures>
-                            </viz.data:FlattenedDataset>
-                        </viz:dataset>
-                        <viz:feeds>
-                            <viz.feeds:FeedItem id="fi1" uid="valueAxis" type="Measure" values="Moisture,Water Usage" />
-                            <viz.feeds:FeedItem id="fi2" uid="categoryAxis" type="Dimension" values="Step" />
-                        </viz:feeds>
-                    </viz:VizFrame>
+                <VBox class="summarySection">
+                    <Text text="{= 'Total entries: ' + ${/summary/totalEntries}}" />
+                    <Text text="{= 'Irrigation events: ' + ${/summary/irrigationEvents}}" />
+                    <Text text="{= 'Irrigation steps: ' + ${/summary/irrigationSteps}}" />
+                    <Text text="{= 'Total water usage (L): ' + ${/summary/totalWaterUsage}}" />
+                    <Text text="{= 'Percent time irrigated: ' + ${/summary/percentTimeIrrigated} + '%'}" />
                 </VBox>
-            </Panel>
-            <Panel id="panel4" headerText="Digital Twin Results" expandable="false" class="sapUiSmallMarginTop">
-                <Table id="dtTable" items="{/processedEntries}">
+                <viz:VizFrame id="baselineChart" uiConfig="{applicationSet:'fiori'}" vizType="line" height="400px" width="100%">
+                    <viz:dataset>
+                        <viz.data:FlattenedDataset data="{/baselineEntries}">
+                            <viz.data:dimensions>
+                                <viz.data:DimensionDefinition name="Step" value="{step}" />
+                            </viz.data:dimensions>
+                            <viz.data:measures>
+                                <viz.data:MeasureDefinition name="Moisture" value="{moisture}" />
+                                <viz.data:MeasureDefinition name="Water Usage" value="{water_usage_ml}" />
+                            </viz.data:measures>
+                        </viz.data:FlattenedDataset>
+                    </viz:dataset>
+                    <viz:feeds>
+                        <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Moisture,Water Usage" />
+                        <viz.feeds:FeedItem uid="categoryAxis" type="Dimension" values="Step" />
+                    </viz:feeds>
+                </viz:VizFrame>
+                <Table id="baselineDataTable" class="experimentDataTable" items="{/baselineEntries}" growing="true" growingThreshold="20" growingScrollToLoad="false">
                     <headerToolbar>
-                        <Toolbar id="_IDGenToolbar">
-                            <Title id="title1" text="Digital Twin Entry Log" />
+                        <Toolbar id="baselineDataToolbar">
+                            <Title id="baselineDataTitle" text="Experiment data" />
                         </Toolbar>
                     </headerToolbar>
                     <columns>
-                        <Column id="c1"><Text text="Timestamp" id="Timestamp" /></Column>
-                        <Column id="c2"><Text text="Moisture" id="Moisture" /></Column>
-                        <Column id="c3"><Text text="Temperature" id="Temperature" /></Column>
-                        <Column id="c4"><Text text="Humidity" id="Humidity" /></Column>
-                        <Column id="c5"><Text text="Rain" id="Rain" /></Column>
-                        <Column id="c6"><Text text="Irrigation" id="Irrigation" /></Column>
-                        <Column id="c7"><Text text="Water (L)" id="Water" /></Column>
+                        <Column id="baselineStepCol"><Text id="baselineStepHeader" text="Step" /></Column>
+                        <Column id="baselineMoistureCol"><Text id="baselineMoistureHeader" text="Moisture (%)" /></Column>
+                        <Column id="baselineTempCol"><Text id="baselineTempHeader" text="Temperature" /></Column>
+                        <Column id="baselineHumidityCol"><Text id="baselineHumidityHeader" text="Humidity" /></Column>
+                        <Column id="baselineRainCol"><Text id="baselineRainHeader" text="Rain" /></Column>
+                        <Column id="baselineIrrigationCol"><Text id="baselineIrrigationHeader" text="Irrigation" /></Column>
+                        <Column id="baselineWaterCol"><Text id="baselineWaterHeader" text="Water Usage (mL)" /></Column>
                     </columns>
                     <items>
-                        <ColumnListItem id="_IDGenColumnListItem">
+                        <ColumnListItem id="baselineDataRow">
                             <cells>
-                                <Text id="t7" text="{timestamp}" />
-                                <Text id="t8" text="{moisture}" />
-                                <Text id="t9" text="{temperature}" />
-                                <Text id="t10" text="{humidity}" />
-                                <Text id="t11" text="{= ${rain_prediction} ? 'Yes' : 'No'}" />
-                                <Text id="t12" text="{= ${irrigation_active} ? 'Yes' : 'No'}" />
-                                <Text id="t13" text="{water_usage_l}" />
+                                <Text id="baselineStepCell" text="{step}" />
+                                <Text id="baselineMoistureCell" text="{moisture}" />
+                                <Text id="baselineTempCell" text="{temperature}" />
+                                <Text id="baselineHumidityCell" text="{humidity}" />
+                                <Text id="baselineRainCell" text="{rain_prediction}" />
+                                <Text id="baselineIrrigationCell" text="{irrigation_active}" />
+                                <Text id="baselineWaterCell" text="{water_usage_ml}" />
+                            </cells>
+                        </ColumnListItem>
+                    </items>
+                </Table>
+            </Panel>
+
+            <Panel id="samplingPanel" headerText="Sampling Optimization" expandable="false" visible="{= ${/activeExperiment} === 'sampling'}" class="sapUiSmallMarginTop samplingPanel experimentPanel">
+                <VBox class="busyWrapper" visible="{/isSamplingLoading}">
+                    <BusyIndicator visible="{/isSamplingLoading}" text="Running sampling experiment..." />
+                </VBox>
+                <VBox class="summarySection">
+                    <Text text="{= 'Accuracy: ' + ${/samplingSummary/accuracy_percent} + '%'}" />
+                    <Text text="{= 'Mismatch steps: ' + ${/samplingSummary/mismatch_steps}}" />
+                    <Text text="{= 'Baseline water usage (L): ' + ${/samplingSummary/baseline_total_water_usage_l}}" />
+                    <Text text="{= 'Sparse water usage (L): ' + ${/samplingSummary/sparse_total_water_usage_l}}" />
+                    <Text text="{= 'Baseline irrigation events: ' + ${/samplingSummary/baseline_irrigation_event_count}}" />
+                    <Text text="{= 'Sparse irrigation events: ' + ${/samplingSummary/sparse_irrigation_event_count}}" />
+                </VBox>
+                <viz:VizFrame id="samplingChart" uiConfig="{applicationSet:'fiori'}" vizType="line" height="400px" width="100%">
+                    <viz:dataset>
+                        <viz.data:FlattenedDataset data="{/samplingEntries}">
+                            <viz.data:dimensions>
+                                <viz.data:DimensionDefinition name="Step" value="{step}" />
+                            </viz.data:dimensions>
+                            <viz.data:measures>
+                                <viz.data:MeasureDefinition name="Sparse Moisture" value="{sparse_moisture}" />
+                                <viz.data:MeasureDefinition name="Sparse Water Usage" value="{sparse_water_usage_ml}" />
+                            </viz.data:measures>
+                        </viz.data:FlattenedDataset>
+                    </viz:dataset>
+                    <viz:feeds>
+                        <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Sparse Moisture,Sparse Water Usage" />
+                        <viz.feeds:FeedItem uid="categoryAxis" type="Dimension" values="Step" />
+                    </viz:feeds>
+                </viz:VizFrame>
+                <Table id="samplingDataTable" class="experimentDataTable" items="{/samplingEntries}" growing="true" growingThreshold="20" growingScrollToLoad="false">
+                    <headerToolbar>
+                        <Toolbar id="samplingDataToolbar">
+                            <Title id="samplingDataTitle" text="Experiment data" />
+                        </Toolbar>
+                    </headerToolbar>
+                    <columns>
+                        <Column id="samplingStepCol"><Text id="samplingStepHeader" text="Step" /></Column>
+                        <Column id="samplingBaselineMoistureCol"><Text id="samplingBaselineMoistureHeader" text="Baseline Moisture (%)" /></Column>
+                        <Column id="samplingSparseMoistureCol"><Text id="samplingSparseMoistureHeader" text="Sparse Moisture (%)" /></Column>
+                        <Column id="samplingRainCol"><Text id="samplingRainHeader" text="Rain" /></Column>
+                        <Column id="samplingBaselineIrrigationCol"><Text id="samplingBaselineIrrigationHeader" text="Baseline Irrigation" /></Column>
+                        <Column id="samplingSparseIrrigationCol"><Text id="samplingSparseIrrigationHeader" text="Sparse Irrigation" /></Column>
+                        <Column id="samplingSparseWaterCol"><Text id="samplingSparseWaterHeader" text="Sparse Water (mL)" /></Column>
+                    </columns>
+                    <items>
+                        <ColumnListItem id="samplingDataRow">
+                            <cells>
+                                <Text id="samplingStepCell" text="{step}" />
+                                <Text id="samplingBaselineMoistureCell" text="{baseline_moisture}" />
+                                <Text id="samplingSparseMoistureCell" text="{sparse_moisture}" />
+                                <Text id="samplingRainCell" text="{rain_prediction}" />
+                                <Text id="samplingBaselineIrrigationCell" text="{baseline_irrigation_active}" />
+                                <Text id="samplingSparseIrrigationCell" text="{sparse_irrigation_active}" />
+                                <Text id="samplingSparseWaterCell" text="{sparse_water_usage_ml}" />
+                            </cells>
+                        </ColumnListItem>
+                    </items>
+                </Table>
+            </Panel>
+
+            <Panel id="anfisPanel" headerText="ANFIS Intelligent Control" expandable="false" visible="{= ${/activeExperiment} === 'anfis'}" class="sapUiSmallMarginTop anfisPanel experimentPanel">
+                <VBox class="busyWrapper" visible="{/isAnfisLoading}">
+                    <BusyIndicator visible="{/isAnfisLoading}" text="Running ANFIS experiment..." />
+                </VBox>
+                <HBox class="summarySection summaryColumns" width="100%" justifyContent="SpaceBetween">
+                    <VBox class="summaryColumn">
+                        <Text text="{= 'Baseline irrigation events: ' + ${/anfisSummary/baseline_irrigation_event_count}}" />
+                        <Text text="{= 'ANFIS irrigation events: ' + ${/anfisSummary/anfis_irrigation_event_count}}" />
+                        <Text text="{= 'Baseline water usage (L): ' + ${/anfisSummary/baseline_total_water_usage_l}}" />
+                        <Text text="{= 'ANFIS water usage (L): ' + ${/anfisSummary/anfis_total_water_usage_l}}" />
+                        <Text text="{= ''}" />
+                        <Text text="{= 'Test accuracy: ' + ${/anfisSummary/test_accuracy_percent} + '%'}" />
+                        <Text text="{= 'Execution time: ' + ${/anfisSummary/execution_time_seconds} + ' s'}" />
+                    </VBox>
+                    <VBox class="summaryColumn probabilitySummaryColumn">
+                        <Text text="{= 'Predicted probability mean: ' + ${/anfisSummary/predicted_probability_mean}}" />
+                        <Text text="{= 'Predicted probability min: ' + ${/anfisSummary/predicted_probability_min}}" />
+                        <Text text="{= 'Predicted probability max: ' + ${/anfisSummary/predicted_probability_max}}" />
+                    </VBox>
+                </HBox>
+                <viz:VizFrame id="anfisChart" uiConfig="{applicationSet:'fiori'}" vizType="line" height="400px" width="100%">
+                    <viz:dataset>
+                        <viz.data:FlattenedDataset data="{/anfisEntries}">
+                            <viz.data:dimensions>
+                                <viz.data:DimensionDefinition name="Step" value="{step}" />
+                            </viz.data:dimensions>
+                            <viz.data:measures>
+                                <viz.data:MeasureDefinition name="ANFIS Moisture" value="{anfis_moisture}" />
+                                <viz.data:MeasureDefinition name="Predicted Probability" value="{predicted_probability_percent}" />
+                                <viz.data:MeasureDefinition name="ANFIS Water Usage" value="{anfis_water_usage_ml}" />
+                            </viz.data:measures>
+                        </viz.data:FlattenedDataset>
+                    </viz:dataset>
+                    <viz:feeds>
+                        <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="ANFIS Moisture,Predicted Probability,ANFIS Water Usage" />
+                        <viz.feeds:FeedItem uid="categoryAxis" type="Dimension" values="Step" />
+                    </viz:feeds>
+                </viz:VizFrame>
+                <Table id="anfisDataTable" class="experimentDataTable" items="{/anfisEntries}" growing="true" growingThreshold="20" growingScrollToLoad="false">
+                    <headerToolbar>
+                        <Toolbar id="anfisDataToolbar">
+                            <Title id="anfisDataTitle" text="Experiment data" />
+                        </Toolbar>
+                    </headerToolbar>
+                    <columns>
+                        <Column id="anfisStepCol"><Text id="anfisStepHeader" text="Step" /></Column>
+                        <Column id="anfisMoistureCol"><Text id="anfisMoistureHeader" text="ANFIS Moisture (%)" /></Column>
+                        <Column id="anfisProbabilityCol"><Text id="anfisProbabilityHeader" text="Predicted Probability" /></Column>
+                        <Column id="anfisCategoryCol"><Text id="anfisCategoryHeader" text="Category" /></Column>
+                        <Column id="anfisBaselineIrrigationCol"><Text id="anfisBaselineIrrigationHeader" text="Baseline Irrigation" /></Column>
+                        <Column id="anfisIrrigationCol"><Text id="anfisIrrigationHeader" text="ANFIS Irrigation" /></Column>
+                        <Column id="anfisWaterCol"><Text id="anfisWaterHeader" text="ANFIS Water (mL)" /></Column>
+                    </columns>
+                    <items>
+                        <ColumnListItem id="anfisDataRow">
+                            <cells>
+                                <Text id="anfisStepCell" text="{step}" />
+                                <Text id="anfisMoistureCell" text="{anfis_moisture}" />
+                                <Text id="anfisProbabilityCell" text="{predicted_probability}" />
+                                <Text id="anfisCategoryCell" text="{predicted_category}" />
+                                <Text id="anfisBaselineIrrigationCell" text="{baseline_irrigation_active}" />
+                                <Text id="anfisIrrigationCell" text="{anfis_irrigation_active}" />
+                                <Text id="anfisWaterCell" text="{anfis_water_usage_ml}" />
                             </cells>
                         </ColumnListItem>
                     </items>

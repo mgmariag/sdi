@@ -1,10 +1,9 @@
 import random
 
 
-def get_weather_prediction():
-    rain_probability = random.randint(0, 100)
+def get_weather_prediction(rng=None):
+    if rng is None:
+        rng = random
 
-    if rain_probability > 70:
-        return True
-
-    return False
+    rain_probability = rng.randint(0, 100)
+    return rain_probability > 70

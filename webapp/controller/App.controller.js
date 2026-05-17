@@ -6,7 +6,7 @@ sap.ui.define([
 
   return BaseController.extend("disertatie.controller.App", {
       onInit() {
-          MessageBox.alert("Welcome to the app!");
+         // MessageBox.alert("Welcome to the app!");
       }
   });
 });

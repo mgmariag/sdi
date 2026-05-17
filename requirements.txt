@@ -4,3 +4,5 @@ easyocr
 torch
 matplotlib
 pandas
+fastapi
+uvicorn

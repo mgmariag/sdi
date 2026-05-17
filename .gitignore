@@ -9,5 +9,6 @@ resources
 archive.zip
 .*_mta_build_tmp
 docs_texts/*
+experiment_outputs/
 __pycache__/*
 *.pdf
