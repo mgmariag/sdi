@@ -1,35 +1,60 @@
-## Application Details
-|               |
-| ------------- |
-|**Generation Date and Time**<br>Sat May 09 2026 19:54:21 GMT+0300 (Eastern European Summer Time)|
-|**App Generator**<br>SAP Fiori Application Generator|
-|**App Generator Version**<br>1.23.0|
-|**Generation Platform**<br>Visual Studio Code|
-|**Template Used**<br>Basic|
-|**Service Type**<br>None|
-|**Service URL**<br>N/A|
-|**Module Name**<br>disertatie|
-|**Application Title**<br>App Title|
-|**Namespace**<br>|
-|**UI5 Theme**<br>sap_horizon|
-|**UI5 Version**<br>1.147.2|
-|**Enable TypeScript**<br>False|
-|**Add Eslint configuration**<br>True, see https://www.npmjs.com/package/@sap-ux/eslint-plugin-fiori-tools#rules for the eslint rules.|
+# Digital Twin Irrigation System
 
-## disertatie
+Master's thesis application for simulating and evaluating irrigation decisions with a database-backed digital twin.
 
-An SAP Fiori application.
+## Architecture
 
-### Starting the generated app
+The application is split into explicit services:
 
--   This app has been generated using the SAP Fiori tools - App Generator, as part of the SAP Fiori tools suite.  To launch the generated application, run the following from the generated application root folder:
+| Service | Port | Responsibility |
+| --- | ---: | --- |
+| `frontend` | `8080` | SAPUI5 user interface served by Nginx |
+| `backend` | `8000` | UI-facing API, pot metadata, experiment execution, cached experiment results |
+| `weather-service` | `8001` | Open-Meteo ingestion and weather cache maintenance |
+| `sensor-service` | `8002` | Scheduled simulated sensor readings and sensor database updates |
+| `postgres` | `5432` | Shared persistent database |
 
+The frontend calls the `backend` through `/api/...`. Ingestion operations are separated into their own services so weather refreshes and sensor updates do not run inside the UI API process.
+
+## Important Folders
+
+- `digital_twin/` - package-based backend architecture with API routers, config, repositories, domain contracts, services, workers, and scripts.
+- `backend/` - FastAPI app and experiment cache/service orchestration.
+- `services/` - standalone ingestion service entrypoints.
+- `tools/` - domain simulation, ANFIS, sensor generation, and offline scripts.
+- `webapp/` - SAPUI5 frontend.
+- `database.py` - compatibility module for schema initialization, seed data, and data access helpers now surfaced through `digital_twin.db`.
+- `weather_ingestion.py` - compatibility module for Open-Meteo retrieval and weather persistence now surfaced through `digital_twin.services`.
+
+The legacy entrypoints remain stable:
+
+- `backend.api:app` imports the UI-facing API from `digital_twin.api.main`.
+- `services.weather_api:app` imports the weather service from `digital_twin.api.weather_app`.
+- `services.sensor_api:app` imports the sensor service from `digital_twin.api.sensor_app`.
+
+## Running With Docker
+
+```powershell
+docker compose build
+docker compose up -d --force-recreate
 ```
-    npm start
+
+Open the UI at:
+
+```text
+http://localhost:8080
 ```
 
-#### Pre-requisites:
+Useful service endpoints:
 
-1. Active NodeJS LTS (Long Term Support) version and associated supported NPM version.  (See https://nodejs.org)
+- Main API: `http://localhost:8000/api/hello`
+- Weather service health: `http://localhost:8001/health`
+- Sensor service health: `http://localhost:8002/health`
 
+## Local Verification
 
+```powershell
+python -m py_compile .\hello.py .\backend\api.py .\backend\cache.py .\backend\experiment_service.py .\services\weather_api.py .\services\sensor_api.py .\tools\daily_irrigation.py .\tools\sensor_readings.py .\weather_ingestion.py .\database.py .\digital_twin\api\main.py .\digital_twin\api\weather_app.py .\digital_twin\api\sensor_app.py
+npm.cmd run build
+docker compose config
+```

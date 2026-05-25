@@ -12,9 +12,13 @@
     --dt-line: rgba(77, 130, 216, 0.2);
 }
 
-.experimentPage {
-    min-height: calc(100vh - 2rem);
-    padding: 1rem;
+body .experimentPage {
+    box-sizing: border-box;
+    width: min(calc(100% - 2rem), 82rem) !important;
+    max-width: 82rem;
+    min-height: auto;
+    margin: 0 auto;
+    padding: 1rem 1.25rem 1.5rem;
     background:
         linear-gradient(135deg, rgba(200, 220, 255, 0.72), rgba(199, 247, 255, 0.54) 52%, rgba(228, 255, 195, 0.48)),
         #f7fbff;
@@ -50,10 +54,14 @@
     font-weight: 700;
 }
 
-.experimentControlRow {
+.experimentPanel .sapMPanelContent {
+    padding: 0.85rem 1rem 1rem;
+}
+
+body .experimentControlRow {
     gap: 1rem;
     flex-wrap: wrap;
-    align-items: flex-end;
+    align-items: center;
 }
 
 .experimentControlRow .sapMLabel {
@@ -75,18 +83,22 @@
     box-shadow: 0 0 0 0.15rem rgba(67, 191, 210, 0.14);
 }
 
-.experimentButtonGroup {
+body .experimentButtonGroup {
     gap: 0.75rem;
     flex-wrap: wrap;
+    align-self: center;
+    padding-top: 0.35rem;
 }
 
 .experimentButton {
-    min-width: 9rem;
+    min-width: 9.5rem;
     font-weight: 700;
+    height: 2.25rem;
+    padding: 0.4rem;
 }
 
 .experimentButton .sapMBtnInner {
-    height: 2.5rem;
+    height: 2.25rem;
     border: 1px solid transparent !important;
     border-radius: 0.5rem !important;
     color: var(--dt-ink) !important;
@@ -163,7 +175,12 @@
     border: 1px solid rgba(77, 130, 216, 0.14);
     border-radius: 0.5rem;
     background: rgba(255, 255, 255, 0.92);
-    overflow: hidden;
+    overflow: visible;
+    position: relative;
+}
+
+.sapVizFrame svg {
+    overflow: visible;
 }
 
 .experimentDataTable {
@@ -187,4 +204,16 @@
 .sapMText,
 .sapMLabel {
     color: var(--dt-ink);
+}
+
+@media (max-width: 48rem) {
+    .experimentPage {
+        width: 100%;
+        padding: 0.75rem;
+    }
+
+    .experimentButtonGroup,
+    .experimentButton {
+        width: 100%;
+    }
 }

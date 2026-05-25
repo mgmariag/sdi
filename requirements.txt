@@ -6,3 +6,4 @@ matplotlib
 pandas
 fastapi
 uvicorn
+psycopg[binary]
