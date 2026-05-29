@@ -20,6 +20,10 @@ def _env_int(name: str, default: int) -> int:
     return int(value)
 
 
+def _default_worker_count() -> int:
+    return max(1, min(8, (os.cpu_count() or 2) - 1))
+
+
 def _env_date(name: str, default: date) -> date:
     value = os.getenv(name)
     if value is None or value.strip() == "":
@@ -70,7 +74,7 @@ class Settings:
     experiment_precompute_related: bool = True
     experiment_precompute_anfis: bool = True
     default_scenario_seed: int = 2026
-    default_anfis_parallel_workers: int = 20
+    default_anfis_parallel_workers: int = field(default_factory=_default_worker_count)
     default_anfis_parallel_backend: str = "process"
 
 
@@ -91,6 +95,6 @@ def get_settings() -> Settings:
         experiment_snapshot_cache_ttl_seconds=_env_int("EXPERIMENT_SNAPSHOT_CACHE_TTL_SECONDS", 15 * 60),
         experiment_precompute_related=_env_bool("EXPERIMENT_PRECOMPUTE_RELATED", True),
         experiment_precompute_anfis=_env_bool("EXPERIMENT_PRECOMPUTE_ANFIS", True),
-        default_anfis_parallel_workers=_env_int("DEFAULT_ANFIS_PARALLEL_WORKERS", 20),
+        default_anfis_parallel_workers=_env_int("DEFAULT_ANFIS_PARALLEL_WORKERS", _default_worker_count()),
         default_anfis_parallel_backend=os.getenv("DEFAULT_ANFIS_PARALLEL_BACKEND", "process"),
     )

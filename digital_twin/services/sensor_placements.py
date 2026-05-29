@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from digital_twin.db.sensor_placement_repository import SensorPlacementRepository
+from digital_twin.db.repositories.sensor_repository import SensorPlacementRepository
 
 
 DEFAULT_SENSOR_COUNT = 4
@@ -22,7 +22,7 @@ class SensorPlacementService:
         if current["items"]:
             current["changed"] = False
             return current
-        return self.recommend(DEFAULT_SENSOR_COUNT)
+        return self.recommend(int(current.get("sensor_count") or DEFAULT_SENSOR_COUNT))
 
     def recommend(self, sensor_count: int = DEFAULT_SENSOR_COUNT) -> dict[str, Any]:
         pots = self.repository.active_pots()
@@ -172,3 +172,4 @@ def _size_label(pot: dict[str, Any]) -> str:
 
 
 __all__ = ["DEFAULT_SENSOR_COUNT", "SensorPlacementService"]
+

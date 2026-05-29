@@ -1,1 +1,0 @@
-"""Standalone ingestion service entrypoints."""

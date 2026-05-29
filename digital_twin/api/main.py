@@ -7,10 +7,10 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from digital_twin.api.routes import actuation, experiments, health, pots, sensors, weather
+from digital_twin.api.routes import experiments, sensors, weather
 from digital_twin.core.config import get_settings
 from digital_twin.db.schema import initialize_database
-from digital_twin.services.sensors import SensorService
+from digital_twin.services.sensor_service import SensorService
 
 
 logger = logging.getLogger("digital_twin.api")
@@ -48,13 +48,12 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    app.include_router(health.router)
-    app.include_router(pots.router)
+    app.include_router(sensors.system_router)
     app.include_router(sensors.api_router)
     app.include_router(weather.api_router)
-    app.include_router(actuation.api_router)
     app.include_router(experiments.router)
     return app
 
 
 app = create_app()
+

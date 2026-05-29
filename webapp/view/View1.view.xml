@@ -1,5 +1,6 @@
 <mvc:View controllerName="disertatie.controller.View1"
     xmlns:mvc="sap.ui.core.mvc"
+    xmlns:core="sap.ui.core"
     xmlns="sap.m"
     xmlns:viz="sap.viz.ui5.controls"
     xmlns:viz.data="sap.viz.ui5.data"
@@ -13,160 +14,72 @@
                     <HBox alignItems="Center" justifyContent="SpaceBetween" class="experimentControlRow">
                         <VBox>
                             <Label text="Start date" labelFor="startDateInput" />
-                            <DatePicker id="startDateInput" value="{/experimentSettings/start_date}" valueFormat="yyyy-MM-dd" displayFormat="yyyy-MM-dd" width="9rem" />
+                            <DatePicker id="startDateInput" value="{/experimentSettings/start_date}" valueFormat="yyyy-MM-dd" displayFormat="yyyy-MM-dd" width="9rem" change="onDateChange" />
                         </VBox>
                         <VBox>
                             <Label text="End date" labelFor="endDateInput" />
-                            <DatePicker id="endDateInput" value="{/experimentSettings/end_date}" valueFormat="yyyy-MM-dd" displayFormat="yyyy-MM-dd" width="9rem" />
-                        </VBox>
-                        <VBox>
-                            <Label text="Sample interval (hours)" labelFor="sampleIntervalInput" />
-                            <Input id="sampleIntervalInput" value="{/samplingSettings/sample_interval_hours}" type="Number" width="8rem" />
+                            <DatePicker id="endDateInput" value="{/experimentSettings/end_date}" valueFormat="yyyy-MM-dd" displayFormat="yyyy-MM-dd" width="9rem" change="onDateChange" />
                         </VBox>
                         <VBox>
                             <Label text="Sensors" labelFor="sensorCountInput" />
-                            <Input id="sensorCountInput" value="{/sensorSettings/sensor_count}" type="Number" width="6rem" showValueHelp="true" valueHelpRequest="onSensorLocationHelp" />
+                            <Input id="sensorCountInput" value="{/sensorSettings/sensor_count}" type="Number" width="6rem" showValueHelp="true" valueHelpRequest="onOpenSensorPlacement" />
                         </VBox>
                         <HBox class="experimentButtonGroup" alignItems="Center" justifyContent="SpaceBetween">
-                            <Button text="Baseline" press="onRunExperiment" type="Accept" class="experimentButton baselineButton" />
-                            <Button text="Sampling" press="onRunSamplingExperiment" type="Emphasized" class="experimentButton samplingButton" />
-                            <Button text="ANFIS-GA" press="onRunAnfisExperiment" type="Accept" class="experimentButton anfisButton" />
+                            <VBox class="samplingParameterControl" width="8rem">
+                                <Label text="Sample interval (h)" labelFor="sampleIntervalInput" />
+                                <Input id="sampleIntervalInput" value="{/samplingSettings/sample_interval_hours}" type="Number" width="100%" />
+                            </VBox>
+                            <Button text="Sampling" press="onRunSampling" type="Emphasized" class="experimentButton samplingButton" />
+                            <Button text="ANFIS-GA" press="onRunAnfis" type="Accept" class="experimentButton anfisButton" />
+                            <Button text="Fuzzy DT" press="onRunFuzzyDt" type="Accept" class="experimentButton fuzzyButton" />
                         </HBox>
                     </HBox>
                 </VBox>
             </Panel>
 
-            <Text id="activeText" class="sapUiSmallMarginTop" text="{= ${/activeExperiment} === 'baseline' ? 'Baseline results' : ${/activeExperiment} === 'sampling' ? 'Sampling experiment results' : ${/activeExperiment} === 'anfis' ? 'ANFIS decision experiment results' : 'Choose an experiment to run from the buttons above.' }" />
-
-            <Panel id="baselinePanel" headerText="Baseline" expandable="false" visible="{= ${/activeExperiment} === 'baseline'}" class="sapUiSmallMarginTop baselinePanel experimentPanel">
-                <VBox class="busyWrapper" visible="{/isLoading}">
-                    <BusyIndicator visible="{/isLoading}" text="Running daily irrigation experiment..." />
-                </VBox>
-                <VBox class="summarySection">
-                    <Text text="{= 'Days analyzed: ' + ${/summary/daysAnalyzed}}" />
-                    <Text text="{= 'Pots analyzed: ' + ${/summary/potsAnalyzed}}" />
-                    <Text text="{= 'Irrigation events: ' + ${/summary/irrigationEvents}}" />
-                    <Text text="{= 'Irrigation decisions: ' + ${/summary/irrigationDecisions}}" />
-                    <Text text="{= 'Total water usage (L): ' + ${/summary/totalWaterUsage}}" />
-                    <Text text="{= 'Average daily water usage (L): ' + ${/summary/averageDailyWaterUsage}}" />
-                    <Text text="{= 'Emergency dryness alerts: ' + ${/summary/emergencyAlerts}}" />
-                </VBox>
-                <viz:VizFrame id="baselineChart" uiConfig="{applicationSet:'fiori'}" vizType="line" height="400px" width="100%" renderComplete=".onChartRenderComplete">
-                    <viz:dataset>
-                        <viz.data:FlattenedDataset data="{/baselineChartEntries}">
-                            <viz.data:dimensions>
-                                <viz.data:DimensionDefinition name="Date/Time" value="{chart_label}" />
-                            </viz.data:dimensions>
-                            <viz.data:measures>
-                                <viz.data:MeasureDefinition name="Average Moisture" value="{average_moisture}" />
-                                <viz.data:MeasureDefinition name="Water Usage (L)" value="{water_usage_chart}" />
-                            </viz.data:measures>
-                        </viz.data:FlattenedDataset>
-                    </viz:dataset>
-                    <viz:feeds>
-                        <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Average Moisture,Water Usage (L)" />
-                        <viz.feeds:FeedItem uid="categoryAxis" type="Dimension" values="Date/Time" />
-                    </viz:feeds>
-                </viz:VizFrame>
-                <IconTabBar id="baselineDataTabs" class="experimentDataTabs">
-                    <items>
-                        <IconTabFilter id="baselineExperimentDataTab" text="Experiment data">
-                <Table id="baselineDataTable" class="experimentDataTable" items="{/baselineEntries}" growing="true" growingThreshold="20" growingScrollToLoad="false">
-                    <headerToolbar>
-                        <Toolbar id="baselineDataToolbar">
-                            <Title id="baselineDataTitle" text="Experiment data" />
-                        </Toolbar>
-                    </headerToolbar>
-                    <columns>
-                        <Column id="baselineStepCol"><Text id="baselineStepHeader" text="Date" /></Column>
-                        <Column id="baselineMoistureCol"><Text id="baselineMoistureHeader" text="Avg Moisture (%)" /></Column>
-                        <Column id="baselineTempCol"><Text id="baselineTempHeader" text="Max Temp" /></Column>
-                        <Column id="baselineHumidityCol"><Text id="baselineHumidityHeader" text="Avg Humidity" /></Column>
-                        <Column id="baselineRainCol"><Text id="baselineRainHeader" text="Rain (mm)" /></Column>
-                        <Column id="baselineIrrigationCol"><Text id="baselineIrrigationHeader" text="Events" /></Column>
-                        <Column id="baselineWaterCol"><Text id="baselineWaterHeader" text="Water (L)" /></Column>
-                        <Column id="baselineAlertsCol"><Text id="baselineAlertsHeader" text="Alerts" /></Column>
-                    </columns>
-                    <items>
-                        <ColumnListItem id="baselineDataRow">
-                            <cells>
-                                <Text id="baselineStepCell" text="{day_label}" />
-                                <Text id="baselineMoistureCell" text="{average_moisture}" />
-                                <Text id="baselineTempCell" text="{max_temperature}" />
-                                <Text id="baselineHumidityCell" text="{humidity}" />
-                                <Text id="baselineRainCell" text="{rain_amount}" />
-                                <Text id="baselineIrrigationCell" text="{irrigation_events}" />
-                                <Text id="baselineWaterCell" text="{water_usage_l}" />
-                                <Text id="baselineAlertsCell" text="{alerts}" />
-                            </cells>
-                        </ColumnListItem>
-                    </items>
-                </Table>
-                        </IconTabFilter>
-                        <IconTabFilter id="baselinePotsTab" text="Pots">
-                            <Table id="baselinePotsTable" class="experimentDataTable" items="{/baselinePots}" growing="true" growingThreshold="20" growingScrollToLoad="false">
-                                <columns>
-                                    <Column id="baselinePotCodeCol"><Text id="baselinePotCodeHeader" text="Code" /></Column>
-                                    <Column id="baselinePotLabelCol"><Text id="baselinePotLabelHeader" text="Pot" /></Column>
-                                    <Column id="baselinePotSizeCol"><Text id="baselinePotSizeHeader" text="Size" /></Column>
-                                    <Column id="baselinePotPlantCol"><Text id="baselinePotPlantHeader" text="Plant" /></Column>
-                                    <Column id="baselinePotLocationCol"><Text id="baselinePotLocationHeader" text="Location" /></Column>
-                                    <Column id="baselinePotSunCol"><Text id="baselinePotSunHeader" text="Sun" /></Column>
-                                    <Column id="baselinePotFlowCol"><Text id="baselinePotFlowHeader" text="Flow ml/min" /></Column>
-                                    <Column id="baselinePotTargetCol"><Text id="baselinePotTargetHeader" text="Target %" /></Column>
-                                </columns>
-                                <items>
-                                    <ColumnListItem id="baselinePotRow">
-                                        <cells>
-                                            <Text id="baselinePotCodeCell" text="{pot_code}" />
-                                            <Text id="baselinePotLabelCell" text="{label}" />
-                                            <Text id="baselinePotSizeCell" text="{= ${small_subtype} ? ${size_class} + ' ' + ${small_subtype} : ${size_class}}" />
-                                            <Text id="baselinePotPlantCell" text="{plant_type_label}" />
-                                            <Text id="baselinePotLocationCell" text="{default_location}" />
-                                            <Text id="baselinePotSunCell" text="{sun_exposure}" />
-                                            <Text id="baselinePotFlowCell" text="{drip_flow_ml_min}" />
-                                            <Text id="baselinePotTargetCell" text="{moisture_target_pct}" />
-                                        </cells>
-                                    </ColumnListItem>
-                                </items>
-                            </Table>
-                        </IconTabFilter>
-                    </items>
-                </IconTabBar>
+            <Panel id="experimentSummaryPanel" headerText="Experiment summary" expandable="true" expanded="true" visible="{= !!${/activeExperiment}}" class="sapUiSmallMarginTop experimentPanel experimentSummaryPanel">
+                <core:HTML id="experimentSummaryCards" content="{/experimentSummaryCardsHtml}" sanitizeContent="false" />
             </Panel>
+
+            <VBox id="overviewDashboard" visible="{= !${/activeExperiment}}" width="100%" class="overviewDashboard overviewWorkspace">
+                <core:HTML id="overviewDefaultRail" content="{/overview/sideRailHtml}" sanitizeContent="false" />
+            </VBox>
+
+            <Text id="activeText" class="sapUiSmallMarginTop" visible="{= !!${/activeExperiment}}" text="{= ${/activeExperiment} === 'sampling' ? 'Sampling experiment results' : ${/activeExperiment} === 'anfis' ? 'ANFIS decision experiment results' : ${/activeExperiment} === 'fuzzy' ? 'Fuzzy DT recommendation results' : '' }" />
 
             <Panel id="samplingPanel" headerText="Sampling Optimization" expandable="false" visible="{= ${/activeExperiment} === 'sampling'}" class="sapUiSmallMarginTop samplingPanel experimentPanel">
                 <VBox class="busyWrapper" visible="{/isSamplingLoading}">
                     <BusyIndicator visible="{/isSamplingLoading}" text="Running sampling experiment..." />
                 </VBox>
-                <VBox class="summarySection">
-                    <Text text="{= 'Days analyzed: ' + ${/samplingSummary/daysAnalyzed}}" />
-                    <Text text="{= 'Sample interval (hours): ' + ${/samplingSummary/sample_interval_hours}}" />
-                    <Text text="{= 'Accuracy: ' + ${/samplingSummary/accuracy_percent} + '%'}" />
-                    <Text text="{= 'Mismatch days: ' + ${/samplingSummary/mismatch_days}}" />
-                    <Text text="{= 'Baseline water usage (L): ' + ${/samplingSummary/baseline_total_water_usage_l}}" />
-                    <Text text="{= 'Sparse water usage (L): ' + ${/samplingSummary/sparse_total_water_usage_l}}" />
-                    <Text text="{= 'Baseline irrigation events: ' + ${/samplingSummary/baseline_irrigation_event_count}}" />
-                    <Text text="{= 'Sparse irrigation events: ' + ${/samplingSummary/sparse_irrigation_event_count}}" />
-                </VBox>
-                <viz:VizFrame id="samplingChart" uiConfig="{applicationSet:'fiori'}" vizType="line" height="400px" width="100%" renderComplete=".onChartRenderComplete">
-                    <viz:dataset>
-                        <viz.data:FlattenedDataset data="{/samplingChartEntries}">
-                            <viz.data:dimensions>
-                                <viz.data:DimensionDefinition name="Date/Time" value="{chart_label}" />
-                            </viz.data:dimensions>
-                            <viz.data:measures>
-                                <viz.data:MeasureDefinition name="Baseline Moisture" value="{baseline_moisture}" />
-                                <viz.data:MeasureDefinition name="Sparse Moisture" value="{sparse_moisture}" />
-                                <viz.data:MeasureDefinition name="Sparse Water Usage (L)" value="{sparse_water_usage_chart}" />
-                            </viz.data:measures>
-                        </viz.data:FlattenedDataset>
-                    </viz:dataset>
-                    <viz:feeds>
-                        <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Baseline Moisture,Sparse Moisture,Sparse Water Usage (L)" />
-                        <viz.feeds:FeedItem uid="categoryAxis" type="Dimension" values="Date/Time" />
-                    </viz:feeds>
-                </viz:VizFrame>
+                <HBox id="samplingChartRow" class="chartWithOverviewRail">
+                    <VBox id="samplingChartColumn" class="chartMainColumn">
+                        <viz:VizFrame id="samplingChart" uiConfig="{applicationSet:'fiori'}" vizType="combination" height="500px" width="100%" renderComplete=".onChartRenderComplete">
+                            <viz:dataset>
+                                <viz.data:FlattenedDataset data="{/samplingChartEntries}">
+                                    <viz.data:dimensions>
+                                        <viz.data:DimensionDefinition name="Date/Time" value="{chart_label}" />
+                                    </viz.data:dimensions>
+                                    <viz.data:measures>
+                                        <viz.data:MeasureDefinition name="Baseline Moisture" value="{baseline_moisture}" />
+                                        <viz.data:MeasureDefinition name="Baseline Water Usage (L)" value="{baseline_water_usage_chart}" />
+                                        <viz.data:MeasureDefinition name="Sparse Moisture" value="{sparse_moisture}" />
+                                        <viz.data:MeasureDefinition name="Sparse Water Usage (L)" value="{sparse_water_usage_chart}" />
+                                        <viz.data:MeasureDefinition name="Max Temp (C)" value="{max_temperature}" />
+                                        <viz.data:MeasureDefinition name="Rain (L/m2)" value="{rain_amount}" />
+                                    </viz.data:measures>
+                                </viz.data:FlattenedDataset>
+                            </viz:dataset>
+                            <viz:feeds>
+                                <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Baseline Moisture,Baseline Water Usage (L),Sparse Moisture,Sparse Water Usage (L),Max Temp (C),Rain (L/m2)" />
+                                <viz.feeds:FeedItem uid="categoryAxis" type="Dimension" values="Date/Time" />
+                            </viz:feeds>
+                        </viz:VizFrame>
+                    </VBox>
+                    <core:HTML
+    id="samplingOverviewRail"
+    content="{/overview/experimentSideRailHtml}"
+    sanitizeContent="false" />
+                </HBox>
                 <IconTabBar id="samplingDataTabs" class="experimentDataTabs">
                     <items>
                         <IconTabFilter id="samplingExperimentDataTab" text="Experiment data">
@@ -180,9 +93,9 @@
                         <Column id="samplingStepCol"><Text id="samplingStepHeader" text="Date" /></Column>
                         <Column id="samplingBaselineMoistureCol"><Text id="samplingBaselineMoistureHeader" text="Baseline Moisture (%)" /></Column>
                         <Column id="samplingSparseMoistureCol"><Text id="samplingSparseMoistureHeader" text="Sparse Moisture (%)" /></Column>
-                        <Column id="samplingRainCol"><Text id="samplingRainHeader" text="Rain (mm)" /></Column>
-                        <Column id="samplingBaselineIrrigationCol"><Text id="samplingBaselineIrrigationHeader" text="Baseline Events" /></Column>
-                        <Column id="samplingSparseIrrigationCol"><Text id="samplingSparseIrrigationHeader" text="Sparse Events" /></Column>
+                        <Column id="samplingRainCol"><Text id="samplingRainHeader" text="Rain (L/m2)" /></Column>
+                        <Column id="samplingBaselineIrrigationCol"><Text id="samplingBaselineIrrigationHeader" text="Baseline Windows" /></Column>
+                        <Column id="samplingSparseIrrigationCol"><Text id="samplingSparseIrrigationHeader" text="Sparse Windows" /></Column>
                         <Column id="samplingSparseWaterCol"><Text id="samplingSparseWaterHeader" text="Sparse Water (L)" /></Column>
                     </columns>
                     <items>
@@ -236,43 +149,33 @@
                 <VBox class="busyWrapper" visible="{/isAnfisLoading}">
                     <BusyIndicator visible="{/isAnfisLoading}" text="Running ANFIS experiment..." />
                 </VBox>
-                <HBox class="summarySection summaryColumns" width="100%" justifyContent="SpaceBetween">
-                    <VBox class="summaryColumn">
-                        <Text text="{= 'Days analyzed: ' + ${/anfisSummary/daysAnalyzed}}" />
-                        <Text text="{= 'Baseline irrigation days: ' + ${/anfisSummary/baseline_irrigation_days}}" />
-                        <Text text="{= 'ANFIS irrigation days: ' + ${/anfisSummary/anfis_irrigation_days}}" />
-                        <Text text="{= 'Baseline irrigation events: ' + ${/anfisSummary/baseline_irrigation_event_count}}" />
-                        <Text text="{= 'ANFIS irrigation events: ' + ${/anfisSummary/anfis_irrigation_event_count}}" />
-                        <Text text="{= 'Baseline water usage (L): ' + ${/anfisSummary/baseline_total_water_usage_l}}" />
-                        <Text text="{= 'ANFIS water usage (L): ' + ${/anfisSummary/anfis_total_water_usage_l}}" />
-                        <Text text="{= ''}" />
-                        <Text text="{= 'Test accuracy: ' + ${/anfisSummary/test_accuracy_percent} + '%'}" />
-                        <Text text="{= 'Execution time: ' + ${/anfisSummary/execution_time_seconds} + ' s'}" />
+                <HBox id="anfisChartRow" class="chartWithOverviewRail">
+                    <VBox id="anfisChartColumn" class="chartMainColumn">
+                        <viz:VizFrame id="anfisChart" uiConfig="{applicationSet:'fiori'}" vizType="combination" height="500px" width="100%" renderComplete=".onChartRenderComplete">
+                            <viz:dataset>
+                                <viz.data:FlattenedDataset data="{/anfisChartEntries}">
+                                    <viz.data:dimensions>
+                                        <viz.data:DimensionDefinition name="Date/Time" value="{chart_label}" />
+                                    </viz.data:dimensions>
+                                    <viz.data:measures>
+                                        <viz.data:MeasureDefinition name="Baseline Moisture" value="{baseline_moisture}" />
+                                        <viz.data:MeasureDefinition name="Baseline Water Usage (L)" value="{baseline_water_usage_chart}" />
+                                        <viz.data:MeasureDefinition name="ANFIS Moisture" value="{anfis_moisture}" />
+                                        <viz.data:MeasureDefinition name="Predicted Probability" value="{predicted_probability_percent}" />
+                                        <viz.data:MeasureDefinition name="ANFIS Water Usage (L)" value="{anfis_water_usage_chart}" />
+                                        <viz.data:MeasureDefinition name="Max Temp (C)" value="{max_temperature}" />
+                                        <viz.data:MeasureDefinition name="Rain (L/m2)" value="{rain_amount}" />
+                                    </viz.data:measures>
+                                </viz.data:FlattenedDataset>
+                            </viz:dataset>
+                            <viz:feeds>
+                                <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Baseline Moisture,Baseline Water Usage (L),ANFIS Moisture,Predicted Probability,ANFIS Water Usage (L),Max Temp (C),Rain (L/m2)" />
+                                <viz.feeds:FeedItem uid="categoryAxis" type="Dimension" values="Date/Time" />
+                            </viz:feeds>
+                        </viz:VizFrame>
                     </VBox>
-                    <VBox class="summaryColumn probabilitySummaryColumn">
-                        <Text text="{= 'Predicted probability mean: ' + ${/anfisSummary/predicted_probability_mean}}" />
-                        <Text text="{= 'Predicted probability min: ' + ${/anfisSummary/predicted_probability_min}}" />
-                        <Text text="{= 'Predicted probability max: ' + ${/anfisSummary/predicted_probability_max}}" />
-                    </VBox>
+                    <core:HTML id="anfisOverviewRail" content="{/overview/experimentSideRailHtml}" sanitizeContent="false" />
                 </HBox>
-                <viz:VizFrame id="anfisChart" uiConfig="{applicationSet:'fiori'}" vizType="line" height="400px" width="100%" renderComplete=".onChartRenderComplete">
-                    <viz:dataset>
-                        <viz.data:FlattenedDataset data="{/anfisChartEntries}">
-                            <viz.data:dimensions>
-                                <viz.data:DimensionDefinition name="Date/Time" value="{chart_label}" />
-                            </viz.data:dimensions>
-                            <viz.data:measures>
-                                <viz.data:MeasureDefinition name="ANFIS Moisture" value="{anfis_moisture}" />
-                                <viz.data:MeasureDefinition name="Predicted Probability" value="{predicted_probability_percent}" />
-                                <viz.data:MeasureDefinition name="ANFIS Water Usage (L)" value="{anfis_water_usage_chart}" />
-                            </viz.data:measures>
-                        </viz.data:FlattenedDataset>
-                    </viz:dataset>
-                    <viz:feeds>
-                        <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="ANFIS Moisture,Predicted Probability,ANFIS Water Usage (L)" />
-                        <viz.feeds:FeedItem uid="categoryAxis" type="Dimension" values="Date/Time" />
-                    </viz:feeds>
-                </viz:VizFrame>
                 <IconTabBar id="anfisDataTabs" class="experimentDataTabs">
                     <items>
                         <IconTabFilter id="anfisExperimentDataTab" text="Experiment data">
@@ -287,8 +190,8 @@
                         <Column id="anfisMoistureCol"><Text id="anfisMoistureHeader" text="ANFIS Moisture (%)" /></Column>
                         <Column id="anfisProbabilityCol"><Text id="anfisProbabilityHeader" text="Predicted Probability" /></Column>
                         <Column id="anfisCategoryCol"><Text id="anfisCategoryHeader" text="Category" /></Column>
-                        <Column id="anfisBaselineIrrigationCol"><Text id="anfisBaselineIrrigationHeader" text="Baseline Events" /></Column>
-                        <Column id="anfisIrrigationCol"><Text id="anfisIrrigationHeader" text="ANFIS Events" /></Column>
+                        <Column id="anfisBaselineIrrigationCol"><Text id="anfisBaselineIrrigationHeader" text="Baseline Windows" /></Column>
+                        <Column id="anfisIrrigationCol"><Text id="anfisIrrigationHeader" text="ANFIS Windows" /></Column>
                         <Column id="anfisWaterCol"><Text id="anfisWaterHeader" text="ANFIS Water (L)" /></Column>
                     </columns>
                     <items>
@@ -337,6 +240,137 @@
                     </items>
                 </IconTabBar>
             </Panel>
+
+            <Panel id="fuzzyPanel" headerText="Fuzzy DT Recommendation" expandable="false" visible="{= ${/activeExperiment} === 'fuzzy'}" class="sapUiSmallMarginTop fuzzyPanel experimentPanel">
+                <VBox class="busyWrapper" visible="{/isFuzzyLoading}">
+                    <BusyIndicator visible="{/isFuzzyLoading}" text="Running Fuzzy DT experiment..." />
+                </VBox>
+                <HBox id="fuzzyChartRow" class="chartWithOverviewRail">
+                    <VBox id="fuzzyChartColumn" class="chartMainColumn">
+                        <viz:VizFrame id="fuzzyChart" uiConfig="{applicationSet:'fiori'}" vizType="combination" height="500px" width="100%" renderComplete=".onChartRenderComplete">
+                            <viz:dataset>
+                                <viz.data:FlattenedDataset data="{/fuzzyChartEntries}">
+                                    <viz.data:dimensions>
+                                        <viz.data:DimensionDefinition name="Date/Time" value="{chart_label}" />
+                                    </viz.data:dimensions>
+                                    <viz.data:measures>
+                                        <viz.data:MeasureDefinition name="Baseline Moisture" value="{baseline_moisture}" />
+                                        <viz.data:MeasureDefinition name="Baseline Water Usage (L)" value="{baseline_water_usage_chart}" />
+                                        <viz.data:MeasureDefinition name="Fuzzy Moisture" value="{fuzzy_moisture}" />
+                                        <viz.data:MeasureDefinition name="Fuzzy Prescription (mm)" value="{fuzzy_prescription_mm}" />
+                                        <viz.data:MeasureDefinition name="Fuzzy Water Usage (L)" value="{fuzzy_water_usage_chart}" />
+                                        <viz.data:MeasureDefinition name="Max Temp (C)" value="{max_temperature}" />
+                                        <viz.data:MeasureDefinition name="Rain (L/m2)" value="{rain_amount}" />
+                                    </viz.data:measures>
+                                </viz.data:FlattenedDataset>
+                            </viz:dataset>
+                            <viz:feeds>
+                                <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Baseline Moisture,Baseline Water Usage (L),Fuzzy Moisture,Fuzzy Prescription (mm),Fuzzy Water Usage (L),Max Temp (C),Rain (L/m2)" />
+                                <viz.feeds:FeedItem uid="categoryAxis" type="Dimension" values="Date/Time" />
+                            </viz:feeds>
+                        </viz:VizFrame>
+                    </VBox>
+                    <core:HTML id="fuzzyOverviewRail" content="{/overview/experimentSideRailHtml}" sanitizeContent="false" />
+                </HBox>
+                <IconTabBar id="fuzzyDataTabs" class="experimentDataTabs">
+                    <items>
+                        <IconTabFilter id="fuzzyExperimentDataTab" text="Experiment data">
+                            <Table id="fuzzyDataTable" class="experimentDataTable" items="{/fuzzyEntries}" growing="true" growingThreshold="20" growingScrollToLoad="false">
+                                <headerToolbar>
+                                    <Toolbar id="fuzzyDataToolbar">
+                                        <Title id="fuzzyDataTitle" text="Experiment data" />
+                                    </Toolbar>
+                                </headerToolbar>
+                                <columns>
+                                    <Column id="fuzzyStepCol"><Text id="fuzzyStepHeader" text="Date" /></Column>
+                                    <Column id="fuzzyBaselineMoistureCol"><Text id="fuzzyBaselineMoistureHeader" text="Baseline Moisture (%)" /></Column>
+                                    <Column id="fuzzyMoistureCol"><Text id="fuzzyMoistureHeader" text="Fuzzy Moisture (%)" /></Column>
+                                    <Column id="fuzzyEtcCol"><Text id="fuzzyEtcHeader" text="ETc (mm)" /></Column>
+                                    <Column id="fuzzyPrescriptionCol"><Text id="fuzzyPrescriptionHeader" text="Prescription (mm)" /></Column>
+                                    <Column id="fuzzyRainCol"><Text id="fuzzyRainHeader" text="Rain (L/m2)" /></Column>
+                                    <Column id="fuzzyEventsCol"><Text id="fuzzyEventsHeader" text="Fuzzy Windows" /></Column>
+                                    <Column id="fuzzyWaterCol"><Text id="fuzzyWaterHeader" text="Fuzzy Water (L)" /></Column>
+                                </columns>
+                                <items>
+                                    <ColumnListItem id="fuzzyDataRow">
+                                        <cells>
+                                            <Text id="fuzzyStepCell" text="{day_label}" />
+                                            <Text id="fuzzyBaselineMoistureCell" text="{baseline_moisture}" />
+                                            <Text id="fuzzyMoistureCell" text="{fuzzy_moisture}" />
+                                            <Text id="fuzzyEtcCell" text="{etc_mm}" />
+                                            <Text id="fuzzyPrescriptionCell" text="{fuzzy_prescription_mm}" />
+                                            <Text id="fuzzyRainCell" text="{rain_amount}" />
+                                            <Text id="fuzzyEventsCell" text="{fuzzy_irrigation_events}" />
+                                            <Text id="fuzzyWaterCell" text="{fuzzy_water_usage_l}" />
+                                        </cells>
+                                    </ColumnListItem>
+                                </items>
+                            </Table>
+                        </IconTabFilter>
+                        <IconTabFilter id="fuzzyPotsTab" text="Pots">
+                            <Table id="fuzzyPotsTable" class="experimentDataTable" items="{/fuzzyPots}" growing="true" growingThreshold="20" growingScrollToLoad="false">
+                                <columns>
+                                    <Column id="fuzzyPotCodeCol"><Text id="fuzzyPotCodeHeader" text="Code" /></Column>
+                                    <Column id="fuzzyPotLabelCol"><Text id="fuzzyPotLabelHeader" text="Pot" /></Column>
+                                    <Column id="fuzzyPotSizeCol"><Text id="fuzzyPotSizeHeader" text="Size" /></Column>
+                                    <Column id="fuzzyPotPlantCol"><Text id="fuzzyPotPlantHeader" text="Plant" /></Column>
+                                    <Column id="fuzzyPotLocationCol"><Text id="fuzzyPotLocationHeader" text="Location" /></Column>
+                                    <Column id="fuzzyPotSunCol"><Text id="fuzzyPotSunHeader" text="Sun" /></Column>
+                                    <Column id="fuzzyPotFlowCol"><Text id="fuzzyPotFlowHeader" text="Flow ml/min" /></Column>
+                                    <Column id="fuzzyPotTargetCol"><Text id="fuzzyPotTargetHeader" text="Target %" /></Column>
+                                </columns>
+                                <items>
+                                    <ColumnListItem id="fuzzyPotRow">
+                                        <cells>
+                                            <Text id="fuzzyPotCodeCell" text="{pot_code}" />
+                                            <Text id="fuzzyPotLabelCell" text="{label}" />
+                                            <Text id="fuzzyPotSizeCell" text="{= ${small_subtype} ? ${size_class} + ' ' + ${small_subtype} : ${size_class}}" />
+                                            <Text id="fuzzyPotPlantCell" text="{plant_type_label}" />
+                                            <Text id="fuzzyPotLocationCell" text="{default_location}" />
+                                            <Text id="fuzzyPotSunCell" text="{sun_exposure}" />
+                                            <Text id="fuzzyPotFlowCell" text="{drip_flow_ml_min}" />
+                                            <Text id="fuzzyPotTargetCell" text="{moisture_target_pct}" />
+                                        </cells>
+                                    </ColumnListItem>
+                                </items>
+                            </Table>
+                        </IconTabFilter>
+                    </items>
+                </IconTabBar>
+            </Panel>
         </VBox>
+        <footer>
+            <Toolbar id="experimentFooterBar" class="experimentFooterBar">
+                <HBox id="experimentFooterContent" width="100%" alignItems="Center" justifyContent="SpaceBetween" class="experimentFooterContent">
+                    <HBox id="experimentFooterMeta" alignItems="Center" wrap="Wrap" class="experimentFooterMeta">
+                        <HBox id="experimentFooterExperiment" alignItems="Center" class="experimentFooterItem">
+                            <Text id="experimentFooterExperimentLabel" text="Experiment:" class="experimentFooterLabel" />
+                            <Text id="experimentFooterExperimentValue" text="{/experimentFooter/experimentLabel}" class="experimentFooterValue" />
+                        </HBox>
+                        <HBox id="experimentFooterPeriod" alignItems="Center" class="experimentFooterItem">
+                            <Text id="experimentFooterPeriodLabel" text="Period:" class="experimentFooterLabel" />
+                            <Text id="experimentFooterPeriodValue" text="{= ${/experimentSettings/start_date} + ' to ' + ${/experimentSettings/end_date}}" class="experimentFooterValue" />
+                        </HBox>
+                        <HBox id="experimentFooterPots" alignItems="Center" class="experimentFooterItem">
+                            <Text id="experimentFooterPotsLabel" text="Pots:" class="experimentFooterLabel" />
+                            <Text id="experimentFooterPotsValue" text="{/experimentFooter/pots}" class="experimentFooterValue" />
+                        </HBox>
+                        <HBox id="experimentFooterDays" alignItems="Center" class="experimentFooterItem">
+                            <Text id="experimentFooterDaysLabel" text="Days analyzed:" class="experimentFooterLabel" />
+                            <Text id="experimentFooterDaysValue" text="{/experimentFooter/daysAnalyzed}" class="experimentFooterValue" />
+                        </HBox>
+                        <HBox id="experimentFooterInterval" alignItems="Center" class="experimentFooterItem">
+                            <Text id="experimentFooterIntervalLabel" text="Time interval:" class="experimentFooterLabel" />
+                            <Text id="experimentFooterIntervalValue" text="{/experimentFooter/timeInterval}" class="experimentFooterValue" />
+                        </HBox>
+                    </HBox>
+                    <HBox id="experimentFooterCopyright" alignItems="Center" class="experimentFooterCopyright">
+                        <Text id="experimentFooterCopyrightText" text="&#169; 2026 Smart Irrigation DT" class="experimentFooterValue" />
+                        <Text id="experimentFooterSeparator" text="|" class="experimentFooterSeparator" />
+                        <Text id="experimentFooterProductText" text="Digital Twin for Intelligent Irrigation" class="experimentFooterValue" />
+                    </HBox>
+                </HBox>
+            </Toolbar>
+        </footer>
     </Page>
 </mvc:View>

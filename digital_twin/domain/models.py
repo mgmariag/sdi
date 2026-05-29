@@ -68,7 +68,7 @@ class SensorReading:
 
 @dataclass(frozen=True)
 class IrrigationDecision:
-    pot_id: int
+    sensor_id: int
     decided_at: datetime
     decision_date: date
     decision_slot: str
@@ -79,7 +79,7 @@ class IrrigationDecision:
 
 @dataclass(frozen=True)
 class IrrigationEvent:
-    pot_id: int
+    sensor_id: int
     scheduled_start_at: datetime
     scheduled_end_at: datetime
     flow_rate_ml_min: Decimal

@@ -73,6 +73,17 @@ def run_dt_anfis_experiment(
         raise http_error(exc, 500, "ANFIS experiment failed") from exc
 
 
+@router.get("/fuzzy")
+def run_dt_fuzzy_dt_experiment(
+    start: date | None = Query(None),
+    end: date | None = Query(None),
+):
+    try:
+        return service.run_fuzzy_dt(start=start, end=end)
+    except Exception as exc:
+        raise http_error(exc, 500, "Fuzzy DT experiment failed") from exc
+
+
 @router.post("/precompute")
 def precompute_dt_experiments(
     start: date | None = Query(None),

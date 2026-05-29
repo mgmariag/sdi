@@ -5,7 +5,7 @@ from datetime import date
 from fastapi import APIRouter, Query
 
 from digital_twin.api.errors import http_error
-from digital_twin.services.weather import WeatherService
+from digital_twin.services.weather_service import WeatherService
 
 
 api_router = APIRouter(prefix="/api/weather/cluj-napoca")
@@ -89,4 +89,5 @@ def refresh_cluj_forecast(force: bool = Query(False)):
         return service.refresh_forecast(force=force)
     except Exception as exc:
         raise http_error(exc, 502, "Forecast refresh failed") from exc
+
 

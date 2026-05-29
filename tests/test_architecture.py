@@ -1,18 +1,33 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
-from backend.cache import SingleFlightCache as LegacySingleFlightCache
 from digital_twin.api.main import create_app
 from digital_twin.core.cache import SingleFlightCache
 from digital_twin.core.config import get_settings
-from services.sensor_api import app as sensor_app
-from services.weather_api import app as weather_app
+from digital_twin.services.experiment_service import _experiment_cache
 
 
 class ArchitectureTests(unittest.TestCase):
-    def test_legacy_cache_entrypoint_uses_package_cache(self) -> None:
-        self.assertIs(LegacySingleFlightCache, SingleFlightCache)
+    def test_legacy_roots_are_removed(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        removed_paths = [
+            root / "backend",
+            root / "services",
+            root / "tools",
+            root / "database.py",
+            root / "weather_ingestion.py",
+        ]
+        self.assertFalse(any(path.exists() for path in removed_paths))
+
+    def test_api_route_modules_are_consolidated(self) -> None:
+        route_dir = Path(__file__).resolve().parents[1] / "digital_twin" / "api" / "routes"
+        route_files = {path.name for path in route_dir.glob("*.py") if path.name != "__init__.py"}
+        self.assertEqual(route_files, {"experiments.py", "weather.py", "sensors.py"})
+
+    def test_experiment_service_uses_package_cache(self) -> None:
+        self.assertIsInstance(_experiment_cache, SingleFlightCache)
 
     def test_main_api_registers_compatible_routes(self) -> None:
         app = create_app()
@@ -29,17 +44,25 @@ class ArchitectureTests(unittest.TestCase):
             "/api/experiment",
             "/api/experiment/sampling",
             "/api/experiment/anfis",
+            "/api/experiment/fuzzy",
         }
         self.assertTrue(expected_paths.issubset(paths))
 
-    def test_ingestion_service_entrypoints_keep_compatible_routes(self) -> None:
-        weather_paths = {route.path for route in weather_app.routes}
-        sensor_paths = {route.path for route in sensor_app.routes}
+    def test_consolidated_sensor_repositories_import(self) -> None:
+        from digital_twin.db.repositories.sensor_repository import (
+            OverviewRepository,
+            PotRepository,
+            SensorPlacementRepository,
+        )
 
-        self.assertIn("/weather/cluj-napoca/refresh-forecast", weather_paths)
-        self.assertIn("/weather/cluj-napoca/cache-range", weather_paths)
-        self.assertIn("/sensors/run-due", sensor_paths)
-        self.assertIn("/sensors/run-at", sensor_paths)
+        self.assertIsNotNone(OverviewRepository)
+        self.assertIsNotNone(PotRepository)
+        self.assertIsNotNone(SensorPlacementRepository)
+
+    def test_simulation_engine_keeps_controller_helpers_wired(self) -> None:
+        from digital_twin.simulation import engine
+
+        self.assertTrue(callable(engine._apply_planned_volume))
 
     def test_settings_centralize_runtime_defaults(self) -> None:
         settings = get_settings()
@@ -51,4 +74,3 @@ class ArchitectureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

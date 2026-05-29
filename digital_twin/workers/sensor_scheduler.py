@@ -7,8 +7,8 @@ import time as sleep_time
 
 from digital_twin.core.config import get_settings
 from digital_twin.core.time import local_timezone
-from digital_twin.services.sensors import SensorService
-from tools.sensor_readings import next_scheduled_sensor_datetime
+from digital_twin.services.sensor_service import SensorService
+from digital_twin.services.sensor_readings import next_scheduled_sensor_datetime
 
 
 logger = logging.getLogger("digital_twin.sensor_scheduler")
@@ -68,3 +68,4 @@ class SensorScheduler:
         if candidate <= now:
             candidate += timedelta(days=1)
         return candidate
+

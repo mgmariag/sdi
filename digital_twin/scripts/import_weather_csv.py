@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 
-from digital_twin.services.weather import WeatherService
+from digital_twin.services.weather_service import WeatherService
 
 
 def main() -> int:
@@ -18,4 +18,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 

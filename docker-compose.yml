@@ -27,52 +27,6 @@ services:
       postgres:
         condition: service_healthy
 
-  weather-service:
-    build:
-      context: .
-      dockerfile: Dockerfile.backend
-    command: ["uvicorn", "services.weather_api:app", "--host", "0.0.0.0", "--port", "8001"]
-    environment:
-      DATABASE_URL: postgresql://dt_user:dt_password@postgres:5432/digital_twin
-      WEATHER_REFRESH_ON_STARTUP: "true"
-    ports:
-      - "8001:8001"
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-  sensor-service:
-    build:
-      context: .
-      dockerfile: Dockerfile.backend
-    command: ["uvicorn", "services.sensor_api:app", "--host", "0.0.0.0", "--port", "8002"]
-    environment:
-      DATABASE_URL: postgresql://dt_user:dt_password@postgres:5432/digital_twin
-      SENSOR_SOURCE: simulated_sensor
-      SENSOR_READING_INTERVAL_MINUTES: "15"
-      SENSOR_SEED_HISTORY_ON_STARTUP: "true"
-      SENSOR_SCHEDULER_ENABLED: "true"
-      SENSOR_CLEANUP_ENABLED: "true"
-      SENSOR_CLEANUP_TIME: "03:15"
-    ports:
-      - "8002:8002"
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-  actuation-service:
-    build:
-      context: .
-      dockerfile: Dockerfile.backend
-    command: ["uvicorn", "services.actuation_api:app", "--host", "0.0.0.0", "--port", "8003"]
-    environment:
-      DATABASE_URL: postgresql://dt_user:dt_password@postgres:5432/digital_twin
-    ports:
-      - "8003:8003"
-    depends_on:
-      postgres:
-        condition: service_healthy
-
   frontend:
     build:
       context: .
@@ -81,9 +35,6 @@ services:
       - "8080:80"
     depends_on:
       - backend
-      - weather-service
-      - sensor-service
-      - actuation-service
 
 volumes:
   postgres_data:
