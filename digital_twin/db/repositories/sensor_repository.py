@@ -7,13 +7,16 @@ from typing import Any
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from digital_twin.core.time import now_local
+from digital_twin.core.config import get_settings
+from digital_twin.core.time import local_timezone, now_local
 from digital_twin.db.connection import get_connection
 from digital_twin.db.schema import get_database_health, get_pot_summary, list_pots
-from digital_twin.domain.irrigation_methods import VALVE_ZONE_DESIGN, VALVE_ZONE_ORDER
+from digital_twin.domain.irrigation_methods import VALVE_COUNT, VALVE_ZONE_DESIGN, VALVE_ZONE_ORDER
 
 SAFE_TAP_FLOW_L_MIN = 2.0
 VALVE_SWITCH_PAUSE_MIN = 1.0
+NO_IRRIGATION_PLANNED_LABEL = "No irrigation planned"
+NO_IRRIGATION_RECORDED_LABEL = "No irrigation recorded"
 
 
 class SensorRepository:
@@ -48,9 +51,10 @@ class OverviewRepository:
                 conn.execute("SELECT count(*) AS count FROM pots WHERE active = true").fetchone()["count"]
                 or 0
             )
-            current_state = self._current_state(conn, now, today)
+            next_window = _next_irrigation_window(conn, now)
+            valve_plan = self._valve_plan(conn, now, next_window)
+            current_state = self._current_state(conn, now, today, valve_plan, next_window)
             sensor_coverage = self._sensor_coverage(conn, now, today, active_pots)
-            valve_plan = self._valve_plan(conn, now, current_state.get("next_irrigation_window"))
             plant_overview = self._plant_overview(conn)
 
         return _json_ready(
@@ -63,7 +67,14 @@ class OverviewRepository:
             }
         )
 
-    def _current_state(self, conn, now: datetime, today) -> dict[str, Any]:
+    def _current_state(
+        self,
+        conn,
+        now: datetime,
+        today,
+        valve_plan: dict[str, Any],
+        next_window: dict[str, Any],
+    ) -> dict[str, Any]:
         latest = conn.execute(
             """
             WITH latest AS (
@@ -96,6 +107,7 @@ class OverviewRepository:
             """
             SELECT
                 coalesce(sum(coalesce(precipitation_mm, rain_mm, 0)), 0) AS rain_mm,
+                max(temperature_c) AS max_temperature_c,
                 count(*) AS weather_rows
             FROM weather_hourly
             WHERE location_name = 'Cluj-Napoca'
@@ -108,6 +120,7 @@ class OverviewRepository:
             },
         ).fetchone()
         rain_mm = _number(rain["rain_mm"], 0.0)
+        max_temperature = rain["max_temperature_c"]
 
         dry = conn.execute(
             """
@@ -125,7 +138,11 @@ class OverviewRepository:
             """
         ).fetchone()
         dry_sensors = int(dry["dry_sensors"] or 0)
-        recommendation_on = dry_sensors > 0
+        recommendation_on = dry_sensors > 0 or int(valve_plan.get("valve_starts") or 0) > 0
+        planned_window = _next_planned_irrigation(conn, now) or _next_prescription_irrigation(conn, now)
+        recent_window = _most_recent_irrigation(conn, now)
+        irrigation_activity = _irrigation_activity(planned_window, recent_window)
+        next_recommendation_ready_at = _next_recommendation_ready_at(now)
 
         confidence = _confidence_score(
             freshness_percent=_freshness_percent(latest_at, now),
@@ -137,10 +154,16 @@ class OverviewRepository:
             "current_soil_moisture_pct": round(moisture, 2),
             "forecast_rain_next_3_days_mm": round(rain_mm, 2),
             "forecast_rain_level": _rain_level(rain_mm),
+            "forecast_max_temperature_c": round(float(max_temperature), 2) if max_temperature is not None else None,
             "irrigation_recommendation": "ON" if recommendation_on else "OFF",
+            "next_recommendation_ready_at": next_recommendation_ready_at.isoformat(),
             "dry_sensor_count": dry_sensors,
             "confidence": confidence,
-            "next_irrigation_window": _next_irrigation_window(conn, now),
+            "next_irrigation_window": planned_window
+            or {"label": NO_IRRIGATION_PLANNED_LABEL, "start_at": None, "end_at": None},
+            "recent_irrigation_window": recent_window
+            or {"label": NO_IRRIGATION_RECORDED_LABEL, "start_at": None, "end_at": None},
+            "irrigation_activity": irrigation_activity,
             "latest_sensor_recorded_at": latest_at,
         }
 
@@ -160,19 +183,37 @@ class OverviewRepository:
                 or 0
             )
 
-        actual_today = int(
+        measured_today = int(
             conn.execute(
                 """
-                SELECT count(DISTINCT sensor_id) AS count
-                FROM sensor_readings
-                WHERE source = 'actual_sensor'
-                  AND recorded_at::date = %(today)s
+                WITH recommended_sensor_pots AS (
+                    SELECT DISTINCT pot_id
+                    FROM sensor_location_recommendations
+                ),
+                current_readings AS (
+                    SELECT DISTINCT sr.sensor_id
+                    FROM sensor_readings sr
+                    JOIN pots p ON p.id = sr.sensor_id
+                    WHERE p.active = true
+                      AND sr.recorded_at::date = %(today)s
+                      AND (sr.source = 'actual_sensor' OR sr.source = %(sensor_source)s)
+                )
+                SELECT
+                    CASE
+                        WHEN EXISTS (SELECT 1 FROM recommended_sensor_pots)
+                            THEN (
+                                SELECT count(*)
+                                FROM current_readings cr
+                                WHERE cr.sensor_id IN (SELECT pot_id FROM recommended_sensor_pots)
+                            )
+                        ELSE (SELECT count(*) FROM current_readings)
+                    END AS count
                 """,
-                {"today": today},
+                {"today": today, "sensor_source": get_settings().sensor_source},
             ).fetchone()["count"]
             or 0
         )
-        measured_pots = min(active_pots, actual_today)
+        measured_pots = min(active_pots, measured_today)
         estimated_pots = max(0, active_pots - measured_pots)
 
         latest_at = conn.execute("SELECT max(recorded_at) AS latest_at FROM sensor_readings").fetchone()["latest_at"]
@@ -183,7 +224,7 @@ class OverviewRepository:
             "data_freshness_pct": freshness,
             "segments": [
                 {"key": "measured", "label": "Measured pots", "count": measured_pots},
-                {"key": "estimated", "label": "Estimated (DT)", "count": estimated_pots},
+                {"key": "estimated", "label": "Estimated pots", "count": estimated_pots},
             ],
         }
 
@@ -262,6 +303,7 @@ class OverviewRepository:
                 p.pot_code,
                 p.label,
                 p.balcony_zone,
+                p.rain_exposure,
                 p.sun_exposure,
                 p.size_class,
                 p.small_subtype,
@@ -286,7 +328,8 @@ class OverviewRepository:
             LEFT JOIN latest l ON l.sensor_id = p.id
             WHERE p.active = true
             ORDER BY p.balcony_zone, p.id
-            """
+            """,
+            {"now": now},
         ).fetchall()
 
         candidates = [_valve_candidate(row) for row in rows]
@@ -303,6 +346,7 @@ class OverviewRepository:
             ordered = sorted(zone_candidates, key=lambda item: (-item["priority_score"], item["pot_code"]))
             total_flow_ml_min = sum(item["flow_rate_ml_min"] for item in ordered)
             planned_volume_ml = sum(item["planned_volume_ml"] for item in ordered)
+            design_volume_ml = sum(item["design_volume_ml"] for item in ordered)
             immediate_volume_ml = sum(item["planned_volume_ml"] for item in ordered if item["requires_run"])
             estimated_run_minutes = planned_volume_ml / max(total_flow_ml_min, 1.0)
             immediate_run_minutes = immediate_volume_ml / max(total_flow_ml_min, 1.0)
@@ -321,7 +365,11 @@ class OverviewRepository:
                     "estimated_run_minutes": round(estimated_run_minutes, 1),
                     "immediate_run_minutes": round(immediate_run_minutes, 1),
                     "planned_volume_ml": round(planned_volume_ml, 1),
+                    "planned_volume_l": round(planned_volume_ml / 1000.0, 2),
+                    "design_volume_ml": round(design_volume_ml, 1),
+                    "design_volume_l": round(design_volume_ml / 1000.0, 2),
                     "immediate_volume_ml": round(immediate_volume_ml, 1),
+                    "immediate_volume_l": round(immediate_volume_ml / 1000.0, 2),
                     "priority_score": round(max(item["priority_score"] for item in ordered), 2),
                     "top_pots": top_pots[:3],
                 }
@@ -361,12 +409,14 @@ class OverviewRepository:
         immediate_starts = sum(1 for item in priority_order if item["requires_run"])
         immediate_pots = sum(item["immediate_pots"] for item in priority_order)
         total_flow_ml_min = sum(item["total_flow_ml_min"] for item in priority_order)
+        complete_irrigation_volume_ml = sum(item["design_volume_ml"] for item in priority_order)
+        immediate_irrigation_volume_ml = sum(item["immediate_volume_ml"] for item in priority_order)
         max_zone_flow_ml_min = max([item["total_flow_ml_min"] for item in priority_order] or [0.0])
 
         if required_valves == 0:
             recommendation = "No active pots to map"
         elif immediate_starts == 0:
-            recommendation = "No immediate run; optimized full-refill plan is ready"
+            recommendation = "No immediate run, optimized full-refill plan is ready"
         elif not immediate_schedule["fits_window"]:
             recommendation = "Split sequence across watering windows"
         elif immediate_schedule["max_parallel_valves"] > 1:
@@ -383,6 +433,12 @@ class OverviewRepository:
             "total_runtime_min": round(immediate_runtime, 1),
             "full_refill_runtime_min": round(full_refill_runtime, 1),
             "design_runtime_min": round(full_refill_runtime, 1),
+            "complete_irrigation_volume_ml": round(complete_irrigation_volume_ml, 1),
+            "complete_irrigation_volume_l": round(complete_irrigation_volume_ml / 1000.0, 2),
+            "full_refill_volume_ml": round(complete_irrigation_volume_ml, 1),
+            "full_refill_volume_l": round(complete_irrigation_volume_ml / 1000.0, 2),
+            "immediate_irrigation_volume_ml": round(immediate_irrigation_volume_ml, 1),
+            "immediate_irrigation_volume_l": round(immediate_irrigation_volume_ml / 1000.0, 2),
             "optimized_runtime_min": full_schedule["runtime_min"],
             "immediate_optimized_runtime_min": immediate_schedule["runtime_min"],
             "total_flow_ml_min": round(total_flow_ml_min, 2),
@@ -406,6 +462,267 @@ class OverviewRepository:
         }
 
 
+def _next_planned_irrigation(conn, now: datetime) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT scheduled_start_at
+        FROM irrigation_actuations
+        WHERE status = 'planned'
+          AND scheduled_start_at AT TIME ZONE 'Europe/Bucharest' > %(now)s
+        ORDER BY scheduled_start_at
+        LIMIT 1
+        """,
+        {"now": now},
+    ).fetchone()
+    if row:
+        return _planned_irrigation_window(
+            conn,
+            table_name="irrigation_actuations",
+            scheduled_start_at=row["scheduled_start_at"],
+            source="actuation",
+        )
+
+    return None
+
+
+def _planned_irrigation_window(conn, table_name: str, scheduled_start_at: datetime, source: str) -> dict[str, Any] | None:
+    if table_name != "irrigation_actuations":
+        return None
+
+    row = conn.execute(
+        f"""
+        SELECT
+            min(scheduled_start_at AT TIME ZONE 'Europe/Bucharest') AS start_at,
+            max(scheduled_end_at AT TIME ZONE 'Europe/Bucharest') AS end_at,
+            count(*) AS item_count,
+            coalesce(sum(planned_volume_ml), 0) AS planned_volume_ml
+        FROM {table_name}
+        WHERE status = 'planned'
+          AND scheduled_start_at = %(scheduled_start_at)s
+        """,
+        {"scheduled_start_at": scheduled_start_at},
+    ).fetchone()
+    if not row or not row["start_at"] or not row["end_at"]:
+        return None
+
+    start = row["start_at"]
+    end = row["end_at"]
+    return {
+        "label": f"{start:%Y-%m-%d %H:%M} - {end:%H:%M}",
+        "start_at": start.isoformat(),
+        "end_at": end.isoformat(),
+        "source": source,
+        "item_count": int(row["item_count"] or 0),
+        "planned_volume_l": round(_number(row["planned_volume_ml"], 0.0) / 1000.0, 2),
+    }
+
+
+def _next_prescription_irrigation(conn, now: datetime) -> dict[str, Any] | None:
+    prescriptions = conn.execute(
+        """
+        SELECT experiment_type, prescription_date, payload
+        FROM irrigation_prescriptions
+        WHERE status = 'dispatched'
+          AND prescription_date > %(today)s
+        ORDER BY prescription_date, experiment_type
+        """,
+        {"today": now.date()},
+    ).fetchall()
+    candidates = []
+    for prescription in prescriptions:
+        payload = prescription.get("payload") or {}
+        for event in payload.get("events") or []:
+            start = _parse_local_datetime(event.get("scheduled_start_at"))
+            if not start or start <= now:
+                continue
+            candidates.append(
+                {
+                    "experiment_type": prescription.get("experiment_type"),
+                    "start_at": start,
+                    "end_at": _event_end_at(event, start),
+                    "planned_volume_ml": _number(event.get("planned_volume_ml"), 0.0),
+                    "valve_number": event.get("valve_number"),
+                    "valve_zone": event.get("valve_zone"),
+                }
+            )
+    if not candidates:
+        return None
+
+    next_start = min(item["start_at"] for item in candidates)
+    window_events = [item for item in candidates if item["start_at"] == next_start]
+    return _activity_window(
+        window_events,
+        source="prescription",
+        mode="next_planned",
+        display_label="Next planned irrigation",
+    )
+
+
+def _most_recent_irrigation(conn, now: datetime) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT scheduled_start_at
+        FROM irrigation_actuations
+        WHERE status IN ('running', 'completed')
+          AND scheduled_start_at AT TIME ZONE 'Europe/Bucharest' <= %(now)s
+        ORDER BY coalesce(completed_at, scheduled_end_at, scheduled_start_at) DESC
+        LIMIT 1
+        """,
+        {"now": now},
+    ).fetchone()
+    if not row:
+        return None
+
+    rows = conn.execute(
+        """
+        SELECT
+            experiment_type,
+            scheduled_start_at AT TIME ZONE 'Europe/Bucharest' AS start_at,
+            scheduled_end_at AT TIME ZONE 'Europe/Bucharest' AS end_at,
+            coalesce(delivered_volume_ml, planned_volume_ml, 0) AS planned_volume_ml,
+            valve_number,
+            valve_zone
+        FROM irrigation_actuations
+        WHERE status IN ('running', 'completed')
+          AND scheduled_start_at = %(scheduled_start_at)s
+        ORDER BY experiment_type, valve_number, pot_id
+        """,
+        {"scheduled_start_at": row["scheduled_start_at"]},
+    ).fetchall()
+    return _activity_window(
+        rows,
+        source="actuation_history",
+        mode="most_recent",
+        display_label="Most recent irrigation",
+    )
+
+
+def _irrigation_activity(
+    planned_window: dict[str, Any] | None,
+    recent_window: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if planned_window:
+        return {**planned_window, "mode": "next_planned", "display_label": "Next planned irrigation"}
+    if recent_window:
+        return {**recent_window, "mode": "most_recent", "display_label": "Most recent irrigation"}
+    return {
+        "label": NO_IRRIGATION_RECORDED_LABEL,
+        "start_at": None,
+        "end_at": None,
+        "source": "none",
+        "mode": "none",
+        "display_label": "Most recent irrigation",
+        "item_count": 0,
+        "planned_volume_l": 0.0,
+    }
+
+
+def _activity_window(
+    rows: list[dict[str, Any]],
+    source: str,
+    mode: str,
+    display_label: str,
+) -> dict[str, Any] | None:
+    if not rows:
+        return None
+    start = min(item["start_at"] for item in rows if item.get("start_at"))
+    end = max(item["end_at"] for item in rows if item.get("end_at"))
+    experiments = sorted({str(item.get("experiment_type")) for item in rows if item.get("experiment_type")})
+    valve_numbers = sorted({
+        int(item["valve_number"])
+        for item in rows
+        if item.get("valve_number") is not None
+    })
+    return {
+        "label": f"{start:%Y-%m-%d %H:%M} - {end:%H:%M}",
+        "start_at": start.isoformat(),
+        "end_at": end.isoformat(),
+        "source": source,
+        "mode": mode,
+        "display_label": display_label,
+        "item_count": len(rows),
+        "planned_volume_l": round(
+            sum(_number(item.get("planned_volume_ml"), 0.0) for item in rows) / 1000.0,
+            2,
+        ),
+        "experiment_types": experiments,
+        "activated_valves": _valve_label(valve_numbers),
+    }
+
+
+def _next_recommendation_ready_at(now: datetime) -> datetime:
+    candidate = datetime.combine(now.date(), get_settings().prescription_dispatch_time)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def _parse_local_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed
+    return parsed.astimezone(local_timezone()).replace(tzinfo=None)
+
+
+def _event_end_at(event: dict[str, Any], start: datetime) -> datetime:
+    end = _parse_local_datetime(event.get("scheduled_end_at"))
+    if end and end > start:
+        return end
+
+    duration_min = _number(event.get("duration_min"), 0.0)
+    planned_volume_ml = _number(event.get("planned_volume_ml"), 0.0)
+    flow_rate_ml_min = _number(event.get("flow_rate_ml_min"), 0.0)
+    if duration_min <= 0.0 and planned_volume_ml > 0.0 and flow_rate_ml_min > 0.0:
+        duration_min = planned_volume_ml / flow_rate_ml_min
+    return start + timedelta(minutes=max(duration_min, 1.0))
+
+
+def _valve_label(valve_numbers: list[int]) -> str:
+    if not valve_numbers:
+        return "none"
+    if valve_numbers == list(range(min(valve_numbers), max(valve_numbers) + 1)):
+        return f"V{valve_numbers[0]}" if len(valve_numbers) == 1 else f"V{valve_numbers[0]}-V{valve_numbers[-1]}"
+    return ", ".join(f"V{number}" for number in valve_numbers)
+
+
+def _next_dt_planned_irrigation(next_window: dict[str, Any] | None, valve_plan: dict[str, Any]) -> dict[str, Any] | None:
+    immediate_starts = int(valve_plan.get("valve_starts") or 0)
+    if immediate_starts <= 0:
+        return None
+    if not next_window or not next_window.get("start_at") or not next_window.get("end_at"):
+        return None
+
+    try:
+        start = datetime.fromisoformat(str(next_window["start_at"]))
+        window_end = datetime.fromisoformat(str(next_window["end_at"]))
+    except ValueError:
+        return None
+
+    runtime_min = _number(
+        valve_plan.get("immediate_optimized_runtime_min"),
+        _number(valve_plan.get("total_runtime_min"), 0.0),
+    )
+    planned_volume_l = _number(valve_plan.get("immediate_irrigation_volume_l"), 0.0)
+
+    planned_end = start + timedelta(minutes=max(runtime_min, 0.0))
+    if planned_end <= start or planned_end > window_end:
+        planned_end = window_end
+
+    return {
+        "label": f"{start:%Y-%m-%d %H:%M} - {planned_end:%H:%M}",
+        "start_at": start.isoformat(),
+        "end_at": planned_end.isoformat(),
+        "source": "digital_twin_immediate_plan",
+        "item_count": immediate_starts,
+        "planned_volume_l": round(planned_volume_l, 2),
+    }
+
+
 def _next_irrigation_window(conn, now: datetime) -> dict[str, Any]:
     row = conn.execute(
         """
@@ -426,6 +743,8 @@ def _next_irrigation_window(conn, now: datetime) -> dict[str, Any]:
             ("morning_window_start", "morning_window_end"),
             ("evening_window_start", "evening_window_end"),
         ):
+            if start_key == "evening_window_start" and not _is_hot_irrigation_day(conn, day):
+                continue
             start_time = row[start_key]
             end_time = row[end_key]
             if start_time and end_time:
@@ -442,6 +761,23 @@ def _next_irrigation_window(conn, now: datetime) -> dict[str, Any]:
     }
 
 
+def _is_hot_irrigation_day(conn, day) -> bool:
+    row = conn.execute(
+        """
+        SELECT max(temperature_c) AS max_temperature_c
+        FROM weather_hourly
+        WHERE location_name = 'Cluj-Napoca'
+          AND observed_local_at >= %(start_at)s
+          AND observed_local_at < %(end_at)s
+        """,
+        {
+            "start_at": datetime.combine(day, time.min),
+            "end_at": datetime.combine(day + timedelta(days=1), time.min),
+        },
+    ).fetchone()
+    return _number(row["max_temperature_c"] if row else None, 0.0) >= 32.0
+
+
 def _rain_level(rain_mm: float) -> str:
     if rain_mm >= 30.0:
         return "High"
@@ -456,6 +792,7 @@ def _valve_candidate(row: dict[str, Any]) -> dict[str, Any] | None:
     target = _number(row.get("moisture_target_pct"), min_moisture)
     urgency = max(0.0, min_moisture - moisture)
     requires_run = urgency > 0
+    design_volume_ml = _planned_valve_volume_ml(row, min_moisture, target)
     planned_volume_ml = _planned_valve_volume_ml(row, moisture if requires_run else min_moisture, target)
     flow_rate = max(_number(row.get("drip_flow_ml_min"), 1.0), 1.0)
     run_minutes = planned_volume_ml / flow_rate if flow_rate > 0 else 0.0
@@ -474,12 +811,14 @@ def _valve_candidate(row: dict[str, Any]) -> dict[str, Any] | None:
         "pot_code": row["pot_code"],
         "label": row["label"],
         "zone": row["balcony_zone"],
+        "rain_exposure": row.get("rain_exposure") or "partially_exposed",
         "sun_exposure": row["sun_exposure"],
         "plant_type_label": row["plant_type_label"],
         "moisture_pct": round(moisture, 1),
         "moisture_min_pct": round(min_moisture, 1),
         "moisture_target_pct": round(target, 1),
         "planned_volume_ml": planned_volume_ml,
+        "design_volume_ml": design_volume_ml,
         "flow_rate_ml_min": round(flow_rate, 2),
         "run_minutes": round(run_minutes, 1),
         "priority_score": round(priority_score, 2),
@@ -626,7 +965,7 @@ def _freshness_percent(latest_at: datetime | None, now: datetime) -> int:
 
 
 def _confidence_score(freshness_percent: int, sensor_count: int, weather_rows: int) -> float:
-    sensor_factor = min(1.0, sensor_count / 4.0)
+    sensor_factor = min(1.0, sensor_count / max(VALVE_COUNT, 1))
     weather_factor = min(1.0, weather_rows / 72.0)
     freshness_factor = max(0.0, min(1.0, freshness_percent / 100.0))
     return round(0.2 + 0.45 * freshness_factor + 0.25 * sensor_factor + 0.1 * weather_factor, 2)
@@ -667,9 +1006,8 @@ class SensorPlacementRepository:
                     pt.water_need_level,
                     pt.heat_sensitive,
                     pt.allows_second_watering,
-                    p.default_location,
-                    p.winter_location,
                     p.balcony_zone,
+                    p.rain_exposure,
                     p.sun_exposure,
                     p.wind_exposure,
                     p.container_material,
@@ -713,9 +1051,8 @@ class SensorPlacementRepository:
                     p.small_subtype,
                     p.plant_type_code,
                     pt.label AS plant_type_label,
-                    p.default_location,
-                    p.winter_location,
                     p.balcony_zone,
+                    p.rain_exposure,
                     p.sun_exposure,
                     p.wind_exposure,
                     p.container_material,
@@ -739,16 +1076,23 @@ class SensorPlacementRepository:
                     ) AS sensor_reading_pot_count
                 """
             ).fetchone()
-        items = [_json_ready(row) for row in rows]
+        items = [_with_valve_fields(_json_ready(row)) for row in rows]
         stored_sensor_count = items[0]["requested_sensor_count"] if items else 0
         sensor_reading_pot_count = int(counts["sensor_reading_pot_count"] or 0)
+        active_pot_count = int(counts["active_pot_count"] or 0)
+        default_sensor_count = min(active_pot_count, VALVE_COUNT) if active_pot_count > 0 else 0
+        selected_zones = {str(item.get("balcony_zone") or "") for item in items}
+        required_zones = {item["zone"] for item in VALVE_ZONE_DESIGN}
         return {
-            "sensor_count": stored_sensor_count or sensor_reading_pot_count,
+            "sensor_count": stored_sensor_count or default_sensor_count,
+            "minimum_sensor_count": VALVE_COUNT,
+            "valve_count": VALVE_COUNT,
+            "has_all_valve_zones": bool(items) and required_zones.issubset(selected_zones),
             "stored_sensor_count": stored_sensor_count,
             "sensor_reading_pot_count": sensor_reading_pot_count,
             "items": items,
             "updated_at": items[0]["created_at"] if items else None,
-            "active_pot_count": int(counts["active_pot_count"] or 0),
+            "active_pot_count": active_pot_count,
         }
 
     def replace(self, requested_sensor_count: int, recommendations: list[dict[str, Any]]) -> dict[str, Any]:
@@ -811,3 +1155,10 @@ def _json_ready(value):
     if hasattr(value, "isoformat"):
         return value.isoformat()
     return value
+
+
+def _with_valve_fields(item: dict[str, Any]) -> dict[str, Any]:
+    valve_number = VALVE_ZONE_ORDER.get(str(item.get("balcony_zone") or ""))
+    item["valve_number"] = valve_number
+    item["valve_label"] = f"V{valve_number}" if valve_number else "Unmapped"
+    return item

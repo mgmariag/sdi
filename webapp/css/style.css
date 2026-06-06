@@ -6,12 +6,13 @@
     --dt-blue-900: #17324d;
     --dt-cyan-100: #c7f7ff;
     --dt-cyan-500: #43bfd2;
-    --dt-green-100: #e4ffc3;
-    --dt-green-400: #aee36d;
+    --dt-green-100: #b4df80;
+    --dt-green-400: #6fbf45;
     --dt-pink-100: #ffd7eb;
     --dt-pink-500: #d96aa7;
     --dt-purple-100: #ece1ff;
     --dt-purple-500: #8f6ed5;
+    --dt-now-marker: #d7cde8;
     --dt-ink: #17324d;
     --dt-muted: #5d7187;
     --dt-line: rgba(77, 130, 216, 0.2);
@@ -23,9 +24,22 @@ body,
     background: #f7fbff;
 }
 
+@media (min-width: 80rem) {
+    .sapUiMedia-Std-Desktop .sapUShellApplicationContainer.sapUShellApplicationContainerLimitedWidth,
+    .sapUiMedia-StdExt-Desktop .sapUShellApplicationContainer.sapUShellApplicationContainerLimitedWidth,
+    .sapUiMedia-StdExt-LargeDesktop .sapUShellApplicationContainer.sapUShellApplicationContainerLimitedWidth {
+        width: 100% !important;
+        max-width: none !important;
+        margin-right: 0 !important;
+        margin-left: 0 !important;
+    }
+}
+
 body .experimentPage {
     box-sizing: border-box;
-    width: min(calc(100% - clamp(1rem, 3vw, 4rem)), 132rem) !important;
+    container-name: experiment-page;
+    container-type: inline-size;
+    width: min(100%, 132rem) !important;
     max-width: 132rem;
     min-height: auto;
     margin: 0 auto;
@@ -100,23 +114,28 @@ body .experimentControlRow {
 }
 
 body .experimentButtonGroup {
-    gap: 0.75rem;
-    flex-wrap: wrap;
-    align-self: center;
+    display: grid !important;
+    grid-template-columns: 8rem repeat(3, 9.5rem);
+    column-gap: 1.35rem;
+    align-items: start !important;
+    align-self: flex-end;
     justify-content: flex-end !important;
     margin-left: auto;
-    padding-top: 0.35rem;
+    padding-top: 0;
 }
 
 .samplingParameterControl {
     flex: 0 0 8rem;
+    width: 8rem !important;
 }
 
 .experimentButton {
+    width: 9.5rem;
     min-width: 9.5rem;
     font-weight: 700;
     height: 2.25rem;
-    padding: 0.4rem;
+    margin-top: 1.35rem;
+    padding: 0;
 }
 
 .experimentButton .sapMBtnInner {
@@ -143,7 +162,7 @@ body .experimentButtonGroup {
 }
 
 .fuzzyButton .sapMBtnInner {
-    background: linear-gradient(180deg, #b4a4fa, #70a4f7) !important;
+    background: linear-gradient(180deg, #9dbef7, #43bfd2) !important;
 }
 
 #activeText {
@@ -205,8 +224,18 @@ body .experimentButtonGroup {
     min-width: 0;
 }
 
+.chartWithOverviewRail {
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr) minmax(19rem, 24rem);
+    gap: 1.25rem;
+    align-items: start;
+    width: 100%;
+    transition: grid-template-columns 0.2s ease;
+}
+
 .chartWithOverviewRail .chartMainColumn {
-    flex: 1 1 78rem;
+    min-width: 0;
+    overflow: hidden;
 }
 
 .overviewOnboarding {
@@ -249,7 +278,7 @@ body .experimentButtonGroup {
 }
 
 .overviewExperimentCardFuzzy {
-    border-top: 0.3rem solid var(--dt-purple-500);
+    border-top: 0.3rem solid var(--dt-blue-600);
 }
 
 .overviewExperimentCardHeader {
@@ -521,22 +550,39 @@ body .experimentButtonGroup {
 }
 
 .overviewSensorFooter {
-    display: flex;
-    justify-content: flex-end;
-    gap: 1rem;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.5rem;
     margin-top: 0.75rem;
     color: var(--dt-ink);
     font-size: 0.78rem;
 }
 
-.overviewSensorFooter i {
-    display: inline-block;
-    width: 0.45rem;
-    height: 0.45rem;
-    margin-right: 0.35rem;
-    border-radius: 50%;
-    background: #79d267;
+.overviewSensorFooter > span {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.32rem 0.45rem;
+    border: 1px solid rgba(77, 130, 216, 0.14);
+    border-radius: 0.4rem;
+    background: rgba(255, 255, 255, 0.68);
+}
+
+.overviewSensorFooter > span > span {
+    min-width: 0;
+    color: var(--dt-muted);
+    font-weight: 700;
+    line-height: 1.2;
+}
+
+.overviewSensorFooter strong {
+    color: var(--dt-ink);
+    font-weight: 800;
+    line-height: 1.2;
+    text-align: right;
+    white-space: normal;
 }
 
 .overviewPlantLayout {
@@ -584,7 +630,7 @@ body .experimentButtonGroup {
      /* border: 1px solid rgba(0, 76, 140, 0.12); */
     box-shadow: 0 0.25rem 1rem rgba(0, 55, 100, 0.08);
     border-radius: 0.4rem;
-    background: rgb(196, 236, 241);;
+    background: rgb(196, 236, 241);
         /* linear-gradient(180deg, rgba(77, 130, 216, 0.24), rgba(67, 191, 210, 0.14)),
         var(--dt-blue-900); */
     box-shadow: 0 0.9rem 1.9rem rgba(23, 50, 77, 0.18);
@@ -725,6 +771,10 @@ body .experimentButtonGroup {
 
 .overviewRailIcon-clock {
     color: var(--dt-purple-500);
+}
+
+.overviewRailIcon-temperature {
+    color: #f08a18;
 }
 
 .overviewRailIcon-valve {
@@ -1048,114 +1098,8 @@ body .experimentButtonGroup {
     width: 100% !important;
 }
 
-.experimentSummaryCards {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(12rem, 16rem));
-    gap: 0.75rem;
-    justify-content: start;
-    width: 100%;
-    margin-top: 0.75rem;
-}
-
-.experimentSummaryPanel .sapMPanelContent {
-    padding-top: 0.7rem;
-}
-
-.experimentSummaryPanel .experimentSummaryCards {
-    margin-top: 0;
-}
-
-.summaryCard {
-    box-sizing: border-box;
-    display: flex;
-    min-height: 6.4rem;
-    gap: 0.8rem;
-    align-items: flex-start;
-    padding: 0.9rem 0.95rem;
-    border: 1px solid rgba(77, 130, 216, 0.14);
-    border-radius: 0.5rem;
-    background: rgba(255, 255, 255, 0.92);
-    box-shadow: 0 0.65rem 1.45rem rgba(23, 50, 77, 0.09);
-}
-
-.summaryCardIcon {
-    display: inline-flex;
-    width: 2.5rem;
-    height: 2.5rem;
-    min-width: 2.5rem;
-    align-items: center;
-    justify-content: center;
-    border-radius: 0.5rem;
-    background: rgba(237, 245, 255, 0.92);
-    color: var(--dt-blue-600);
-}
-
-.summaryCardIcon svg {
-    width: 1.65rem;
-    height: 1.65rem;
-    fill: none;
-    stroke: currentColor;
-    stroke-linecap: round;
-    stroke-linejoin: round;
-    stroke-width: 1.9;
-}
-
-.summaryCardBody {
-    min-width: 0;
-}
-
-.summaryCardTitle {
-    color: var(--dt-ink);
-    font-size: 0.76rem;
-    font-weight: 800;
-    line-height: 1.25;
-}
-
-.summaryCardValue {
-    margin-top: 0.35rem;
-    color: #0d1f36;
-    font-size: 1.42rem;
-    font-weight: 800;
-    line-height: 1.1;
-    overflow-wrap: anywhere;
-}
-
-.summaryCardDetail {
-    margin-top: 0.4rem;
-    color: var(--dt-muted);
-    font-size: 0.72rem;
-    font-weight: 700;
-    line-height: 1.25;
-}
-
-.summaryCard-blue .summaryCardIcon {
-    background: rgba(191, 212, 251, 0.38);
-    color: var(--dt-blue-600);
-}
-
-.summaryCard-cyan .summaryCardIcon {
-    background: rgba(191, 245, 255, 0.48);
-    color: var(--dt-cyan-500);
-}
-
-.summaryCard-green .summaryCardIcon {
-    background: rgba(228, 255, 195, 0.58);
-    color: #5eae43;
-}
-
-.summaryCard-purple .summaryCardIcon {
-    background: rgba(236, 225, 255, 0.72);
-    color: var(--dt-purple-500);
-}
-
-.summaryCard-pink .summaryCardIcon {
-    background: rgba(255, 215, 235, 0.62);
-    color: var(--dt-pink-500);
-}
-
-.summaryCard-yellow .summaryCardIcon {
-    background: rgba(247, 223, 138, 0.3);
-    color: #f08a18;
+.chartMainColumn .samplingSingleAxisAlignedChart.sapVizFrame {
+    width: calc(100% - 2rem) !important;
 }
 
 .summarySection {
@@ -1197,19 +1141,39 @@ body .experimentButtonGroup {
 }
 
 .fuzzyPanel {
-    border-top: 0.35rem solid var(--dt-purple-500);
+    border-top: 0.35rem #9dbef7 solid;
+}
+
+.experimentChartStack {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    width: 100%;
+}
+
+.experimentChartBlock {
+    width: 100%;
+}
+
+.experimentChartTitle.sapMText {
+    display: block;
+    margin: 0 0 0.3rem 0.1rem;
+    color: var(--dt-ink);
+    font-size: 0.86rem;
+    font-weight: 800;
 }
 
 .sapVizFrame {
+    box-sizing: border-box;
     border: 1px solid rgba(77, 130, 216, 0.14);
     border-radius: 0.5rem;
     background: rgba(255, 255, 255, 0.92);
-    overflow: visible;
+    overflow: hidden !important;
     position: relative;
 }
 
 .sapVizFrame svg {
-    overflow: visible;
+    overflow: hidden !important;
 }
 
 .dtChartOverlay {
@@ -1225,10 +1189,24 @@ body .experimentButtonGroup {
     background: rgba(157, 190, 247, 0.16);
 }
 
+.dtChartFutureBandLabel {
+    position: absolute;
+    top: 0.45rem;
+    left: 50%;
+    max-width: calc(100% - 1rem);
+    transform: translateX(-50%);
+    color: #9879da;
+    font-size: 0.62rem;
+    font-weight: 400;
+    line-height: 1.15;
+    text-align: center;
+    user-select: none;
+}
+
 .dtChartNowLine {
     position: absolute;
     width: 0;
-    border-left: 2px dashed #8f6ed5;
+    border-left: 2px dashed var(--dt-now-marker);
 }
 
 .dtChartNowBadge {
@@ -1236,12 +1214,109 @@ body .experimentButtonGroup {
     transform: translateX(-50%);
     padding: 0.2rem 0.42rem;
     border-radius: 0.25rem;
-    background: #8f6ed5;
-    color: #fff;
+    background: var(--dt-now-marker); 
+    color: #9879da;
     font-size: 0.68rem;
-    font-weight: 700;
+    font-weight: 400;
     line-height: 1;
-    box-shadow: 0 0.3rem 0.7rem rgba(23, 50, 77, 0.16);
+    white-space: nowrap;
+    /* box-shadow: 0 0.3rem 0.7rem rgba(251, 195, 239, 0.28); */
+}
+
+.dtChartThresholdLine {
+    position: absolute;
+    height: 0.8rem;
+    transform: translateY(-50%);
+    border: 0;
+    cursor: help;
+    pointer-events: auto;
+}
+
+.dtChartThresholdLine::after {
+    position: absolute;
+    top: 50%;
+    right: 0;
+    left: 0;
+    border-top: 1.5px dashed;
+    border-color: inherit;
+    content: "";
+}
+
+.dtChartThresholdLabel {
+    position: absolute;
+    top: -0.85rem;
+    left: 0.25rem;
+    z-index: 1;
+    padding: 0.08rem 0.35rem;
+    border-radius: 0.18rem;
+    background: rgba(255, 255, 255, 0.92);
+    color: var(--dt-ink);
+    font-size: 0.64rem;
+    font-weight: 700;
+    line-height: 1.1;
+    pointer-events: none;
+    user-select: none;
+}
+
+.dtChartLegend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem 1.15rem;
+    align-items: center;
+    justify-content: center;
+    min-height: 1.25rem;
+    margin: 0.35rem 0 0.15rem;
+    color: var(--dt-ink);
+    font-size: 0.72rem;
+    font-weight: 600;
+    line-height: 1.1;
+}
+
+.dtChartLegendItem {
+    display: inline-flex;
+    gap: 0.35rem;
+    align-items: center;
+    white-space: nowrap;
+}
+
+.dtChartLegendMarker {
+    display: inline-block;
+    flex: 0 0 auto;
+    color: var(--dt-chart-series-color);
+}
+
+.dtChartLegendMarker-line {
+    position: relative;
+    width: 1.35rem;
+    height: 0.65rem;
+}
+
+.dtChartLegendMarker-line::before {
+    position: absolute;
+    top: 50%;
+    right: 0;
+    left: 0;
+    border-top: 2px solid currentColor;
+    content: "";
+}
+
+.dtChartLegendMarker-line::after {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 0.38rem;
+    height: 0.38rem;
+    border-radius: 50%;
+    background: currentColor;
+    content: "";
+    transform: translate(-50%, -50%);
+}
+
+.dtChartLegendMarker-bar {
+    width: 0.65rem;
+    height: 0.65rem;
+    border-radius: 0.12rem;
+    background: currentColor;
 }
 
 .experimentDataTable {
@@ -1314,7 +1389,8 @@ body .experimentButtonGroup {
 
 @media (max-width: 88rem) {
     .chartWithOverviewRail {
-        flex-direction: column;
+         gap: 1rem;
+         align-items: flex-start;
     }
 
     .chartWithOverviewRail .overviewSideRail {
@@ -1359,9 +1435,6 @@ body .experimentButtonGroup {
         display: none;
     }
 
-    .experimentSummaryCards {
-        grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
-    }
 }
 
 @media (max-width: 48rem) {
@@ -1373,6 +1446,15 @@ body .experimentButtonGroup {
     .experimentButtonGroup,
     .experimentButton {
         width: 100%;
+    }
+
+    .experimentButton {
+        margin-top: 0;
+    }
+
+    body .experimentButtonGroup {
+        grid-template-columns: 1fr;
+        row-gap: 0.55rem;
     }
 
     .samplingParameterControl {
@@ -1404,10 +1486,6 @@ body .experimentButtonGroup {
         min-width: 0;
     }
 
-    .experimentSummaryCards {
-        grid-template-columns: 1fr;
-    }
-
     .experimentFooterContent,
     .experimentFooterCopyright {
         align-items: flex-start;
@@ -1428,11 +1506,9 @@ body .experimentButtonGroup {
 }
 
 .experimentOnlyOverview {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+    display: block;
     width: 100%;
     min-width: 0;
-    gap: 0.9rem;
     padding: 0;
     border: 0;
     background: transparent;
@@ -1443,7 +1519,386 @@ body .experimentButtonGroup {
     width: 100%;
     min-width: 0;
     flex: 1 1 auto;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+}
+
+.chartWithOverviewRail:has(.experimentOverviewDetails[open]),
+.chartWithOverviewRail:has(.experimentOverviewContext[open]) {
+    grid-template-columns: minmax(0, 1fr) minmax(22rem, 27.5rem);
+}
+
+.chartWithOverviewRail:has(.experimentOverviewDetails:not([open])),
+.chartWithOverviewRail:has(.experimentOverviewContext:not([open])) {
+    grid-template-columns: minmax(0, 1fr) minmax(11rem, 12.5rem);
+}
+
+.experimentOverviewDetails {
+    width: 100%;
+}
+
+.experimentOverviewContext {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 0.65rem;
+    border: 1px solid rgba(191, 245, 255, 0.2);
+    border-radius: 0.5rem;
+    background: rgb(196, 236, 241);
+    box-shadow: 0 0.9rem 1.9rem rgba(23, 50, 77, 0.18);
+}
+
+.experimentOverviewContextTitle {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    margin: 0;
+    padding-left: 0.15rem;
+    color: var(--dt-ink);
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 900;
+    line-height: 1.2;
+    list-style: none;
+}
+
+.experimentOverviewContext[open] .experimentOverviewContextTitle {
+    margin-bottom: 0.55rem;
+}
+
+.experimentOverviewContextTitle::before {
+    display: inline-block;
+    width: 0;
+    height: 0;
+    border-top: 0.34rem solid var(--dt-ink);
+    border-right: 0.28rem solid transparent;
+    border-left: 0.28rem solid transparent;
+    content: "";
+    transform: translateY(0.05rem);
+    transition: transform 0.18s ease;
+}
+
+.experimentOverviewContextTitle::-webkit-details-marker {
+    display: none;
+}
+
+.experimentOverviewContext:not([open]) .experimentOverviewContextTitle::before {
+    transform: rotate(-90deg) translateX(0.04rem);
+}
+
+.experimentEvidencePanel {
+    box-sizing: border-box;
+    width: 100%;
+    margin-bottom: 0.48rem;
+    padding: 0.62rem;
+    border: 1px solid rgba(88, 169, 200, 0.28);
+    border-left: 0.28rem solid var(--dt-blue-600);
+    border-radius: 0.5rem;
+    background:
+        linear-gradient(135deg, rgba(232, 248, 251, 0.98), rgba(227, 240, 255, 0.9));
+    box-shadow: 0 0.45rem 1.05rem rgba(10, 29, 49, 0.09);
+}
+
+.experimentEvidencePanel-good {
+    border-left-color: #4c9a45;
+    background:
+        linear-gradient(135deg, rgba(237, 249, 241, 0.98), rgba(225, 243, 250, 0.9));
+}
+
+.experimentEvidencePanel-watch {
+    border-left-color: #d5962c;
+    background:
+        linear-gradient(135deg, rgba(252, 245, 230, 0.98), rgba(227, 244, 250, 0.9));
+}
+
+.experimentEvidencePanel-risk {
+    border-left-color: var(--dt-pink-500);
+    background:
+        linear-gradient(135deg, rgba(255, 241, 248, 0.97), rgba(227, 244, 250, 0.9));
+}
+
+.experimentEvidenceHeader {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6rem;
+    padding-bottom: 0.44rem;
+    border-bottom: 1px solid rgba(77, 130, 216, 0.14);
+}
+
+.experimentEvidenceHeader span {
+    color: var(--dt-muted);
+    font-size: 0.68rem;
+    font-weight: 800;
+    line-height: 1.15;
+}
+
+.experimentEvidenceHeader strong {
+    color: var(--dt-ink);
+    font-size: 0.78rem;
+    font-weight: 900;
+    line-height: 1.15;
+    text-align: right;
+}
+
+.experimentEvidenceGrid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+    gap: 0.36rem;
+    margin-top: 0.46rem;
+}
+
+.experimentEvidenceMetric {
+    min-width: 0;
+    padding: 0.4rem 0.48rem;
+    border: 1px solid rgba(77, 130, 216, 0.16);
+    border-radius: 0.4rem;
+    background: rgba(245, 251, 255, 0.62);
+}
+
+.experimentEvidenceMetric span,
+.experimentEvidenceMetric strong,
+.experimentEvidenceMetric em {
+    display: block;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.experimentEvidenceMetric span {
+    color: var(--dt-muted);
+    font-size: 0.62rem;
+    font-weight: 800;
+    line-height: 1.15;
+}
+
+.experimentEvidenceMetric strong {
+    margin-top: 0.12rem;
+    color: var(--dt-ink);
+    font-size: 0.84rem;
+    font-weight: 900;
+    line-height: 1.12;
+}
+
+.experimentEvidenceMetric em {
+    margin-top: 0.12rem;
+    color: var(--dt-muted);
+    font-size: 0.6rem;
+    font-style: normal;
+    line-height: 1.15;
+}
+
+.experimentEvidencePanel p {
+    margin: 0.48rem 0 0;
+    color: var(--dt-muted);
+    font-size: 0.66rem;
+    font-weight: 650;
+    line-height: 1.35;
+}
+
+.experimentOverviewSummary {
+    box-sizing: border-box;
+    display: flex;
+    min-height: 2.2rem;
+    align-items: center;
+    padding: 0.45rem 0.65rem;
+    border: 1px solid rgba(88, 169, 200, 0.25);
+    border-radius: 0.5rem;
+    background:
+        linear-gradient(135deg, rgba(232, 248, 251, 0.96), rgba(227, 240, 255, 0.88));
+    color: var(--dt-ink);
+    cursor: pointer;
+    font-size: 0.85rem;
+    font-weight: 800;
+    line-height: 1.2;
+    list-style-position: inside;
+    box-shadow: 0 0.4rem 1rem rgba(10, 29, 49, 0.1);
+}
+
+.experimentOverviewDetails[open] .experimentOverviewSummary {
+    margin-bottom: 0.45rem;
+}
+
+.experimentOverviewDetails:not([open]) .experimentOverviewSummary {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+.experimentOverviewCards {
+    box-sizing: border-box;
+    display: grid;
     grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+    gap: 0.7rem;
+    width: 100%;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+}
+
+@container experiment-page (max-width: 88rem) {
+    .chartWithOverviewRail {
+        grid-template-columns: minmax(0, 1fr) minmax(10rem, 12rem) !important;
+        gap: 0.85rem;
+    }
+
+    .chartWithOverviewRail:has(.experimentOverviewDetails[open]),
+    .chartWithOverviewRail:has(.experimentOverviewContext[open]) {
+        grid-template-columns: minmax(0, 1fr) minmax(16.5rem, 20rem) !important;
+    }
+
+    .chartWithOverviewRail:has(.experimentOverviewDetails:not([open])),
+    .chartWithOverviewRail:has(.experimentOverviewContext:not([open])) {
+        grid-template-columns: minmax(0, 1fr) minmax(10rem, 12rem) !important;
+    }
+
+    .chartWithOverviewRail .overviewSideRail,
+    .chartWithOverviewRail .experimentOnlyOverview {
+        width: 100%;
+        min-width: 0;
+    }
+
+    .experimentEvidencePanel,
+    .experimentOverviewContext {
+        padding: 0.62rem;
+    }
+
+    .experimentEvidenceGrid,
+    .experimentOverviewCards {
+        grid-template-columns: 1fr;
+    }
+
+    .experimentEvidenceGrid {
+        gap: 0.35rem;
+    }
+
+    .experimentEvidenceMetric {
+        padding: 0.42rem 0.46rem;
+    }
+
+    .overviewDashboard .overviewValveList {
+        grid-template-columns: repeat(auto-fit, minmax(min(100%, 12.25rem), 1fr)) !important;
+    }
+
+    .overviewDashboard .overviewValveRow,
+    .overviewDashboard .overviewValveBatch,
+    .overviewDashboard .overviewValveGauge {
+        padding: 0.55rem !important;
+    }
+
+    .overviewDashboard .overviewValveStats {
+        gap: 0.24rem;
+    }
+
+    .overviewDashboard .overviewValveStats span {
+        padding: 0.3rem 0.34rem;
+    }
+}
+
+@container experiment-page (max-width: 64rem) {
+    .experimentOverviewCards {
+        grid-template-columns: 1fr;
+    }
+}
+
+@container experiment-page (max-width: 48rem) {
+    .chartWithOverviewRail {
+        grid-template-columns: minmax(0, 1fr) minmax(9rem, 10.5rem) !important;
+        gap: 0.65rem;
+    }
+
+    .chartWithOverviewRail:has(.experimentOverviewDetails[open]),
+    .chartWithOverviewRail:has(.experimentOverviewContext[open]) {
+        grid-template-columns: minmax(0, 1fr) minmax(12.5rem, 14rem) !important;
+    }
+
+    .chartWithOverviewRail:has(.experimentOverviewDetails:not([open])),
+    .chartWithOverviewRail:has(.experimentOverviewContext:not([open])) {
+        grid-template-columns: minmax(0, 1fr) minmax(9rem, 10.5rem) !important;
+    }
+
+    .experimentEvidenceHeader {
+        gap: 0.35rem;
+    }
+
+    .experimentEvidenceHeader strong {
+        font-size: 0.72rem;
+    }
+
+    .experimentEvidenceMetric strong {
+        font-size: 0.78rem;
+    }
+
+    .experimentEvidencePanel p {
+        font-size: 0.6rem;
+    }
+}
+
+@container experiment-page (max-width: 34rem) {
+    .chartWithOverviewRail,
+    .chartWithOverviewRail:has(.experimentOverviewDetails[open]),
+    .chartWithOverviewRail:has(.experimentOverviewDetails:not([open])),
+    .chartWithOverviewRail:has(.experimentOverviewContext[open]),
+    .chartWithOverviewRail:has(.experimentOverviewContext:not([open])) {
+        grid-template-columns: 1fr !important;
+    }
+}
+
+.overviewStateContextCard {
+    grid-column: 1 / -1;
+}
+
+.experimentOnlyOverview .overviewRailMetric strong {
+    flex: 0 1 auto;
+    max-width: none;
+    line-height: 1.15;
+    white-space: nowrap;
+}
+
+.experimentOnlyOverview .overviewRailCard {
+    padding: 0.65rem 0.75rem;
+}
+
+.experimentOnlyOverview .overviewRailCard h3 {
+    margin-bottom: 0.45rem;
+}
+
+.experimentOnlyOverview .overviewRailMetric {
+    min-height: 1.72rem;
+    gap: 0.55rem;
+}
+
+.overviewWeatherImpactCard .overviewRailMetric strong {
+    max-width: none;
+}
+
+.overviewWeatherReason {
+    min-height: 1.85rem;
+    align-items: center;
+    padding-top: 0;
+}
+
+.overviewIrrigationWindow {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.14rem;
+}
+
+.overviewIrrigationWindowTime,
+.overviewIrrigationValves {
+    display: block;
+    line-height: 1.15;
+}
+
+.overviewIrrigationValves {
+    color: var(--dt-muted);
+    font-size: 0.68rem;
+    font-weight: 750;
+    white-space: normal;
+    overflow-wrap: anywhere;
 }
 
 /* ==========================================================
@@ -1472,7 +1927,7 @@ body .experimentButtonGroup {
     font-size: 0.98rem !important;
 }
 
-/* Digital Twin State rows: more compact */
+/* Current state rows: more compact */
 .overviewDashboard .overviewRailMetric {
     min-height: 1.65rem !important;
     gap: 0.5rem !important;
@@ -1542,70 +1997,334 @@ body .experimentButtonGroup {
     gap: 0.6rem !important;
 }
 
-/* Valve Priority Plan: less vertical space */
+/* Valve Priority Plan */
 .overviewDashboard .overviewValveCard {
-    padding: 0.9rem 1rem !important;
+    padding: 0.95rem 1rem 1rem !important;
 }
 
-/* Metric cards inside valve plan */
-.overviewDashboard .overviewValveMetrics {
-    grid-template-columns: repeat(8, minmax(0, 1fr)) !important;
-    gap: 0.55rem !important;
+.overviewDashboard .overviewValveHero {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0.75rem;
+    align-items: center;
+    padding: 0.75rem 0.85rem;
+    border: 1px solid rgba(77, 130, 216, 0.18);
+    border-radius: 0.55rem;
+    background:
+        linear-gradient(135deg, rgba(237, 245, 255, 0.96), rgba(199, 247, 255, 0.44)),
+        #fff;
 }
 
-.overviewDashboard .overviewValveMetrics .overviewRailMetric {
-    min-height: 4.1rem !important;
-    padding: 0.55rem 0.6rem !important;
-    gap: 0.25rem !important;
+.overviewDashboard .overviewValveHero span,
+.overviewDashboard .overviewValveSectionHeader span,
+.overviewDashboard .overviewValveGauge span {
+    display: block;
+    color: var(--dt-muted);
+    font-size: 0.68rem;
+    font-weight: 700;
+    line-height: 1.2;
 }
 
-.overviewDashboard .overviewValveMetrics .overviewRailMetric strong {
-    font-size: 1rem !important;
+.overviewDashboard .overviewValveHero strong {
+    display: block;
+    margin-top: 0.15rem;
+    color: var(--dt-ink);
+    font-size: 0.95rem;
+    line-height: 1.25;
 }
 
-/* Priority label bar */
-.overviewValveMode {
-    margin-top: 0.55rem !important;
-    padding: 0.4rem 0.55rem !important;
-    font-size: 0.7rem !important;
+.overviewDashboard .overviewValveStatus {
+    display: inline-flex;
+    min-height: 1.65rem;
+    align-items: center;
+    justify-content: center;
+    padding: 0 0.65rem;
+    border-radius: 999px;
+    font-size: 0.7rem;
+    font-style: normal;
+    font-weight: 800;
+    line-height: 1;
+    white-space: nowrap;
 }
 
-/* Batch cards less tall */
+.overviewDashboard .overviewValveStatusOk {
+    background: rgba(174, 227, 109, 0.28);
+    color: #2f6f35;
+}
+
+.overviewDashboard .overviewValveStatusSplit {
+    background: rgba(255, 215, 235, 0.52);
+    color: #9f3d70;
+}
+
+.overviewDashboard .overviewValveGauges {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.65rem;
+    margin-top: 0.65rem;
+}
+
+.overviewDashboard .overviewValveGauge {
+    min-width: 0;
+    padding: 0.65rem 0.75rem;
+    border: 1px solid rgba(77, 130, 216, 0.14);
+    border-radius: 0.5rem;
+    background: rgba(255, 255, 255, 0.78);
+}
+
+.overviewDashboard .overviewValveGauge div {
+    display: flex;
+    min-width: 0;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.75rem;
+}
+
+.overviewDashboard .overviewValveGauge strong {
+    color: var(--dt-ink);
+    font-size: 0.92rem;
+    line-height: 1.2;
+    text-align: right;
+    white-space: nowrap;
+}
+
+.overviewDashboard .overviewValveGauge > i,
+.overviewDashboard .overviewValveBatchTrack {
+    display: block;
+    height: 0.48rem;
+    margin-top: 0.48rem;
+    overflow: hidden;
+    border-radius: 999px;
+    background: rgba(200, 220, 255, 0.44);
+}
+
+.overviewDashboard .overviewValveGauge > i > span,
+.overviewDashboard .overviewValveBatchTrack span {
+    display: block;
+    width: var(--gauge-share, var(--batch-share, 0%));
+    min-width: 0.45rem;
+    max-width: 100%;
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, var(--dt-cyan-500), var(--dt-green-400));
+}
+
+.overviewDashboard .overviewValveGauge em {
+    display: block;
+    margin-top: 0.35rem;
+    color: var(--dt-muted);
+    font-size: 0.68rem;
+    font-style: normal;
+    line-height: 1.2;
+}
+
+.overviewDashboard .overviewValveSectionHeader {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-top: 0.8rem;
+    padding-top: 0.7rem;
+    border-top: 1px solid rgba(77, 130, 216, 0.14);
+}
+
+.overviewDashboard .overviewValveSectionHeader strong {
+    color: var(--dt-ink);
+    font-size: 0.76rem;
+}
+
 .overviewDashboard .overviewValveSchedule {
-    margin-top: 0.6rem !important;
-    gap: 0.55rem !important;
+    display: grid !important;
+    grid-template-columns: repeat(auto-fit, minmax(13.5rem, 1fr)) !important;
+    gap: 0.58rem !important;
+    margin-top: 0.5rem !important;
 }
 
 .overviewDashboard .overviewValveBatch {
-    min-height: 2.25rem !important;
-    padding: 0.45rem 0.6rem !important;
-    font-size: 0.75rem !important;
+    display: block !important;
+    min-height: 0 !important;
+    padding: 0.58rem 0.65rem !important;
+    border: 1px solid rgba(77, 130, 216, 0.16) !important;
+    border-radius: 0.5rem !important;
+    background: rgba(237, 245, 255, 0.68) !important;
+    color: var(--dt-ink);
+    font-size: 0.74rem !important;
 }
 
-/* Valve rows less tall and less empty */
+.overviewDashboard .overviewValveBatchHeader,
+.overviewDashboard .overviewValveBatchFooter,
+.overviewDashboard .overviewValveRowHeader {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+}
+
+.overviewDashboard .overviewValveBatchHeader strong {
+    min-width: 0;
+    color: var(--dt-ink);
+    font-size: 0.78rem;
+    line-height: 1.2;
+}
+
+.overviewDashboard .overviewValveBatchHeader span {
+    color: var(--dt-muted);
+    font-size: 0.7rem;
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.overviewDashboard .overviewValveBatchFooter {
+    margin-top: 0.45rem;
+}
+
+.overviewDashboard .overviewValveBatchFooter em {
+    color: var(--dt-muted);
+    font-size: 0.68rem;
+    font-style: normal;
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.overviewDashboard .overviewValveChips {
+    display: flex;
+    min-width: 0;
+    flex-wrap: wrap;
+    gap: 0.28rem;
+}
+
+.overviewDashboard .overviewValveChips span {
+    min-width: 0;
+    padding: 0.12rem 0.38rem;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.78);
+    color: var(--dt-ink);
+    font-size: 0.64rem;
+    font-weight: 800;
+    line-height: 1.25;
+    text-align: left;
+    overflow-wrap: anywhere;
+}
+
 .overviewDashboard .overviewValveList {
-    margin-top: 0.65rem !important;
-    grid-template-columns: repeat(5, minmax(0, 1fr)) !important;
-    gap: 0.55rem !important;
+    display: grid !important;
+    grid-template-columns: repeat(auto-fit, minmax(14.5rem, 1fr)) !important;
+    gap: 0.6rem !important;
+    margin-top: 0.5rem !important;
 }
 
 .overviewDashboard .overviewValveRow {
-    min-height: 4.9rem !important;
-    padding: 0.6rem 0.65rem !important;
-    font-size: 0.72rem !important;
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    min-height: 0 !important;
     align-content: start !important;
+    gap: 0.55rem !important;
+    padding: 0.65rem !important;
+    border: 1px solid rgba(77, 130, 216, 0.16) !important;
+    border-radius: 0.5rem !important;
+    background: rgba(255, 255, 255, 0.78) !important;
+    color: var(--dt-ink);
+    font-size: 0.72rem !important;
 }
 
-.overviewDashboard .overviewValveRow em {
-    margin-top: 0.35rem !important;
-    line-height: 1.25 !important;
+.overviewDashboard .overviewValveRank {
+    display: inline-flex;
+    width: 1.8rem;
+    height: 1.8rem;
+    flex: 0 0 1.8rem;
+    align-items: center;
+    justify-content: center;
+    border-radius: 0.48rem;
+    background: var(--dt-blue-100);
+    color: var(--dt-blue-900);
+    font-size: 0.7rem;
+    font-weight: 900;
+}
+
+.overviewDashboard .overviewValveRowHeader > div {
+    min-width: 0;
+    flex: 1 1 auto;
+}
+
+.overviewDashboard .overviewValveRowHeader strong {
+    display: block;
+    color: var(--dt-ink);
+    font-size: 0.78rem;
+    line-height: 1.2;
+    overflow-wrap: anywhere;
+}
+
+.overviewDashboard .overviewValveRowHeader em {
+    display: block;
+    margin-top: 0.12rem !important;
+    color: var(--dt-muted);
+    font-size: 0.65rem;
+    font-style: normal;
+    line-height: 1.2 !important;
+}
+
+.overviewDashboard .overviewValveTag {
+    display: inline-flex;
+    min-height: 1.35rem;
+    align-items: center;
+    padding: 0 0.48rem;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    font-size: 0.62rem;
+    font-weight: 900;
+    line-height: 1;
+    white-space: nowrap;
+}
+
+.overviewDashboard .overviewValveTagNeedsWater {
+    border-color: rgba(198, 126, 0, 0.22);
+    background: rgba(236, 225, 255, 0.58);
+    color: #674caf;;
+}
+
+.overviewDashboard .overviewValveTagStandby {
+    border-color: rgba(77, 130, 216, 0.16);
+    background: rgba(237, 245, 255, 0.82);
+    color: #49637f;
+}
+
+.overviewDashboard .overviewValveStats {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.32rem;
+}
+
+.overviewDashboard .overviewValveStats span {
+    min-width: 0;
+    padding: 0.38rem 0.42rem;
+    border-radius: 0.4rem;
+    background: rgba(237, 245, 255, 0.72);
+    text-align: left;
+}
+
+.overviewDashboard .overviewValveStats b,
+.overviewDashboard .overviewValveStats em {
+    display: block;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.overviewDashboard .overviewValveStats b {
+    color: var(--dt-ink);
+    font-size: 0.68rem;
+    line-height: 1.15;
+}
+
+.overviewDashboard .overviewValveStats em {
+    margin-top: 0.12rem !important;
+    color: var(--dt-muted);
+    font-size: 0.6rem;
+    font-style: normal;
+    line-height: 1.1 !important;
 }
 
 @media (max-width: 1300px) {
-    .overviewDashboard .overviewValveMetrics {
-        grid-template-columns: repeat(4, minmax(0, 1fr)) !important;
-    }
-
     .overviewDashboard .overviewValveList {
         grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
     }
@@ -1613,9 +2332,19 @@ body .experimentButtonGroup {
 
 @media (max-width: 800px) {
     .overviewDashboard .overviewRailStack,
-    .overviewDashboard .overviewValveMetrics,
+    .overviewDashboard .overviewValveGauges,
+    .overviewDashboard .overviewValveSchedule,
     .overviewDashboard .overviewValveList {
         grid-template-columns: 1fr !important;
+    }
+
+    .overviewDashboard .overviewValveHero {
+        grid-template-columns: 1fr;
+        align-items: flex-start;
+    }
+
+    .overviewDashboard .overviewValveStatus {
+        width: fit-content;
     }
 }
 
@@ -1623,4 +2352,3 @@ body .experimentPage {
     padding-top: 0.65rem !important;
     padding-bottom: 1rem !important;
 }
-

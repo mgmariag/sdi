@@ -3,20 +3,49 @@
     "sap/viz/ui5/format/ChartFormatter",
     "sap/viz/ui5/api/env/Format",
     "sap/viz/ui5/controls/Popover",
+    "sap/viz/ui5/controls/common/feeds/FeedItem",
     "sap/ui/core/HTML"
-], (ChartBuilder, ChartFormatter, Format, Popover, HTML) => {
+], (ChartBuilder, ChartFormatter, Format, Popover, FeedItem, HTML) => {
     "use strict";
 
     const {
-        CHART_DATA_SHAPES,
+        CHART_DATA_PATHS,
         CHART_FORMATS,
         CHART_MEASURES,
-        CHART_PALETTES,
+        CHART_SOURCE_DATA_PATHS,
+        EXPERIMENT_CHART_IDS,
         INITIAL_VISIBLE_CHART_DAYS,
-        SENSOR_DEPENDENT_LINE_MEASURES,
-        WEATHER_LINE_MEASURES,
-        entryTimestamp
+        MOISTURE_THRESHOLD_COLOR,
+        MOISTURE_THRESHOLD_PCT,
+        entryTimestamp,
+        visibleChartDataShapesByAxis,
+        visibleChartMeasures,
+        visibleChartMeasuresByAxis,
+        visibleChartPalette,
+        withChartVisibility,
+        chartMeasureColor
     } = ChartBuilder;
+
+    const ANFIS_SCORE_MEASURE = "ANFIS-GA irrigation score (%)";
+    const FUZZY_SCORE_MEASURE = "Fuzzy irrigation score (%)";
+    const LEGEND_LABELS = {
+        "Baseline Moisture": "Baseline",
+        "Sparse Moisture": "Sparse estimate",
+        "ANFIS Moisture": "ANFIS estimate",
+        "Fuzzy Moisture": "Fuzzy estimate",
+        [ANFIS_SCORE_MEASURE]: "ANFIS-GA score",
+        "Baseline Irrigation (L)": "Baseline irrigation",
+        "Baseline Water Usage (L)": "Baseline irrigation",
+        "Sparse-Sensing Irrigation (L)": "Sparse irrigation",
+        "Sparse Water Usage (L)": "Sparse irrigation",
+        "ANFIS Water Usage (L)": "ANFIS irrigation",
+        "Fuzzy Water Usage (L)": "Fuzzy irrigation",
+        [FUZZY_SCORE_MEASURE]: "Fuzzy score",
+        "Rain (mm)": "Rain (mm)",
+        "Rain (L/m²)": "Rain",
+        "Max Temperature (C)": "Max temp",
+        "Max Temp (C)": "Max temp"
+    };
 
     return {
         onAfterRendering() {
@@ -24,7 +53,7 @@
         },
 
         _styleCharts() {
-            ["samplingChart", "anfisChart", "fuzzyChart"].forEach((chartId) => {
+            EXPERIMENT_CHART_IDS.forEach((chartId) => {
                 const chart = this.byId(chartId);
                 if (chart) {
                     this._styleChart(chart, chartId);
@@ -34,16 +63,21 @@
 
         _styleChart(chart, chartId) {
             const formatString = CHART_FORMATS[chartId] || {};
+            const visibility = this._chartVisibility();
+            const dataShapes = visibleChartDataShapesByAxis(chartId, visibility);
+
+            this._applyChartFeedVisibility(chart, chartId, visibility);
 
             chart.setVizProperties({
                 plotArea: {
-                    colorPalette: CHART_PALETTES[chartId],
+                    colorPalette: visibleChartPalette(chartId, visibility),
                     dataShape: {
-                        primaryAxis: CHART_DATA_SHAPES[chartId] || []
+                        primaryAxis: dataShapes.primaryAxis,
+                        secondaryAxis: dataShapes.secondaryAxis
                     },
                     dataPointStyleMode: "update",
                     dataPointStyle: {
-                        rules: this._predictionLineStyleRules(chartId)
+                        rules: this._chartSeriesStyleRules(chartId)
                     },
                     window: this._initialChartWindow(chartId),
                     dataLabel: {
@@ -56,15 +90,15 @@
                     drawingEffect: "normal"
                 },
                 legend: {
-                    visible: true,
-                    position: "right",
+                    visible: false,
+                    position: "bottom",
                     label: {
                         style: { color: "#17324d" }
                     }
                 },
                 legendGroup: {
                     layout: {
-                        position: "right"
+                        position: "bottom"
                     }
                 },
                 title: {
@@ -73,6 +107,11 @@
                 valueAxis: {
                     label: { style: { color: "#5d7187" } },
                     title: { visible: false }
+                },
+                valueAxis2: {
+                    label: { style: { color: "#5d7187" } },
+                    title: { visible: false },
+                    scale: this._secondaryAxisScale(chartId)
                 },
                 categoryAxis: {
                     label: {
@@ -93,6 +132,77 @@
             });
 
             this._connectChartPopover(chart, chartId);
+        },
+
+        _secondaryAxisScale(chartId) {
+            if (chartId === "anfisMoistureChart") {
+                return { fixedRange: true, minValue: 0, maxValue: 100 };
+            }
+            return { fixedRange: true, minValue: 0, maxValue: 60 };
+        },
+
+        _applyChartFeedVisibility(chart, chartId, visibility) {
+            if (!chart || !chart.getFeeds || !chart.addFeed) {
+                return;
+            }
+            const feeds = chart && chart.getFeeds && chart.getFeeds();
+            if (Array.isArray(feeds) && chart.removeFeed) {
+                feeds.filter((feed) => {
+                    const uid = feed && feed.getUid && feed.getUid();
+                    return uid === "valueAxis" || uid === "valueAxis2";
+                }).forEach((feed) => {
+                    chart.removeFeed(feed);
+                    feed.destroy();
+                });
+            }
+
+            const axes = visibleChartMeasuresByAxis(chartId, visibility);
+            if (axes.primaryAxis.length) {
+                chart.addFeed(new FeedItem({
+                    uid: "valueAxis",
+                    type: "Measure",
+                    values: axes.primaryAxis
+                }));
+            }
+            if (axes.secondaryAxis.length) {
+                chart.addFeed(new FeedItem({
+                    uid: "valueAxis2",
+                    type: "Measure",
+                    values: axes.secondaryAxis
+                }));
+            }
+        },
+
+        _chartVisibility() {
+            const model = this.getView().getModel();
+            return model ? model.getProperty("/chartVisibility") : {};
+        },
+
+        _applyVisibleChartData(chartId) {
+            const model = this.getView().getModel();
+            if (!model) {
+                return [];
+            }
+
+            const storedRows = model.getProperty(this._chartSourceDataPath(chartId));
+            const currentRows = model.getProperty(this._chartDataPath(chartId)) || [];
+            const sourceRows = Array.isArray(storedRows) && storedRows.length ? storedRows : currentRows;
+            const visibleRows = withChartVisibility(sourceRows, this._chartVisibility());
+            model.setProperty(this._chartDataPath(chartId), visibleRows);
+            return visibleRows;
+        },
+
+        _applyExperimentChartData(experiment) {
+            this._experimentChartIds(experiment).forEach((chartId) => this._applyVisibleChartData(chartId));
+        },
+
+        _refreshExperimentCharts(experiment) {
+            this._experimentChartIds(experiment).forEach((chartId) => this._refreshChart(chartId));
+        },
+
+        _experimentChartIds(experiment) {
+            const prefix = String(experiment || "");
+            return EXPERIMENT_CHART_IDS.filter((chartId) => chartId.startsWith(prefix));
         },
 
         _initialChartWindow(chartId) {
@@ -140,37 +250,30 @@
             };
         },
 
-        _predictionLineStyleRules(chartId) {
-            return [
-                {
-                    callback: (context) => this._shouldDashChartPoint(chartId, context),
-                    properties: {
-                        lineType: "dash"
-                    },
-                    displayName: "Prediction / no sensor reading"
-                }
-            ];
+        _chartSeriesStyleRules(chartId) {
+            const measures = CHART_MEASURES[chartId] || [];
+            return measures.map((measure) => {
+                const color = chartMeasureColor(chartId, measure);
+                return {
+                    callback: (context) => this._chartMeasureName(chartId, context) === measure,
+                    properties: this._chartSeriesColorProperties(color),
+                    displayName: this._chartLegendLabel(measure)
+                };
+            });
         },
 
-        _shouldDashChartPoint(chartId, context) {
-            const label = context && context["Date/Time"];
-            if (!label) {
-                return false;
-            }
-            const rows = this.getView().getModel().getProperty(this._chartDataPath(chartId)) || [];
-            const row = Array.isArray(rows) ? rows.find((item) => item && this._chartRowLabel(item) === label) : null;
-            if (!row) {
-                return false;
-            }
+        _chartSeriesColorProperties(color) {
+            return color ? { color, lineColor: color } : {};
+        },
 
-            const measureName = this._chartMeasureName(chartId, context);
-            if (WEATHER_LINE_MEASURES.has(measureName)) {
-                return Boolean(row.is_weather_prediction);
-            }
-            if (SENSOR_DEPENDENT_LINE_MEASURES.has(measureName)) {
-                return Boolean(row.is_sensor_missing_reading);
-            }
-            return false;
+        _chartLegendLabel(measure) {
+            return LEGEND_LABELS[measure] || measure;
+        },
+
+        _isMoistureChart(chartId) {
+            return chartId === "samplingMoistureChart"
+                || chartId === "anfisMoistureChart"
+                || chartId === "fuzzyMoistureChart";
         },
 
         _chartMeasureName(chartId, context) {
@@ -255,7 +358,7 @@
 
             if (!this._chartPopovers[chartId]) {
                 this._chartPopovers[chartId] = new Popover({
-                    customDataControl: (data) => this._weatherDetailPopover(data, chartId)
+                    customDataControl: (data) => this._chartDetailPopover(data, chartId)
                 });
                 this.getView().addDependent(this._chartPopovers[chartId]);
             }
@@ -263,45 +366,249 @@
             this._chartPopovers[chartId].connect(vizUid);
         },
 
-        _weatherDetailPopover(data, chartId) {
-            const measureName = this._extractPopoverMeasureName(data);
-            const row = this._findPopoverChartRow(data, chartId);
-            const lines = [];
-
-            if (row && measureName === "Max Temp (C)") {
-                lines.push(["Temperature", `${this._formatPopoverNumber(row.max_temperature)} C`]);
-                lines.push(["Humidity", `${this._formatPopoverNumber(row.humidity)}%`]);
-            }
-            if (row && measureName === "Rain (L/m2)") {
-                lines.push(["Rain", `${this._formatPopoverNumber(row.rain_amount)} L/m2`]);
-                lines.push(["Cloud cover", `${this._formatPopoverNumber(row.cloud_cover_pct)}%`]);
-            }
+        _chartDetailPopover(data, chartId) {
+            const measureName = this._extractPopoverMeasureName(data, chartId);
+            const row = this._findPopoverChartRow(data, chartId, measureName);
+            const lines = row
+                ? (measureName ? this._chartDetailLines(row, chartId, measureName) : this._chartPointSummaryLines(row, chartId))
+                : [];
 
             if (!lines.length) {
                 return new HTML({ content: "" });
             }
 
             const content = lines.map(([label, value]) => (
-                `<div style="margin:4px 18px 8px 18px;white-space:nowrap;">` +
+                "<div style=\"margin:4px 18px 8px 18px;white-space:nowrap;\">" +
                 `<span style="color:#5d7187;">${label}</span>` +
                 `<span style="float:right;margin-left:24px;font-weight:600;color:#17324d;">${value}</span>` +
-                `</div>`
+                "</div>"
             )).join("");
             return new HTML({ content });
         },
 
-        _extractPopoverMeasureName(data) {
-            const matches = this._flattenPopoverValues(data);
-            if (matches.includes("Max Temp (C)")) {
-                return "Max Temp (C)";
+        _chartDetailLines(row, chartId, measureName) {
+            if (measureName === "Max Temp (C)" || measureName === "Max Temperature (C)") {
+                return this._weatherTemperatureLines(row, chartId);
             }
-            if (matches.includes("Rain (L/m2)")) {
-                return "Rain (L/m2)";
+            if (measureName === "Rain (L/m²)" || measureName === "Rain (mm)") {
+                return [
+                    ["Rain", `${this._formatPopoverNumber(row.rain_amount)} mm`],
+                    ["Cloud cover", `${this._formatPopoverNumber(this._popoverCloudCover(row, chartId))}%`]
+                ];
+            }
+
+            return this._experimentMetricLines(row, measureName);
+        },
+
+        _chartPointSummaryLines(row, chartId) {
+            return (CHART_MEASURES[chartId] || [])
+                .map((measureName) => this._chartMeasureSummaryLine(row, measureName))
+                .filter(Boolean);
+        },
+
+        _chartMeasureSummaryLine(row, measureName) {
+            const label = {
+                "Baseline Moisture": "Baseline moisture",
+                "Sparse Moisture": "Sparse moisture",
+                "ANFIS Moisture": "ANFIS moisture",
+                "Fuzzy Moisture": "Fuzzy moisture",
+                [ANFIS_SCORE_MEASURE]: "ANFIS-GA score",
+                "Baseline Irrigation (L)": "Baseline water",
+                "Baseline Water Usage (L)": "Baseline water",
+                "Sparse-Sensing Irrigation (L)": "Sparse water",
+                "Sparse Water Usage (L)": "Sparse water",
+                "ANFIS Water Usage (L)": "ANFIS water",
+                "Fuzzy Water Usage (L)": "Fuzzy water",
+                [FUZZY_SCORE_MEASURE]: "Fuzzy score",
+                "Max Temperature (C)": "Temperature",
+                "Max Temp (C)": "Temperature",
+                "Rain (mm)": "Rain",
+                "Rain (L/m²)": "Rain"
+            }[measureName];
+            const value = this._chartMeasureSummaryValue(row, measureName);
+            return label && value !== null ? [label, value] : null;
+        },
+
+        _chartMeasureSummaryValue(row, measureName) {
+            const values = {
+                "Baseline Moisture": this._formatPopoverPercent(row.baseline_moisture),
+                "Sparse Moisture": this._formatPopoverPercent(row.sparse_moisture),
+                "ANFIS Moisture": this._formatPopoverPercent(row.anfis_moisture),
+                "Fuzzy Moisture": this._formatPopoverPercent(row.fuzzy_moisture),
+                [ANFIS_SCORE_MEASURE]: this._formatPopoverPercent(row.predicted_probability_percent),
+                "Baseline Irrigation (L)": `${this._formatPopoverNumber(row.baseline_water_usage_l)} L`,
+                "Baseline Water Usage (L)": `${this._formatPopoverNumber(row.baseline_water_usage_l)} L`,
+                "Sparse-Sensing Irrigation (L)": `${this._formatPopoverNumber(row.sparse_water_usage_l)} L`,
+                "Sparse Water Usage (L)": `${this._formatPopoverNumber(row.sparse_water_usage_l)} L`,
+                "ANFIS Water Usage (L)": `${this._formatPopoverNumber(row.anfis_water_usage_l)} L`,
+                "Fuzzy Water Usage (L)": `${this._formatPopoverNumber(row.fuzzy_water_usage_l)} L`,
+                [FUZZY_SCORE_MEASURE]: this._formatPopoverPercent(row.fuzzy_prescription_score_pct),
+                "Max Temperature (C)": `${this._formatPopoverNumber(row.temperature ?? row.max_temperature)} C`,
+                "Max Temp (C)": `${this._formatPopoverNumber(row.temperature ?? row.max_temperature)} C`,
+                "Rain (mm)": `${this._formatPopoverNumber(row.rain_amount)} mm`,
+                "Rain (L/m²)": `${this._formatPopoverNumber(row.rain_amount)} mm`
+            };
+            const value = values[measureName];
+            return value && !value.includes("N/A") ? value : null;
+        },
+
+        _weatherTemperatureLines(row, chartId) {
+            const lines = [];
+            if (this._isHourlyChartRow(row)) {
+                lines.push(["Temperature", `${this._formatPopoverNumber(row.temperature ?? row.max_temperature)} C`]);
+            } else {
+                lines.push(["Max temperature", `${this._formatPopoverNumber(row.max_temperature)} C`]);
+                lines.push(["Min temperature", `${this._formatPopoverNumber(this._popoverMinTemperature(row, chartId))} C`]);
+            }
+            lines.push(["Humidity", `${this._formatPopoverNumber(row.humidity)}%`]);
+            lines.push(["Cloud cover", `${this._formatPopoverNumber(this._popoverCloudCover(row, chartId))}%`]);
+            return lines;
+        },
+
+        _experimentMetricLines(row, measureName) {
+            const details = {
+                "Baseline Moisture": [
+                    ["End-of-day moisture", this._formatPopoverPercent(row.baseline_moisture)],
+                    ["Before irrigation", this._formatPopoverPercent(row.baseline_pre_irrigation_moisture)],
+                    ["After irrigation", this._formatPopoverPercent(row.baseline_post_irrigation_moisture)]
+                ],
+                "Sparse Moisture": [
+                    ["Sparse moisture", this._formatPopoverPercent(row.sparse_moisture)],
+                    ["Sparse valves", this._formatPopoverValves(row, "sparse")],
+                    ["Sparse water", `${this._formatPopoverNumber(row.sparse_water_usage_l)} L`]
+                ],
+                "ANFIS Moisture": [
+                    ["ANFIS moisture", this._formatPopoverPercent(row.anfis_moisture)],
+                    ["ANFIS valves", this._formatPopoverValves(row, "anfis")],
+                    ["ANFIS water", `${this._formatPopoverNumber(row.anfis_water_usage_l)} L`]
+                ],
+                "Fuzzy Moisture": [
+                    ["Fuzzy moisture", this._formatPopoverPercent(row.fuzzy_moisture)],
+                    ["Fuzzy valves", this._formatPopoverValves(row, "fuzzy")],
+                    ["Fuzzy water", `${this._formatPopoverNumber(row.fuzzy_water_usage_l)} L`]
+                ],
+                "Baseline Water Usage (L)": [
+                    ["Baseline water", `${this._formatPopoverNumber(row.baseline_water_usage_l)} L`],
+                    ["Baseline windows", this._formatPopoverInteger(row.baseline_irrigation_events)],
+                    ["Baseline valves", this._formatPopoverValves(row, "baseline")]
+                ],
+                "Baseline Irrigation (L)": [
+                    ["Baseline water", `${this._formatPopoverNumber(row.baseline_water_usage_l)} L`],
+                    ["Baseline windows", this._formatPopoverInteger(row.baseline_irrigation_events)],
+                    ["Baseline valves", this._formatPopoverValves(row, "baseline")]
+                ],
+                "Sparse Water Usage (L)": [
+                    ["Sparse water", `${this._formatPopoverNumber(row.sparse_water_usage_l)} L`],
+                    ["Sparse windows", this._formatPopoverInteger(row.sparse_irrigation_events)],
+                    ["Sparse valves", this._formatPopoverValves(row, "sparse")]
+                ],
+                "Sparse-Sensing Irrigation (L)": [
+                    ["Sparse water", `${this._formatPopoverNumber(row.sparse_water_usage_l)} L`],
+                    ["Sparse windows", this._formatPopoverInteger(row.sparse_irrigation_events)],
+                    ["Sparse valves", this._formatPopoverValves(row, "sparse")]
+                ],
+                "ANFIS Water Usage (L)": [
+                    ["ANFIS water", `${this._formatPopoverNumber(row.anfis_water_usage_l)} L`],
+                    ["ANFIS windows", this._formatPopoverInteger(row.anfis_irrigation_events)],
+                    ["ANFIS valves", this._formatPopoverValves(row, "anfis")]
+                ],
+                "Fuzzy Water Usage (L)": [
+                    ["Fuzzy water", `${this._formatPopoverNumber(row.fuzzy_water_usage_l)} L`],
+                    ["Fuzzy windows", this._formatPopoverInteger(row.fuzzy_irrigation_events)],
+                    ["Fuzzy valves", this._formatPopoverValves(row, "fuzzy")]
+                ],
+                [ANFIS_SCORE_MEASURE]: [
+                    ["Average probability", this._formatPopoverPercent(row.predicted_probability_percent)],
+                    ["Max valve probability", this._formatPopoverPercent(row.trigger_probability_percent)],
+                    ["Decision threshold", this._formatPopoverPercent(row.anfis_decision_threshold_percent)],
+                    ["Average category", row.predicted_category || "N/A"],
+                    ["Max valve category", row.trigger_predicted_category || "N/A"],
+                    ["ANFIS valves", this._formatPopoverValves(row, "anfis")]
+                ],
+                [FUZZY_SCORE_MEASURE]: [
+                    ["Irrigation score", this._formatPopoverPercent(row.fuzzy_prescription_score_pct)],
+                    ["Prescription", `${this._formatPopoverNumber(row.fuzzy_water_usage_l)} L`],
+                    ["Temperature", `${this._formatPopoverNumber(row.max_temperature)} C`],
+                    ["Precipitation", `${this._formatPopoverNumber(row.rain_amount)} mm`],
+                    ["Fuzzy valves", this._formatPopoverValves(row, "fuzzy")]
+                ]
+            };
+            return details[measureName] || [];
+        },
+
+        _extractPopoverMeasureName(data, chartId) {
+            const measures = CHART_MEASURES[chartId] || [];
+            const explicitMeasure = this._findPopoverMeasureByExplicitKey(data, measures)
+                || this._findPopoverMeasureBySingleMeasureKey(data, measures);
+            if (explicitMeasure) {
+                return explicitMeasure;
+            }
+
+            const matches = this._flattenPopoverValues(data);
+            const matchedMeasures = measures.filter((item) => matches.includes(item));
+            if (matchedMeasures.length === 1) {
+                return matchedMeasures[0];
+            }
+
+            if (matches.includes("Rain (L/m²)") || matches.includes("Rain (L/m2)") || matches.includes("Rain (mm)")) {
+                return "Rain (L/m²)";
             }
             return "";
         },
 
-        _findPopoverChartRow(data, chartId) {
+        _findPopoverMeasureByExplicitKey(value, measures) {
+            const measureKeys = new Set([
+                "MeasureNamesDimension",
+                "measureNamesDimension",
+                "Measure Names",
+                "measure",
+                "Measure",
+                "MeasureName",
+                "measureName",
+                "measureNames",
+                "series",
+                "seriesName"
+            ]);
+            let found = "";
+            const visit = (item) => {
+                if (found || item === null || item === undefined || typeof item !== "object") {
+                    return;
+                }
+                Object.keys(item).forEach((key) => {
+                    if (found) {
+                        return;
+                    }
+                    if (measureKeys.has(key)) {
+                        const values = this._flattenPopoverValues(item[key]);
+                        found = measures.find((measure) => values.includes(measure)) || "";
+                    }
+                });
+                if (!found) {
+                    Object.keys(item).forEach((key) => visit(item[key]));
+                }
+            };
+            visit(value);
+            return found;
+        },
+
+        _findPopoverMeasureBySingleMeasureKey(value, measures) {
+            let found = "";
+            const visit = (item) => {
+                if (found || item === null || item === undefined || typeof item !== "object") {
+                    return;
+                }
+                const presentMeasures = measures.filter((measure) => Object.prototype.hasOwnProperty.call(item, measure));
+                if (presentMeasures.length === 1) {
+                    found = presentMeasures[0];
+                    return;
+                }
+                Object.keys(item).forEach((key) => visit(item[key]));
+            };
+            visit(value);
+            return found;
+        },
+
+        _findPopoverChartRow(data, chartId, measureName) {
             const rows = this.getView().getModel().getProperty(this._chartDataPath(chartId)) || [];
             const values = this._flattenPopoverValues(data);
             const strings = values.filter((value) => typeof value === "string");
@@ -310,12 +617,162 @@
                 || rows.find((row) => strings.includes(row.day_label))
                 || rows.find((row) => strings.includes(row.timestamp))
                 || rows.find((row) => strings.includes(row.date))
-                || this._findPopoverRowByIndex(values, rows);
+                || this._findPopoverRowByMeasureValue(data, measureName, rows)
+                || this._findPopoverRowByIndex(data, rows);
         },
 
-        _findPopoverRowByIndex(values, rows) {
-            const index = values.find((value) => Number.isInteger(value) && value >= 0 && value < rows.length);
+        _findPopoverRowByMeasureValue(data, measureName, rows) {
+            const fields = this._measureFieldCandidates(measureName);
+            if (!fields.length) {
+                return null;
+            }
+            const selectedValues = this._flattenPopoverValues(data)
+                .map((value) => this._popoverNumberFromAny(value))
+                .filter(Number.isFinite);
+            if (!selectedValues.length) {
+                return null;
+            }
+
+            const matches = rows.filter((row) => fields.some((field) => {
+                const rowValue = this._popoverNumber(row && row[field]);
+                return Number.isFinite(rowValue) && selectedValues.some((value) => Math.abs(value - rowValue) < 0.01);
+            }));
+            return matches.length === 1 ? matches[0] : null;
+        },
+
+        _measureFieldCandidates(measureName) {
+            return {
+                "Baseline Moisture": ["baseline_moisture"],
+                "Sparse Moisture": ["sparse_moisture"],
+                "ANFIS Moisture": ["anfis_moisture"],
+                "Fuzzy Moisture": ["fuzzy_moisture"],
+                [ANFIS_SCORE_MEASURE]: ["predicted_probability_percent"],
+                "Baseline Irrigation (L)": ["baseline_water_usage_l", "baseline_water_usage_chart"],
+                "Baseline Water Usage (L)": ["baseline_water_usage_chart", "baseline_water_usage_l"],
+                "Sparse-Sensing Irrigation (L)": ["sparse_water_usage_l", "sparse_water_usage_chart"],
+                "Sparse Water Usage (L)": ["sparse_water_usage_chart", "sparse_water_usage_l"],
+                "ANFIS Water Usage (L)": ["anfis_water_usage_l", "anfis_water_usage_chart"],
+                "Fuzzy Water Usage (L)": ["fuzzy_water_usage_l", "fuzzy_water_usage_chart"],
+                [FUZZY_SCORE_MEASURE]: ["fuzzy_prescription_score_pct"],
+                "Max Temperature (C)": ["max_temperature", "temperature"],
+                "Max Temp (C)": ["max_temperature", "temperature"],
+                "Rain (mm)": ["rain_amount"],
+                "Rain (L/m²)": ["rain_amount"]
+            }[measureName] || [];
+        },
+
+        _findPopoverRowByIndex(data, rows) {
+            const indexes = [];
+            const indexKeys = new Set(["dataIndex", "rowIndex", "pointIndex"]);
+            const visit = (item) => {
+                if (item === null || item === undefined) {
+                    return;
+                }
+                if (typeof item === "string") {
+                    const pathMatch = item.match(/\/(\d+)$/);
+                    if (pathMatch) {
+                        indexes.push(Number(pathMatch[1]));
+                    }
+                    return;
+                }
+                if (Array.isArray(item)) {
+                    item.forEach(visit);
+                    return;
+                }
+                if (typeof item === "object") {
+                    Object.keys(item).forEach((key) => {
+                        if (indexKeys.has(key) && Number.isInteger(item[key])) {
+                            indexes.push(item[key]);
+                        } else {
+                            visit(item[key]);
+                        }
+                    });
+                }
+            };
+            visit(data);
+            const index = indexes.find((value) => Number.isInteger(value) && value >= 0 && value < rows.length);
             return Number.isInteger(index) ? rows[index] : null;
+        },
+
+        _popoverMinTemperature(row, chartId) {
+            const explicitMin = this._popoverNumber(row && row.min_temperature);
+            if (Number.isFinite(explicitMin)) {
+                return explicitMin;
+            }
+
+            const rows = this._popoverRowsForDate(row, chartId);
+            const dayTemperatures = rows.map((item) => this._popoverNumber(
+                item.min_temperature ?? item.temperature ?? item.max_temperature
+            )).filter(Number.isFinite);
+
+            if (dayTemperatures.length) {
+                return Math.min(...dayTemperatures);
+            }
+
+            return row ? row.temperature ?? row.max_temperature : null;
+        },
+
+        _popoverCloudCover(row, chartId) {
+            if (this._isHourlyChartRow(row)) {
+                return row ? row.cloud_cover_pct : null;
+            }
+
+            const rows = this._popoverRowsForDate(row, chartId);
+            const cloudCoverValues = rows.map((item) => this._popoverNumber(item.cloud_cover_pct)).filter(Number.isFinite);
+
+            if (cloudCoverValues.length) {
+                const total = cloudCoverValues.reduce((sum, value) => sum + value, 0);
+                return total / cloudCoverValues.length;
+            }
+
+            return row ? row.cloud_cover_pct : null;
+        },
+
+        _isHourlyChartRow(row) {
+            return Boolean(row && row.hour);
+        },
+
+        _popoverRowsForDate(row, chartId) {
+            const date = row && this._chartRowDateKey(row);
+            if (!date) {
+                return [];
+            }
+
+            const model = this.getView().getModel();
+            const sourceRows = model.getProperty(this._chartSourceDataPath(chartId));
+            const rows = Array.isArray(sourceRows) && sourceRows.length
+                ? sourceRows
+                : model.getProperty(this._chartDataPath(chartId)) || [];
+            return rows.filter((item) => item && this._chartRowDateKey(item) === date);
+        },
+
+        _chartRowDateKey(row) {
+            return row && (row.date || this._chartRowDate(row));
+        },
+
+        _chartRowDate(row) {
+            const timestamp = entryTimestamp(row);
+            return timestamp ? timestamp.toISOString().slice(0, 10) : "";
+        },
+
+        _popoverNumber(value) {
+            const numberValue = Number(value);
+            return Number.isFinite(numberValue) ? numberValue : null;
+        },
+
+        _popoverNumberFromAny(value) {
+            if (typeof value === "number") {
+                return Number.isFinite(value) ? value : null;
+            }
+            if (typeof value !== "string") {
+                return null;
+            }
+            const normalized = value.replace(",", ".").replace(/[^0-9.+-]/g, "");
+            if (!normalized) {
+                return null;
+            }
+            const numberValue = Number(normalized);
+            return Number.isFinite(numberValue) ? numberValue : null;
         },
 
         _flattenPopoverValues(value) {
@@ -341,6 +798,9 @@
         },
 
         _chartDataPath(chartId) {
+            if (CHART_DATA_PATHS[chartId]) {
+                return CHART_DATA_PATHS[chartId];
+            }
             return {
                 samplingChart: "/samplingChartEntries",
                 anfisChart: "/anfisChartEntries",
@@ -348,9 +808,38 @@
             }[chartId] || "/samplingChartEntries";
         },
 
+        _chartSourceDataPath(chartId) {
+            if (CHART_SOURCE_DATA_PATHS[chartId]) {
+                return CHART_SOURCE_DATA_PATHS[chartId];
+            }
+            return {
+                samplingChart: "/samplingChartAllEntries",
+                anfisChart: "/anfisChartAllEntries",
+                fuzzyChart: "/fuzzyChartAllEntries"
+            }[chartId] || "/samplingChartAllEntries";
+        },
+
         _formatPopoverNumber(value) {
             const numberValue = Number(value);
             return Number.isFinite(numberValue) ? numberValue.toFixed(2) : "N/A";
+        },
+
+        _formatPopoverPercent(value) {
+            return `${this._formatPopoverNumber(value)}%`;
+        },
+
+        _formatPopoverInteger(value) {
+            const numberValue = Number(value);
+            return Number.isFinite(numberValue) ? String(Math.round(numberValue)) : "N/A";
+        },
+
+        _formatPopoverValves(row, prefix) {
+            const label = row && row[`${prefix}_activated_valves`];
+            if (label) {
+                return label;
+            }
+            const runs = Number(row && row[`${prefix}_valve_runs`]);
+            return Number.isFinite(runs) && runs > 0 ? this._formatPopoverInteger(runs) : "none";
         },
 
         onChartRenderComplete(event) {
@@ -433,48 +922,194 @@
                 return;
             }
 
-            this._removeSemanticLegendEntries(chartDom);
+            this._thinCategoryAxisLabels(chartDom, chartId);
+            this._syncCustomChartLegend(chartDom, chartId);
             const overlay = this._chartOverlayElement(chartDom);
+            if (!overlay) {
+                return;
+            }
             const geometry = this._chartOverlayGeometry(chartDom, chartId);
+            this._clearChartOverlay(overlay);
             if (!geometry) {
-                overlay.innerHTML = "";
                 return;
             }
 
-            overlay.innerHTML = "";
-            const futureBand = document.createElement("div");
-            futureBand.className = "dtChartFutureBand";
-            futureBand.style.left = `${geometry.nowX}px`;
-            futureBand.style.top = `${geometry.top}px`;
-            futureBand.style.width = `${Math.max(0, geometry.right - geometry.nowX)}px`;
-            futureBand.style.height = `${geometry.bottom - geometry.top}px`;
-
-            const nowLine = document.createElement("div");
-            nowLine.className = "dtChartNowLine";
-            nowLine.style.left = `${geometry.nowX}px`;
-            nowLine.style.top = `${geometry.top}px`;
-            nowLine.style.height = `${geometry.bottom - geometry.top}px`;
-
-            const nowBadge = document.createElement("div");
-            nowBadge.className = "dtChartNowBadge";
-            nowBadge.textContent = "NOW";
-            nowBadge.style.left = `${geometry.nowX}px`;
-            nowBadge.style.top = `${Math.max(0, geometry.top - 23)}px`;
-
-            overlay.appendChild(futureBand);
-            overlay.appendChild(nowLine);
-            overlay.appendChild(nowBadge);
+            overlay.insertAdjacentHTML("beforeend", this._chartOverlayMarkup(geometry, chartId));
         },
 
         _chartOverlayElement(chartDom) {
             chartDom.style.position = "relative";
             let overlay = chartDom.querySelector(":scope > .dtChartOverlay");
             if (!overlay) {
-                overlay = document.createElement("div");
-                overlay.className = "dtChartOverlay";
-                chartDom.appendChild(overlay);
+                chartDom.insertAdjacentHTML("beforeend", "<div class=\"dtChartOverlay\"></div>");
+                overlay = chartDom.querySelector(":scope > .dtChartOverlay");
             }
             return overlay;
+        },
+
+        _clearChartOverlay(overlay) {
+            while (overlay.firstChild) {
+                overlay.removeChild(overlay.firstChild);
+            }
+        },
+
+        _chartOverlayMarkup(geometry, chartId) {
+            const top = this._chartOverlayPx(geometry.top);
+            const chartHeight = this._chartOverlayPx(geometry.bottom - geometry.top);
+            const markup = [];
+            const futureBandLabel = String(chartId || "").includes("MoistureChart")
+                ? "Simulation"
+                : "Forecast / Simulation";
+
+            if (Number.isFinite(geometry.nowX)) {
+                const nowX = this._chartOverlayPx(geometry.nowX);
+                const futureWidth = this._chartOverlayPx(Math.max(0, geometry.right - geometry.nowX));
+                markup.push(
+                    `<div class="dtChartFutureBand" style="left:${nowX};top:${top};width:${futureWidth};height:${chartHeight};">` +
+                    `<span class="dtChartFutureBandLabel">${futureBandLabel}</span>` +
+                    `</div>`
+                );
+            }
+
+            if (Number.isFinite(geometry.thresholdY) && Number.isFinite(geometry.thresholdPct)) {
+                const thresholdY = this._chartOverlayPx(geometry.thresholdY);
+                const thresholdLeft = this._chartOverlayPx(geometry.left);
+                const thresholdWidth = this._chartOverlayPx(geometry.right - geometry.left);
+                const thresholdPct = this._formatThresholdPct(geometry.thresholdPct);
+                const thresholdTitle = `Comfort threshold ${thresholdPct}%`;
+                markup.push(
+                    `<div class="dtChartThresholdLine" title="${thresholdTitle}" aria-label="${thresholdTitle}" tabindex="0" style="left:${thresholdLeft};top:${thresholdY};width:${thresholdWidth};border-color:${MOISTURE_THRESHOLD_COLOR};">` +
+                    `<span class="dtChartThresholdLabel">${thresholdTitle}</span>` +
+                    `</div>`
+                );
+            }
+
+            if (Number.isFinite(geometry.nowX)) {
+                const nowX = this._chartOverlayPx(geometry.nowX);
+                markup.push(
+                    `<div class="dtChartNowLine" style="left:${nowX};top:${top};height:${chartHeight};"></div>`
+                );
+                if (this._showsBoundaryBadge(chartId)) {
+                    const badgeTop = this._chartOverlayPx(Math.max(0, geometry.top - 23));
+                    markup.push(
+                        `<div class="dtChartNowBadge" style="left:${nowX};top:${badgeTop};">Forecast boundary</div>`
+                    );
+                }
+            }
+
+            return markup.join("");
+        },
+
+        _thinCategoryAxisLabels(chartDom, chartId) {
+            const rows = this.getView().getModel().getProperty(this._chartDataPath(chartId)) || [];
+            const rowLabels = new Set(rows.map((row) => this._chartRowLabel(row)).filter(Boolean));
+            const rowDateByLabel = this._categoryAxisDateMap(rows);
+            const labels = Array.from(chartDom.querySelectorAll("svg text"))
+                .filter((element) => this._isCategoryAxisLabel(element, rowLabels));
+            if (labels.length < 2) {
+                return;
+            }
+
+            const labelDates = labels.map((element) => (
+                this._categoryAxisLabelDate(String(element.textContent || "").trim(), rowDateByLabel)
+            ));
+            const firstDate = labelDates.find(Boolean);
+            if (!firstDate) {
+                this._applyCategoryAxisLabelStep(labels, 2);
+                return;
+            }
+
+            const firstDay = this._categoryAxisDayStart(firstDate);
+            const shownDayKeys = new Set();
+            labels.forEach((element, index) => {
+                const labelDate = labelDates[index];
+                const dayStart = labelDate ? this._categoryAxisDayStart(labelDate) : null;
+                const dayOffset = dayStart ? Math.round((dayStart.getTime() - firstDay.getTime()) / 86400000) : NaN;
+                const dayKey = dayStart ? this._categoryAxisDayKey(dayStart) : "";
+                const shouldShow = dayStart && dayOffset % 2 === 0 && !shownDayKeys.has(dayKey);
+                if (shouldShow) {
+                    shownDayKeys.add(dayKey);
+                }
+                this._setCategoryAxisLabelVisibility(element, shouldShow);
+            });
+        },
+
+        _applyCategoryAxisLabelStep(labels, step) {
+            labels.forEach((element, index) => {
+                const shouldShow = index % step === 0;
+                this._setCategoryAxisLabelVisibility(element, shouldShow);
+            });
+        },
+
+        _setCategoryAxisLabelVisibility(element, shouldShow) {
+            const visibility = shouldShow ? "" : "hidden";
+            if (element.style.visibility !== visibility) {
+                element.style.visibility = visibility;
+            }
+        },
+
+        _categoryAxisDateMap(rows) {
+            return rows.reduce((dateByLabel, row) => {
+                const date = entryTimestamp(row);
+                if (!date) {
+                    return dateByLabel;
+                }
+                [
+                    row.chart_label,
+                    row.day_label,
+                    row.timestamp,
+                    row.date
+                ].filter(Boolean).forEach((label) => {
+                    dateByLabel.set(String(label), date);
+                });
+                return dateByLabel;
+            }, new Map());
+        },
+
+        _categoryAxisLabelDate(label, rowDateByLabel) {
+            const mappedDate = rowDateByLabel.get(label);
+            if (mappedDate) {
+                return mappedDate;
+            }
+
+            const fullDate = label.match(/^(\d{4})-(\d{2})-(\d{2})(?:\s+\d{2}:\d{2})?$/);
+            if (fullDate) {
+                return new Date(Number(fullDate[1]), Number(fullDate[2]) - 1, Number(fullDate[3]));
+            }
+
+            const shortDate = label.match(/^(\d{2})-(\d{2})(?:\s+\d{2}:\d{2})?$/);
+            if (shortDate) {
+                return new Date(new Date().getFullYear(), Number(shortDate[1]) - 1, Number(shortDate[2]));
+            }
+            return null;
+        },
+
+        _categoryAxisDayStart(date) {
+            return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+        },
+
+        _categoryAxisDayKey(date) {
+            return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+        },
+
+        _isCategoryAxisLabel(element, rowLabels) {
+            const label = String(element && element.textContent || "").trim();
+            if (!label) {
+                return false;
+            }
+            return rowLabels.has(label)
+                || /^\d{4}-\d{2}-\d{2}$/.test(label)
+                || /^\d{2}-\d{2}\s+\d{2}:\d{2}$/.test(label)
+                || /^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}$/.test(label);
+        },
+
+        _showsBoundaryBadge(chartId) {
+            return String(chartId || "").includes("MoistureChart");
+        },
+
+        _chartOverlayPx(value) {
+            const numberValue = Number(value);
+            return `${Number.isFinite(numberValue) ? Number(numberValue.toFixed(2)) : 0}px`;
         },
 
         _chartOverlayGeometry(chartDom, chartId) {
@@ -494,12 +1129,35 @@
             const right = plotBounds ? plotBounds.right : Math.max(left + 1, width - Math.max(26, Math.round(width * 0.035)));
             const top = plotBounds ? plotBounds.top : Math.max(20, Math.round(height * 0.08));
             const bottom = plotBounds ? plotBounds.bottom : Math.max(top + 1, height - Math.max(84, Math.round(height * 0.2)));
+            const thresholdPct = this._moistureThresholdPct(chartId);
+            const baseGeometry = {
+                left,
+                right,
+                top,
+                bottom,
+                nowX: null,
+                thresholdPct,
+                thresholdY: this._thresholdOverlayY(chartDom, chartId, { left, right, top, bottom }, thresholdPct)
+            };
             const now = new Date();
             const axisGeometry = this._axisOverlayGeometry(chartDom, rows, { left, right, top, bottom }, now);
             if (axisGeometry) {
-                return axisGeometry.visible ? axisGeometry.geometry : null;
+                if (axisGeometry.visible) {
+                    baseGeometry.nowX = axisGeometry.geometry.nowX;
+                }
+                return this._hasOverlayContent(baseGeometry) ? baseGeometry : null;
             }
 
+            baseGeometry.nowX = this._fallbackNowOverlayX(rows, { left, right }, now);
+            return this._hasOverlayContent(baseGeometry) ? baseGeometry : null;
+        },
+
+        _hasOverlayContent(geometry) {
+            return Number.isFinite(geometry && geometry.nowX)
+                || Number.isFinite(geometry && geometry.thresholdY);
+        },
+
+        _fallbackNowOverlayX(rows, plotBounds, now) {
             const visibleRows = this._visibleChartRowsForOverlay(rows);
             if (visibleRows.length < 2) {
                 return null;
@@ -512,13 +1170,98 @@
             }
 
             const ratio = Math.max(0, Math.min(1, (now.getTime() - startDate.getTime()) / (endDate.getTime() - startDate.getTime())));
-            return {
-                left,
-                right,
-                top,
-                bottom,
-                nowX: left + (right - left) * ratio
-            };
+            return plotBounds.left + (plotBounds.right - plotBounds.left) * ratio;
+        },
+
+        _thresholdOverlayY(chartDom, chartId, plotBounds, thresholdPct) {
+            if (!this._isMoistureChart(chartId) || !Number.isFinite(thresholdPct)) {
+                return null;
+            }
+
+            const points = this._valueAxisLabelPoints(chartDom, plotBounds);
+            if (points.length >= 2) {
+                const byValue = points.sort((a, b) => a.value - b.value);
+                const min = byValue[0];
+                const max = byValue[byValue.length - 1];
+                if (max.value > min.value && thresholdPct >= min.value && thresholdPct <= max.value) {
+                    const ratio = (thresholdPct - min.value) / (max.value - min.value);
+                    return min.y + ratio * (max.y - min.y);
+                }
+            }
+
+            return plotBounds.bottom - ((thresholdPct / 100) * (plotBounds.bottom - plotBounds.top));
+        },
+
+        _moistureThresholdPct(chartId) {
+            if (!this._isMoistureChart(chartId)) {
+                return null;
+            }
+
+            const model = this.getView().getModel();
+            const pots = model ? model.getProperty(this._chartPotsPath(chartId)) : [];
+            const targets = (Array.isArray(pots) ? pots : [])
+                .map((pot) => Number(pot && pot.moisture_target_pct))
+                .filter(Number.isFinite);
+            if (!targets.length) {
+                return MOISTURE_THRESHOLD_PCT;
+            }
+
+            const total = targets.reduce((sum, value) => sum + value, 0);
+            return Number((total / targets.length).toFixed(2));
+        },
+
+        _chartPotsPath(chartId) {
+            if (chartId && chartId.startsWith("anfis")) {
+                return "/anfisPots";
+            }
+            if (chartId && chartId.startsWith("fuzzy")) {
+                return "/fuzzyPots";
+            }
+            return "/samplingPots";
+        },
+
+        _formatThresholdPct(value) {
+            const numberValue = Number(value);
+            if (!Number.isFinite(numberValue)) {
+                return "N/A";
+            }
+            return Number.isInteger(numberValue) ? String(numberValue) : numberValue.toFixed(1);
+        },
+
+        _valueAxisLabelPoints(chartDom, plotBounds) {
+            const chartRect = chartDom.getBoundingClientRect();
+            const valuesByLabel = new Map();
+            chartDom.querySelectorAll("svg text").forEach((node) => {
+                const text = (node.textContent || "").trim().replace(",", ".");
+                if (!/^-?\d+(\.\d+)?%?$/.test(text) || !node.getBoundingClientRect) {
+                    return;
+                }
+                const rect = node.getBoundingClientRect();
+                if (!rect.width || !rect.height) {
+                    return;
+                }
+                const centerX = rect.left - chartRect.left + rect.width / 2;
+                const centerY = rect.top - chartRect.top + rect.height / 2;
+                if (
+                    centerX > plotBounds.left - 2
+                    || centerY < plotBounds.top - 8
+                    || centerY > plotBounds.bottom + 8
+                ) {
+                    return;
+                }
+                const value = Number(text.replace("%", ""));
+                if (!Number.isFinite(value)) {
+                    return;
+                }
+                const existing = valuesByLabel.get(value) || [];
+                existing.push(centerY);
+                valuesByLabel.set(value, existing);
+            });
+
+            return Array.from(valuesByLabel.entries()).map(([value, yValues]) => ({
+                value,
+                y: yValues.reduce((sum, item) => sum + item, 0) / yValues.length
+            }));
         },
 
         _axisOverlayGeometry(chartDom, rows, plotBounds, now) {
@@ -670,16 +1413,56 @@
             return visibleRows.length >= 2 ? visibleRows : rows;
         },
 
-        _removeSemanticLegendEntries(chartDom) {
-            chartDom.querySelectorAll("text").forEach((node) => {
-                const text = (node.textContent || "").trim();
-                if (/^Semantic Range\d*$/.test(text)) {
-                    const group = node.closest("g");
-                    if (group) {
-                        group.style.display = "none";
-                    }
-                }
-            });
+        _syncCustomChartLegend(chartDom, chartId) {
+            const parent = chartDom && chartDom.parentElement;
+            if (!parent) {
+                return;
+            }
+
+            parent.querySelectorAll(`.dtChartLegend[data-chart-id="${chartId}"]`).forEach((node) => node.remove());
+
+            const measures = visibleChartMeasures(chartId, this._chartVisibility());
+            if (!measures.length) {
+                return;
+            }
+
+            const measureLegendHtml = measures.map((measure) => {
+                const color = chartMeasureColor(chartId, measure) || "#5d7187";
+                const shape = this._chartLegendShape(chartId, measure);
+                return this._chartLegendItemHtml(this._chartLegendLabel(measure), shape, color);
+            }).join("");
+            chartDom.insertAdjacentHTML(
+                "afterend",
+                `<div class="dtChartLegend" data-chart-id="${chartId}">${measureLegendHtml}</div>`
+            );
+        },
+
+        _chartLegendItemHtml(label, shape, color) {
+            return (
+                `<span class="dtChartLegendItem">` +
+                `<span class="dtChartLegendMarker dtChartLegendMarker-${shape}" style="--dt-chart-series-color:${color};"></span>` +
+                `<span>${this._escapeHtml(label)}</span>` +
+                `</span>`
+            );
+        },
+
+        _chartLegendShape(chartId, measure) {
+            const measures = CHART_MEASURES[chartId] || [];
+            const index = measures.indexOf(measure);
+            const axisShapes = visibleChartDataShapesByAxis(chartId, {});
+            const allShapes = [
+                ...axisShapes.primaryAxis,
+                ...axisShapes.secondaryAxis
+            ];
+            return allShapes[index] === "bar" ? "bar" : "line";
+        },
+
+        _escapeHtml(value) {
+            return String(value || "")
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;");
         },
 
         _registerChartFormatters() {
@@ -694,10 +1477,10 @@
             formatter.registerCustomFormatter("DT_L", (value) => `${formatNumber(value)} L`);
             formatter.registerCustomFormatter("DT_CELSIUS", (value) => `${formatNumber(value)} C`);
             formatter.registerCustomFormatter("DT_MM", (value) => `${formatNumber(value)} mm`);
-            formatter.registerCustomFormatter("DT_LM2", (value) => `${formatNumber(value)} L/m2`);
+            formatter.registerCustomFormatter("DT_LM2", (value) => `${formatNumber(value)} L/m²`);
             formatter.registerCustomFormatter("DT_NUMBER", (value) => formatNumber(value));
             Format.numericFormatter(formatter);
-        },
+        }
 
     };
 });

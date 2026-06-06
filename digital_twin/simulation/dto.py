@@ -8,7 +8,9 @@ from zoneinfo import ZoneInfo
 
 LOCATION_NAME = "Cluj-Napoca"
 LOCAL_TZ = ZoneInfo("Europe/Bucharest")
-ANFIS_DECISION_THRESHOLD = 0.6
+ANFIS_DECISION_THRESHOLD = 0.72
+ANFIS_FORECAST_DECISION_THRESHOLD = 0.78
+ANFIS_TRAINING_LOOKBACK_DAYS = 120
 HOURLY_CHART_MAX_RANGE_DAYS = 7
 
 
@@ -31,4 +33,6 @@ class ExperimentSnapshot:
     sensor_context: dict[str, Any]
     initial_pot_states: dict[int, PotState]
     estimated_weather_rows: int
+    estimated_selected_weather_rows: int
+    estimated_lookahead_weather_rows: int
     loaded_at: datetime

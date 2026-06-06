@@ -7,14 +7,15 @@ from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from psycopg.rows import dict_row
-from psycopg.types.json import Jsonb
 
 from digital_twin.db.connection import get_connection
 from digital_twin.db.schema import initialize_database
 from digital_twin.domain.irrigation_methods import VALVE_ZONE_DESIGN, VALVE_ZONE_ORDER
-from digital_twin.experiments.anfis import ANFIS, probability_category
+from digital_twin.experiments.anfis import ANFIS, probability_category, target_probability
 from digital_twin.simulation.dto import (
     ANFIS_DECISION_THRESHOLD,
+    ANFIS_FORECAST_DECISION_THRESHOLD,
+    ANFIS_TRAINING_LOOKBACK_DAYS,
     ExperimentSnapshot,
     HOURLY_CHART_MAX_RANGE_DAYS,
     LOCAL_TZ,
@@ -35,16 +36,21 @@ from digital_twin.simulation.weather_model import (
 )
 from digital_twin.simulation.irrigation_controller import (
     _alert_row,
-    _apply_fuzzy_prescribed_event,
-    _apply_irrigation_event,
-    _apply_planned_volume,
-    _decision_slot,
+    _apply_event_delivery,
+    _baseline_covered_rain_day,
+    _baseline_irrigation_request,
+    _baseline_decision_slot,
+    _baseline_rain_policy,
+    _baseline_threshold_for_pot,
+    _fuzzy_prescribed_request,
+    _fuzzy_prescribed_volume_ml,
     _is_emergency_dryness,
     _is_outdoor,
-    _make_fao_pm_decision,
+    _make_baseline_irrigation_decision,
     _make_fuzzy_dt_decision,
-    _make_irrigation_decision,
     _precipitation_last_days,
+    _rain_exposure_factor,
+    _three_input_irrigation_skip_reason,
     _threshold_for_pot,
     _upcoming_freeze,
 )
@@ -54,6 +60,21 @@ from digital_twin.services.sensor_readings import (
     ensure_sensor_readings_for_experiment_range,
     load_sensor_readings_for_experiment,
 )
+
+
+BASELINE_WINTER_LOOKAHEAD_DAYS = 14
+MORNING_SENSOR_CALIBRATION_TIME = time(5, 30)
+EVENING_SENSOR_CALIBRATION_TIME = time(17, 30)
+SPARSE_FORECAST_SENSOR_SOURCE = "forecast_simulated_sensor"
+ANFIS_HARD_STOP_REASON_CODES = {
+    "freeze_risk",
+    "winter_indoor_not_valve_managed",
+    "anfis_cold_skip",
+    "anfis_moisture_sufficient",
+    "anfis_rain_sufficient",
+    "anfis_rain_and_moisture_sufficient",
+    "anfis_cool_day_moisture_sufficient",
+}
 
 
 def load_experiment_snapshot(start_date: date, end_date: date) -> ExperimentSnapshot:
@@ -67,13 +88,25 @@ def load_experiment_snapshot(start_date: date, end_date: date) -> ExperimentSnap
 
     sensor_context = _load_sensor_context(start_date, end_date, pots)
     weather_start = _snapshot_weather_start(start_date, sensor_context)
-    weather_rows = _load_weather(weather_start, end_date)
+    weather_end = (
+        end_date + timedelta(days=BASELINE_WINTER_LOOKAHEAD_DAYS)
+        if _baseline_winter_lookahead_needed(start_date, end_date)
+        else end_date
+    )
+    weather_rows = _load_weather(weather_start, weather_end)
     _raise_if_missing_historical_weather(weather_rows, start_date, end_date)
-    weather_rows, estimated_weather_rows = _with_estimated_future_weather(weather_rows, weather_start, end_date)
+    weather_rows, estimated_weather_rows = _with_estimated_future_weather(weather_rows, weather_start, weather_end)
     selected_weather_rows = [
         row for row in weather_rows
         if start_date <= _local_observed_at(row).date() <= end_date
     ]
+    estimated_selected_weather_rows = sum(1 for row in selected_weather_rows if row.get("source") == "estimated-weather")
+    estimated_lookahead_weather_rows = sum(
+        1
+        for row in weather_rows
+        if row.get("source") == "estimated-weather"
+        and not start_date <= _local_observed_at(row).date() <= end_date
+    )
     if not selected_weather_rows:
         raise ValueError("No stored weather rows found for the selected date range")
     initial_pot_states = _initial_pot_states(pots)
@@ -99,6 +132,8 @@ def load_experiment_snapshot(start_date: date, end_date: date) -> ExperimentSnap
         sensor_context=sensor_context,
         initial_pot_states=initial_pot_states,
         estimated_weather_rows=estimated_weather_rows,
+        estimated_selected_weather_rows=estimated_selected_weather_rows,
+        estimated_lookahead_weather_rows=estimated_lookahead_weather_rows,
         loaded_at=datetime.now(LOCAL_TZ),
     )
 
@@ -124,8 +159,184 @@ def _resolve_snapshot(
     return snapshot
 
 
+def _resolve_anfis_training_snapshot(
+    end_date: date,
+    fallback_snapshot: ExperimentSnapshot,
+) -> ExperimentSnapshot:
+    training_start = end_date - timedelta(days=ANFIS_TRAINING_LOOKBACK_DAYS - 1)
+    try:
+        return load_experiment_snapshot(training_start, end_date)
+    except ValueError:
+        return fallback_snapshot
+
+
+def _state_simulation_start(start_date: date, end_date: date) -> date:
+    anchor_date = _historical_state_anchor_date(end_date)
+    if anchor_date is None:
+        return start_date
+    return min(start_date, anchor_date)
+
+
+def _historical_state_anchor_date(end_date: date) -> date | None:
+    try:
+        with get_connection(row_factory=dict_row) as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    (
+                        SELECT min(recorded_at::date)
+                        FROM sensor_readings
+                        WHERE recorded_at::date <= %(end_date)s
+                    ) AS sensor_start,
+                    (
+                        SELECT min(observed_local_at::date)
+                        FROM weather_hourly
+                        WHERE observed_local_at::date <= %(end_date)s
+                    ) AS weather_start
+                """,
+                {"end_date": end_date},
+            ).fetchone()
+    except Exception:
+        return None
+
+    if not row:
+        return None
+
+    sensor_start = row.get("sensor_start")
+    weather_start = row.get("weather_start")
+    if sensor_start and weather_start:
+        return max(sensor_start, weather_start)
+    return sensor_start or weather_start
+
+
+def _resolve_simulation_snapshot(
+    start_date: date,
+    end_date: date,
+    selected_snapshot: ExperimentSnapshot,
+) -> tuple[date, ExperimentSnapshot]:
+    simulation_start_date = _state_simulation_start(start_date, end_date)
+    if simulation_start_date >= start_date:
+        return start_date, selected_snapshot
+
+    try:
+        return simulation_start_date, load_experiment_snapshot(simulation_start_date, end_date)
+    except ValueError:
+        return start_date, selected_snapshot
+
+
 def _uses_hourly_chart(start_date: date, end_date: date) -> bool:
     return (end_date - start_date).days < HOURLY_CHART_MAX_RANGE_DAYS
+
+
+def _new_daily_moisture_tracker() -> dict[str, Any]:
+    return {"snapshots": []}
+
+
+def _daily_moisture_snapshot_label(day: date, observed_at: datetime, day_profile: dict[str, Any]) -> str | None:
+    slot = _baseline_decision_slot(day, observed_at, day_profile)
+    if slot:
+        return f"before_{slot}"
+
+    hour = observed_at.hour
+    max_temp = _number(day_profile.get("max_temperature_c"), 20.0)
+    if day.month in {12, 1, 2, 3} and hour == 13:
+        return "after_winter_check"
+    if hour == 9:
+        return "after_morning"
+    if max_temp >= 32.0 and hour == 21:
+        return "after_evening"
+    return None
+
+
+def _post_irrigation_snapshot_index(
+    day: date,
+    weather_rows: list[dict[str, Any]],
+    start_index: int,
+    day_profile: dict[str, Any],
+) -> tuple[int | None, str | None]:
+    for index in range(max(0, start_index), len(weather_rows)):
+        observed_local = _local_observed_at(weather_rows[index])
+        if observed_local.date() != day:
+            continue
+        label = _daily_moisture_snapshot_label(day, observed_local, day_profile)
+        if label and label.startswith("after_"):
+            return index, label
+    return None, None
+
+
+def _record_daily_moisture_snapshot(
+    tracker: dict[str, Any],
+    pot_states: dict[int, PotState],
+    label: str,
+) -> None:
+    moistures = [state.moisture for state in pot_states.values()]
+    if not moistures:
+        return
+    tracker.setdefault("snapshots", []).append(
+        {
+            "label": label,
+            "average_moisture": sum(moistures) / len(moistures),
+            "min_moisture": min(moistures),
+            "max_moisture": max(moistures),
+        }
+    )
+
+
+def _daily_moisture_summary(
+    tracker: dict[str, Any],
+    pot_states: dict[int, PotState],
+) -> dict[str, Any]:
+    snapshots = tracker.get("snapshots") or []
+    moistures = [state.moisture for state in pot_states.values()]
+    avg_moisture = sum(moistures) / max(len(moistures), 1)
+    end_of_day_summary = {
+        "moisture": round(avg_moisture, 2),
+        "average_moisture": round(avg_moisture, 2),
+        "min_moisture": round(min(moistures), 2),
+        "max_moisture": round(max(moistures), 2),
+    }
+    if not snapshots:
+        return {
+            **end_of_day_summary,
+            "moisture_sample_count": 0,
+            "moisture_sample_method": "end_of_day",
+        }
+
+    post_window_snapshots = [
+        item for item in snapshots
+        if str(item.get("label") or "").startswith("after_")
+    ]
+    pre_window_snapshots = [
+        item for item in snapshots
+        if str(item.get("label") or "").startswith("before_")
+    ]
+    pre_window_moisture = (
+        sum(float(item["average_moisture"]) for item in pre_window_snapshots) / len(pre_window_snapshots)
+        if pre_window_snapshots
+        else None
+    )
+    post_window_moisture = (
+        sum(float(item["average_moisture"]) for item in post_window_snapshots) / len(post_window_snapshots)
+        if post_window_snapshots
+        else None
+    )
+    return {
+        **end_of_day_summary,
+        "moisture_sample_count": len(snapshots),
+        "moisture_sample_method": "end_of_day",
+        "moisture_sample_labels": [str(item["label"]) for item in snapshots],
+        "pre_irrigation_moisture": round(pre_window_moisture, 2) if pre_window_moisture is not None else None,
+        "post_irrigation_moisture": round(post_window_moisture, 2) if post_window_moisture is not None else None,
+    }
+
+
+def _baseline_winter_lookahead_needed(start_date: date, end_date: date) -> bool:
+    current = start_date
+    while current <= end_date:
+        if current.month in {12, 1, 2, 3}:
+            return True
+        current += timedelta(days=1)
+    return False
 
 
 def _chart_entries_for_range(
@@ -144,27 +355,59 @@ def _add_chart_summary(summary: dict[str, Any], chart_entries: list[dict[str, An
     summary["chartEntryCount"] = len(chart_entries)
 
 
-def run_daily_irrigation_experiment(
+def _sampling_moisture_chart_summary(
+    rows: list[dict[str, Any]],
+    sample_interval_hours: int,
+    hourly: bool,
+) -> dict[str, int]:
+    if not rows:
+        return {"sample_count": 0, "sample_interval_rows": 0}
+
+    sample_interval_rows = max(1, sample_interval_hours if hourly else round(sample_interval_hours / 24))
+    sample_count = 0
+    has_sample_flags = any("sparse_sensor_sample" in row for row in rows)
+
+    for index, row in enumerate(rows):
+        raw_sparse = _number(row.get("sparse_moisture"), None)
+        if raw_sparse is not None:
+            row["sparse_moisture_raw"] = round(raw_sparse, 2)
+
+        sample_now = bool(row.get("sparse_sensor_sample")) if has_sample_flags else index % sample_interval_rows == 0
+        if sample_now:
+            sample_count += 1
+
+    return {"sample_count": sample_count, "sample_interval_rows": sample_interval_rows}
+
+
+def run_default_dt_irrigation_control(
     start_date: date,
     end_date: date,
     persist: bool = False,
     snapshot: ExperimentSnapshot | None = None,
 ) -> dict[str, Any]:
-    """Run a database-backed daily irrigation experiment.
+    """Run the database-backed default DT irrigation control strategy.
 
-    The experiment reads stored weather and seeded pot inventory from Postgres.
-    It returns daily aggregate rows for charting and keeps the previous synthetic
-    simulation untouched.
+    The strategy reads stored weather and seeded pot inventory from Postgres.
+    It returns daily aggregate rows for charting.
     """
     if end_date < start_date:
         raise ValueError("end_date must not be before start_date")
 
-    snapshot = _resolve_snapshot(start_date, end_date, snapshot)
-    weather_rows = snapshot.selected_weather_rows
-    pots = snapshot.pots
-    sensor_context = snapshot.sensor_context
-    weather_by_day = snapshot.weather_by_day
-    pot_states = _copy_pot_states(snapshot.initial_pot_states)
+    selected_snapshot = _resolve_snapshot(start_date, end_date, snapshot)
+    simulation_start_date, simulation_snapshot = _resolve_simulation_snapshot(start_date, end_date, selected_snapshot)
+    weather_rows = selected_snapshot.selected_weather_rows
+    pots = simulation_snapshot.pots
+    zone_pots = _pots_by_valve_zone(pots)
+    sensor_context = simulation_snapshot.sensor_context
+    selected_sensor_context = selected_snapshot.sensor_context
+    weather_by_day = simulation_snapshot.weather_by_day
+    pot_states = _copy_pot_states(simulation_snapshot.initial_pot_states)
+    sensor_state_anchor = _initialize_states_from_first_day_sensor_readings(
+        pot_states,
+        pots,
+        sensor_context,
+        simulation_start_date,
+    )
 
     entries = []
     detail_entries = []
@@ -175,19 +418,20 @@ def run_daily_irrigation_experiment(
     total_water_ml = 0.0
     total_irrigation_events = 0
     total_irrigation_decisions = 0
-
-    current_date = start_date
+    current_date = simulation_start_date
     while current_date <= end_date:
         day_weather = weather_by_day.get(current_date, [])
         if not day_weather:
             current_date += timedelta(days=1)
             continue
 
-        day_profile = snapshot.day_profiles.get(current_date) or _day_profile(current_date, day_weather, weather_by_day)
+        record_date = current_date >= start_date
+        day_profile = simulation_snapshot.day_profiles.get(current_date) or _day_profile(current_date, day_weather, weather_by_day)
         daily_water_ml = 0.0
         daily_events = 0
         daily_decisions = 0
         daily_alerts = 0
+        daily_moisture_tracker = _new_daily_moisture_tracker()
 
         for hour_weather in day_weather:
             observed_local = _local_observed_at(hour_weather)
@@ -195,47 +439,95 @@ def run_daily_irrigation_experiment(
             hourly_events = 0
             hourly_decisions = 0
             hourly_alerts = 0
+            slot = _baseline_decision_slot(current_date, observed_local, day_profile)
+            decision_by_pot_id: dict[int, dict[str, Any]] = {}
+            zone_trigger_decisions: dict[str, list[dict[str, Any]]] = {}
 
             for pot in pots:
                 state = pot_states[pot["id"]]
-                _apply_hourly_environment(state, pot, hour_weather, day_profile, observed_local.date())
-                _apply_sensor_reading(state, pot, current_date, observed_local, sensor_context)
+                _apply_hourly_environment(
+                    state,
+                    pot,
+                    hour_weather,
+                    day_profile,
+                    observed_local.date(),
+                    rain_exposure_factor=_rain_exposure_factor(pot, observed_local.date()),
+                )
+                _apply_sensor_calibration_marker(state, pot, current_date, observed_local, sensor_context, day_profile)
 
-                slot = _decision_slot(current_date, observed_local, day_profile)
                 if slot is None:
                     if _is_emergency_dryness(state, pot, current_date, observed_local):
-                        alerts.append(_alert_row(pot, hour_weather, "emergency_dryness", "warning", "Emergency dryness outside watering window"))
-                        daily_alerts += 1
-                        hourly_alerts += 1
+                        if record_date:
+                            alerts.append(_alert_row(pot, hour_weather, "emergency_dryness", "warning", "Emergency dryness outside watering window"))
+                            daily_alerts += 1
+                            hourly_alerts += 1
                     continue
 
                 decision = _with_sensor_key(
-                    _make_irrigation_decision(state, pot, hour_weather, day_profile, slot),
+                    _make_baseline_irrigation_decision(state, pot, hour_weather, day_profile, slot),
                     pot,
                     sensor_context,
                 )
-                decisions.append(decision)
-                daily_decisions += 1
-                hourly_decisions += 1
+                decision = _apply_cold_month_indoor_skip(decision, pot, current_date)
+                decision_by_pot_id[int(pot["id"])] = decision
+                if record_date:
+                    decisions.append(decision)
+                    daily_decisions += 1
+                    hourly_decisions += 1
 
-                if decision["should_irrigate"]:
-                    event = _with_event_sensor_key(_apply_irrigation_event(state, pot, hour_weather, decision), decision)
-                    events.append(event)
-                    daily_events += 1
-                    daily_water_ml += event["planned_volume_ml"]
-                    hourly_events += 1
-                    hourly_water_ml += event["planned_volume_ml"]
+                if decision["should_irrigate"] and _is_valve_managed_pot(pot, current_date):
+                    zone_trigger_decisions.setdefault(pot["balcony_zone"], []).append(decision)
 
-                if state.moisture > pot["moisture_max_pct"]:
-                    state.too_wet_hours += 1
-                    if state.too_wet_hours == 24:
-                        alerts.append(_alert_row(pot, hour_weather, "too_wet_too_long", "warning", "Pot stayed above maximum moisture for 24 hours"))
-                        daily_alerts += 1
-                        hourly_alerts += 1
-                else:
-                    state.too_wet_hours = 0
+            snapshot_label = _daily_moisture_snapshot_label(current_date, observed_local, day_profile)
+            if record_date and snapshot_label:
+                _record_daily_moisture_snapshot(daily_moisture_tracker, pot_states, snapshot_label)
 
-            if _uses_hourly_chart(start_date, end_date):
+            if slot is not None:
+                for zone, trigger_decisions in zone_trigger_decisions.items():
+                    trigger_pot_ids = [int(decision["pot_id"]) for decision in trigger_decisions]
+                    trigger_pot_codes = [decision["pot_code"] for decision in trigger_decisions if decision.get("pot_code")]
+                    zone_dose_factor = _baseline_zone_dose_factor(trigger_decisions)
+                    zone_events = _execute_valve_zone_distribution(
+                        pot_states,
+                        zone_pots,
+                        zone,
+                        current_date,
+                        hour_weather,
+                        decision_by_pot_id,
+                        lambda zone_pot, zone_decision: {
+                            **zone_decision,
+                            "should_irrigate": True,
+                            "dose_factor": zone_dose_factor,
+                        },
+                        _baseline_irrigation_request,
+                        {
+                            "zone_triggered": True,
+                            "zone_trigger_pot_ids": trigger_pot_ids,
+                            "zone_trigger_pot_codes": trigger_pot_codes,
+                            "zone_dose_factor": zone_dose_factor,
+                            "zone": zone,
+                        },
+                    )
+                    for event in zone_events:
+                        if record_date:
+                            events.append(event)
+                            daily_events += 1
+                            daily_water_ml += event["planned_volume_ml"]
+                            hourly_events += 1
+                            hourly_water_ml += event["planned_volume_ml"]
+
+                for pot in pots:
+                    state = pot_states[pot["id"]]
+                    if state.moisture > pot["moisture_max_pct"]:
+                        state.too_wet_hours += 1
+                        if record_date and state.too_wet_hours == 24:
+                            alerts.append(_alert_row(pot, hour_weather, "too_wet_too_long", "warning", "Pot stayed above maximum moisture for 24 hours"))
+                            daily_alerts += 1
+                            hourly_alerts += 1
+                    else:
+                        state.too_wet_hours = 0
+
+            if record_date and _uses_hourly_chart(start_date, end_date):
                 detail_entries.append(
                     _hourly_aggregate_entry(
                         observed_local,
@@ -246,15 +538,18 @@ def run_daily_irrigation_experiment(
                         hourly_events,
                         hourly_decisions,
                         hourly_alerts,
-                        _hourly_line_metadata(sensor_context, current_date, observed_local, hour_weather),
+                        _hourly_line_metadata(selected_sensor_context, current_date, observed_local, hour_weather),
                     )
                 )
 
-        moistures = [state.moisture for state in pot_states.values()]
-        avg_moisture = sum(moistures) / max(len(moistures), 1)
+        if not record_date:
+            current_date += timedelta(days=1)
+            continue
+
         total_water_ml += daily_water_ml
         total_irrigation_events += daily_events
         total_irrigation_decisions += daily_decisions
+        moisture_summary = _daily_moisture_summary(daily_moisture_tracker, pot_states)
 
         entries.append(
             {
@@ -262,12 +557,18 @@ def run_daily_irrigation_experiment(
                 "timestamp": datetime.combine(current_date, time(12, 0), tzinfo=LOCAL_TZ).isoformat(),
                 "day_label": current_date.strftime("%Y-%m-%d"),
                 "chart_label": current_date.strftime("%Y-%m-%d"),
-                "moisture": round(avg_moisture, 2),
-                "average_moisture": round(avg_moisture, 2),
-                "min_moisture": round(min(moistures), 2),
-                "max_moisture": round(max(moistures), 2),
+                "moisture": moisture_summary["moisture"],
+                "average_moisture": moisture_summary["average_moisture"],
+                "min_moisture": moisture_summary["min_moisture"],
+                "max_moisture": moisture_summary["max_moisture"],
+                "moisture_sample_count": moisture_summary.get("moisture_sample_count", 0),
+                "moisture_sample_method": moisture_summary.get("moisture_sample_method", "end_of_day"),
+                "moisture_sample_labels": moisture_summary.get("moisture_sample_labels", []),
+                "pre_irrigation_moisture": moisture_summary.get("pre_irrigation_moisture"),
+                "post_irrigation_moisture": moisture_summary.get("post_irrigation_moisture"),
                 "temperature": round(day_profile["avg_temperature_c"], 2),
                 "max_temperature": round(day_profile["max_temperature_c"], 2),
+                "min_temperature": round(day_profile["min_temperature_c"], 2),
                 "humidity": round(day_profile["avg_humidity_pct"], 2),
                 "cloud_cover_pct": round(day_profile["avg_cloud_cover_pct"], 2),
                 "rain_prediction": day_profile["precipitation_mm"] >= 0.5,
@@ -283,15 +584,12 @@ def run_daily_irrigation_experiment(
                 "alerts": daily_alerts,
                 "water_usage_ml": round(daily_water_ml, 2),
                 "water_usage_l": round(daily_water_ml / 1000.0, 2),
-                **_daily_line_metadata(sensor_context, current_date, day_weather),
+                **_daily_line_metadata(selected_sensor_context, current_date, day_weather),
             }
         )
         current_date += timedelta(days=1)
 
     valve_rollup = _apply_valve_rollup_to_entries(entries, detail_entries, pots, decisions, events)
-
-    if persist:
-        _persist_daily_results("baseline", start_date, end_date, decisions, events, alerts)
 
     total_days = len(entries)
     total_pots = len(pots)
@@ -312,9 +610,14 @@ def run_daily_irrigation_experiment(
         "wetAlerts": len([alert for alert in alerts if alert["alert_type"] == "too_wet_too_long"]),
         "startDate": start_date.isoformat(),
         "endDate": end_date.isoformat(),
-        "source": _experiment_source(sensor_context),
+        "stateSimulationStartDate": simulation_start_date.isoformat(),
+        "stateLookbackDays": (end_date - simulation_start_date).days + 1,
+        "stateAnchorPolicy": "stable_historical_timeline",
+        "source": _experiment_source(selected_sensor_context),
     }
-    summary.update(_sensor_summary_fields(sensor_context))
+    if sensor_state_anchor is not None:
+        summary["stateSensorAnchor"] = sensor_state_anchor
+    summary.update(_sensor_summary_fields(selected_sensor_context))
     chart_entries = _chart_entries_for_range(start_date, end_date, entries, detail_entries)
     _add_chart_summary(summary, chart_entries, start_date, end_date)
 
@@ -341,6 +644,7 @@ def run_daily_sampling_experiment(
     sample_interval_hours: int | None = None,
     persist: bool = False,
     snapshot: ExperimentSnapshot | None = None,
+    baseline_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compare full daily decisions with a sparse sensor sampling strategy."""
     start_time = perf_time.perf_counter()
@@ -351,7 +655,7 @@ def run_daily_sampling_experiment(
     else:
         sample_interval_hours = max(1, int(sample_interval_hours))
         sample_interval_days = max(1, round(sample_interval_hours / 24))
-    baseline = run_daily_irrigation_experiment(
+    baseline = baseline_result or run_default_dt_irrigation_control(
         start_date=start_date,
         end_date=end_date,
         persist=False,
@@ -365,151 +669,106 @@ def run_daily_sampling_experiment(
         snapshot=snapshot,
     )
 
-    baseline_by_date = {entry["date"]: entry for entry in baseline["entries"]}
-    entries = []
-    matches = 0
-    mismatches = 0
+    comparison = _ExperimentComparison(start_date, end_date, snapshot, baseline, sparse, "sparse", "sparse_water_usage_l")
 
-    for sparse_entry in sparse["entries"]:
-        baseline_entry = baseline_by_date.get(sparse_entry["date"])
-        if baseline_entry is None:
-            continue
-
-        baseline_active = baseline_entry["irrigation_events"] > 0
-        sparse_active = sparse_entry["irrigation_events"] > 0
-        if baseline_active == sparse_active:
-            matches += 1
-        else:
-            mismatches += 1
-
-        entries.append(
+    def sparse_row(baseline_entry: dict[str, Any], sparse_entry: dict[str, Any]) -> dict[str, Any]:
+        return comparison.row(
+            baseline_entry,
+            sparse_entry,
             {
-                "date": sparse_entry["date"],
-                "timestamp": sparse_entry["timestamp"],
-                "day_label": sparse_entry["day_label"],
-                "chart_label": sparse_entry.get("chart_label", sparse_entry["day_label"]),
-                "baseline_moisture": baseline_entry["average_moisture"],
-                "sparse_moisture": sparse_entry["average_moisture"],
-                "temperature": sparse_entry["temperature"],
-                "max_temperature": sparse_entry["max_temperature"],
-                "humidity": sparse_entry["humidity"],
-                "cloud_cover_pct": sparse_entry["cloud_cover_pct"],
-                "rain_prediction": sparse_entry["rain_prediction"],
-                "rain_amount": sparse_entry["rain_amount"],
-                "baseline_irrigation_active": baseline_active,
-                "sparse_irrigation_active": sparse_active,
-                "baseline_irrigation_events": baseline_entry["irrigation_events"],
-                "sparse_irrigation_events": sparse_entry["irrigation_events"],
-                "baseline_valve_runs": baseline_entry.get("valve_runs", baseline_entry["irrigation_events"]),
-                "sparse_valve_runs": sparse_entry.get("valve_runs", sparse_entry["irrigation_events"]),
-                "baseline_water_usage_l": baseline_entry["water_usage_l"],
-                "sparse_water_usage_l": sparse_entry["water_usage_l"],
-                "baseline_water_usage_ml": baseline_entry["water_usage_ml"],
-                "sparse_water_usage_ml": sparse_entry["water_usage_ml"],
                 "sample_interval_days": sample_interval_days,
                 "sample_interval_hours": sample_interval_hours,
-                "alerts": sparse_entry["alerts"],
-                **_combined_line_metadata(baseline_entry, sparse_entry),
-            }
+                "sparse_sensor_sample": bool(sparse_entry.get("sparse_sensor_sample")),
+                "sparse_sensor_samples": int(sparse_entry.get("sparse_sensor_samples") or 0),
+            },
         )
 
-    baseline_chart_by_timestamp = {entry["timestamp"]: entry for entry in baseline.get("chartEntries", baseline["entries"])}
-    chart_entries = []
-    for sparse_entry in sparse.get("chartEntries", sparse["entries"]):
-        baseline_entry = baseline_chart_by_timestamp.get(sparse_entry["timestamp"]) or baseline_by_date.get(sparse_entry["date"])
-        if baseline_entry is None:
-            continue
-        baseline_active = baseline_entry["irrigation_events"] > 0
-        sparse_active = sparse_entry["irrigation_events"] > 0
-        chart_entries.append(
-            {
-                "date": sparse_entry["date"],
-                "timestamp": sparse_entry["timestamp"],
-                "day_label": sparse_entry["day_label"],
-                "chart_label": sparse_entry.get("chart_label", sparse_entry["day_label"]),
-                "baseline_moisture": baseline_entry["average_moisture"],
-                "sparse_moisture": sparse_entry["average_moisture"],
-                "temperature": sparse_entry["temperature"],
-                "max_temperature": sparse_entry["max_temperature"],
-                "humidity": sparse_entry["humidity"],
-                "cloud_cover_pct": sparse_entry["cloud_cover_pct"],
-                "rain_prediction": sparse_entry["rain_prediction"],
-                "rain_amount": sparse_entry["rain_amount"],
-                "baseline_irrigation_active": baseline_active,
-                "sparse_irrigation_active": sparse_active,
-                "baseline_irrigation_events": baseline_entry["irrigation_events"],
-                "sparse_irrigation_events": sparse_entry["irrigation_events"],
-                "baseline_valve_runs": baseline_entry.get("valve_runs", baseline_entry["irrigation_events"]),
-                "sparse_valve_runs": sparse_entry.get("valve_runs", sparse_entry["irrigation_events"]),
-                "baseline_water_usage_l": baseline_entry["water_usage_l"],
-                "sparse_water_usage_l": sparse_entry["water_usage_l"],
-                "baseline_water_usage_ml": baseline_entry["water_usage_ml"],
-                "sparse_water_usage_ml": sparse_entry["water_usage_ml"],
-                "sample_interval_days": sample_interval_days,
-                "sample_interval_hours": sample_interval_hours,
-                "alerts": sparse_entry["alerts"],
-                **_combined_line_metadata(baseline_entry, sparse_entry),
-            }
-        )
+    entries = comparison.daily_entries(sparse_row)
+    chart_entries = comparison.chart_entries(sparse_row)
+    matches = sum(1 for entry in entries if entry["baseline_irrigation_active"] == entry["sparse_irrigation_active"])
+    mismatches = len(entries) - matches
+
+    table_moisture_display = _sampling_moisture_chart_summary(entries, sample_interval_hours, hourly=False)
+    chart_moisture_display = _sampling_moisture_chart_summary(
+        chart_entries,
+        sample_interval_hours,
+        hourly=_uses_hourly_chart(start_date, end_date) and bool(chart_entries),
+    )
 
     total_days = len(entries)
-    baseline_summary = baseline["summary"]
-    sparse_summary = sparse["summary"]
+    baseline_summary = comparison.baseline_summary
+    sparse_summary = comparison.comparison_summary
+    baseline_only_irrigation_days = [
+        entry for entry in entries
+        if entry["baseline_irrigation_active"] and not entry["sparse_irrigation_active"]
+    ]
+    sparse_only_irrigation_days = [
+        entry for entry in entries
+        if entry["sparse_irrigation_active"] and not entry["baseline_irrigation_active"]
+    ]
+    baseline_only_valve_runs = sum(int(entry["baseline_valve_runs"] or 0) for entry in baseline_only_irrigation_days)
+    baseline_only_water_l = sum(float(entry["baseline_water_usage_l"] or 0.0) for entry in baseline_only_irrigation_days)
+    missed_valve_run_delta = sum(
+        max(0, int(entry["baseline_valve_runs"] or 0) - int(entry["sparse_valve_runs"] or 0))
+        for entry in entries
+    )
+    sparse_extra_valve_run_delta = sum(
+        max(0, int(entry["sparse_valve_runs"] or 0) - int(entry["baseline_valve_runs"] or 0))
+        for entry in entries
+    )
+    totals = comparison.total_usage_counts(entries)
     summary = {
-        "totalEntries": total_days,
-        "daysAnalyzed": total_days,
-        "potsAnalyzed": sparse_summary["potsAnalyzed"],
+        **comparison.base_summary(entries),
         "sample_interval_days": sample_interval_days,
         "sample_interval_hours": sample_interval_hours,
         "sample_interval": sample_interval_days,
         "accuracy_percent": round(matches / max(total_days, 1) * 100.0, 2),
         "mismatch_days": mismatches,
         "mismatch_steps": mismatches,
-        "baseline_total_water_usage_l": baseline_summary["totalWaterUsage"],
-        "sparse_total_water_usage_l": sparse_summary["totalWaterUsage"],
-        "baseline_irrigation_event_count": baseline_summary["irrigationEvents"],
-        "sparse_irrigation_event_count": sparse_summary["irrigationEvents"],
-        "baseline_valve_run_count": baseline_summary.get("valveRuns", baseline_summary["irrigationEvents"]),
-        "sparse_valve_run_count": sparse_summary.get("valveRuns", sparse_summary["irrigationEvents"]),
-        "baseline_irrigation_decisions": baseline_summary["irrigationDecisions"],
-        "sparse_irrigation_decisions": sparse_summary["irrigationDecisions"],
+        **totals,
+        **comparison.decision_counts(),
         "sampledWeatherRows": sparse_summary.get("sampledWeatherRows", 0),
+        "sampledSensorRows": sparse_summary.get("sampledSensorRows", 0),
+        "sampledSensorMoments": sparse_summary.get("sampledSensorMoments", 0),
         "samplingDataPolicy": sparse_summary.get("samplingDataPolicy", "sensor-and-weather-sampled"),
+        "forecastSensorCalibrationPolicy": sparse_summary.get("forecastSensorCalibrationPolicy"),
+        "weatherSamplingPolicy": sparse_summary.get("weatherSamplingPolicy", "current-weather"),
+        "sparseSimulationGranularity": sparse_summary.get("sparseSimulationGranularity", "hourly_state_decision_slot_control"),
+        "sampling_moisture_mae_pct": sparse_summary.get("sampling_moisture_mae_pct", 0),
+        "sampling_moisture_bias_pct": sparse_summary.get("sampling_moisture_bias_pct", 0),
+        "sampling_moisture_max_error_pct": sparse_summary.get("sampling_moisture_max_error_pct", 0),
+        "sampling_estimation_points": sparse_summary.get("sampling_estimation_points", 0),
+        "sampling_sensor_refreshes": sparse_summary.get("sampling_sensor_refreshes", 0),
+        "sampling_direct_refreshes": sparse_summary.get("sampling_direct_refreshes", 0),
+        "sampling_associated_refreshes": sparse_summary.get("sampling_associated_refreshes", 0),
+        "sampling_forecast_refreshes": sparse_summary.get("sampling_forecast_refreshes", 0),
+        "sampling_missing_refreshes": sparse_summary.get("sampling_missing_refreshes", 0),
+        "sampling_average_association_distance": sparse_summary.get("sampling_average_association_distance", 0),
+        "baseline_only_irrigation_days": len(baseline_only_irrigation_days),
+        "sparse_only_irrigation_days": len(sparse_only_irrigation_days),
+        "baseline_only_valve_runs": baseline_only_valve_runs,
+        "baseline_only_water_usage_l": round(baseline_only_water_l, 2),
+        "missed_valve_run_delta": missed_valve_run_delta,
+        "sparse_extra_valve_run_delta": sparse_extra_valve_run_delta,
+        "sparse_moisture_display_policy": "simulated_between_sensor_calibrations",
+        "sparse_moisture_chart_samples": chart_moisture_display["sample_count"],
+        "sparse_moisture_table_samples": table_moisture_display["sample_count"],
         "decisionLevel": "valve_zone",
         "execution_time_seconds": round(perf_time.perf_counter() - start_time, 3),
         "startDate": start_date.isoformat(),
         "endDate": end_date.isoformat(),
+        "stateSimulationStartDate": sparse_summary.get(
+            "stateSimulationStartDate",
+            baseline_summary.get("stateSimulationStartDate"),
+        ),
+        "stateLookbackDays": sparse_summary.get(
+            "stateLookbackDays",
+            baseline_summary.get("stateLookbackDays"),
+        ),
         "source": baseline_summary.get("source", "database-weather-and-pot-inventory"),
     }
-    for key in (
-        "sensorDataUsed",
-        "sensorSource",
-        "sensorRows",
-        "latestStateRows",
-        "sensorMappedDays",
-        "sensorDateMappings",
-        "sensorFirstDate",
-        "sensorLastDate",
-        "latestKnownSoilStateAt",
-        "futureStateEstimated",
-        "futureEstimatedDays",
-        "futureEstimatedDateRange",
-        "sensorError",
-    ):
-        if key in baseline_summary:
-            summary[key] = baseline_summary[key]
-    _add_chart_summary(summary, chart_entries, start_date, end_date)
-    return {
-        "entries": entries,
-        "chartEntries": chart_entries,
-        "summary": summary,
-        "pots": _comparison_pot_info_entries(
-            snapshot.pots,
-            baseline,
-            sparse,
-            "sparse_water_usage_l",
-        ),
-    }
+    summary.update(comparison.sensor_summary())
+    return comparison.payload(entries, chart_entries, summary)
 
 
 def run_daily_fuzzy_dt_experiment(
@@ -517,25 +776,25 @@ def run_daily_fuzzy_dt_experiment(
     end_date: date,
     persist: bool = False,
     snapshot: ExperimentSnapshot | None = None,
+    baseline_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Run the paper-style digital-twin fuzzy irrigation recommendation.
+    """Compare the fuzzy DT prescription controller with default DT usage.
 
-    The controller follows the FIS layout described in the referenced paper:
-    daily irrigation prescription from ETc, soil moisture, days after planting,
-    rain forecast, and rain probability. Each active pot is treated as a
-    homogeneous management zone.
+    The fuzzy controller uses the same three measured inputs as ANFIS:
+    soil moisture, temperature, and rain. Physical execution is constrained to
+    valve zones, so a triggered zone waters all currently managed pots. The
+    comparator is the application's normal threshold/weather rule controller.
     """
     if end_date < start_date:
         raise ValueError("end_date must not be before start_date")
 
     start_time = perf_time.perf_counter()
     snapshot = _resolve_snapshot(start_date, end_date, snapshot)
-    baseline = _run_fuzzy_dt_daily_irrigation(
+    baseline = baseline_result or run_default_dt_irrigation_control(
         start_date=start_date,
         end_date=end_date,
         persist=False,
         snapshot=snapshot,
-        controller="fao_pm",
     )
     fuzzy = _run_fuzzy_dt_daily_irrigation(
         start_date=start_date,
@@ -544,96 +803,45 @@ def run_daily_fuzzy_dt_experiment(
         snapshot=snapshot,
     )
 
-    baseline_by_date = {entry["date"]: entry for entry in baseline["entries"]}
-    entries = []
-    fuzzy_irrigation_days = 0
-    baseline_irrigation_days = 0
+    comparison = _ExperimentComparison(start_date, end_date, snapshot, baseline, fuzzy, "fuzzy", "fuzzy_water_usage_l")
 
-    for fuzzy_entry in fuzzy["entries"]:
-        baseline_entry = baseline_by_date.get(fuzzy_entry["date"])
-        if baseline_entry is None:
-            continue
+    def fuzzy_row(baseline_entry: dict[str, Any], fuzzy_entry: dict[str, Any]) -> dict[str, Any]:
+        prescription_mm = fuzzy_entry.get("fuzzy_prescription_mm", fuzzy_entry.get("avg_prescription_mm", 0.0))
+        return comparison.row(
+            baseline_entry,
+            fuzzy_entry,
+            {
+                "fuzzy_prescription_mm": prescription_mm,
+                "avg_prescription_mm": fuzzy_entry.get("avg_prescription_mm", prescription_mm),
+            },
+            include_moisture_alias=True,
+        )
 
-        if baseline_entry["irrigation_events"] > 0:
-            baseline_irrigation_days += 1
-        if fuzzy_entry["irrigation_events"] > 0:
-            fuzzy_irrigation_days += 1
-
-        entries.append(_fuzzy_comparison_entry(baseline_entry, fuzzy_entry))
-
-    baseline_chart_by_timestamp = {entry["timestamp"]: entry for entry in baseline.get("chartEntries", baseline["entries"])}
-    chart_entries = []
-    for fuzzy_entry in fuzzy.get("chartEntries", fuzzy["entries"]):
-        baseline_entry = baseline_chart_by_timestamp.get(fuzzy_entry["timestamp"]) or baseline_by_date.get(fuzzy_entry["date"])
-        if baseline_entry is None:
-            continue
-        chart_entries.append(_fuzzy_comparison_entry(baseline_entry, fuzzy_entry))
-
-    total_days = len(entries)
-    baseline_summary = baseline["summary"]
+    entries = comparison.daily_entries(fuzzy_row)
+    chart_entries = comparison.chart_entries(fuzzy_row)
+    totals = comparison.total_usage_counts(entries)
     fuzzy_summary = fuzzy["summary"]
-    baseline_water = float(baseline_summary["totalWaterUsage"])
-    fuzzy_water = float(fuzzy_summary["totalWaterUsage"])
+    baseline_water = float(totals["baseline_total_water_usage_l"])
+    fuzzy_water = float(totals["fuzzy_total_water_usage_l"])
     water_savings_l = baseline_water - fuzzy_water
     summary = {
-        "totalEntries": total_days,
-        "daysAnalyzed": total_days,
-        "potsAnalyzed": fuzzy_summary["potsAnalyzed"],
-        "fao_irrigation_days": baseline_irrigation_days,
-        "baseline_irrigation_days": baseline_irrigation_days,
-        "fuzzy_irrigation_days": fuzzy_irrigation_days,
-        "fao_total_water_usage_l": baseline_water,
-        "baseline_total_water_usage_l": baseline_water,
-        "fuzzy_total_water_usage_l": fuzzy_water,
+        **comparison.base_summary(entries),
+        **comparison.irrigation_day_counts(entries),
+        **totals,
+        **comparison.decision_counts(),
         "water_savings_l": round(water_savings_l, 2),
         "water_savings_percent": round((water_savings_l / baseline_water) * 100.0, 2) if baseline_water > 0 else 0.0,
-        "fao_irrigation_event_count": baseline_summary["irrigationEvents"],
-        "baseline_irrigation_event_count": baseline_summary["irrigationEvents"],
-        "fuzzy_irrigation_event_count": fuzzy_summary["irrigationEvents"],
-        "fao_valve_run_count": baseline_summary.get("valveRuns", baseline_summary["irrigationEvents"]),
-        "baseline_valve_run_count": baseline_summary.get("valveRuns", baseline_summary["irrigationEvents"]),
-        "fuzzy_valve_run_count": fuzzy_summary.get("valveRuns", fuzzy_summary["irrigationEvents"]),
-        "fao_irrigation_decisions": baseline_summary["irrigationDecisions"],
-        "baseline_irrigation_decisions": baseline_summary["irrigationDecisions"],
-        "fuzzy_irrigation_decisions": fuzzy_summary["irrigationDecisions"],
         "average_prescription_mm": fuzzy_summary.get("averagePrescriptionMm", 0.0),
-        "average_etc_mm": fuzzy_summary.get("averageEtcMm", 0.0),
         "fuzzyDataPolicy": fuzzy_summary.get("fuzzyDataPolicy", "daily-fis-prescription"),
+        "comparisonBaseline": "default_dt_threshold_control",
         "decisionLevel": "valve_zone",
         "execution_time_seconds": round(perf_time.perf_counter() - start_time, 3),
         "startDate": start_date.isoformat(),
         "endDate": end_date.isoformat(),
-        "source": baseline_summary.get("source", "database-weather-and-pot-inventory"),
+        "source": comparison.baseline_summary.get("source", "database-weather-and-pot-inventory"),
     }
-    for key in (
-        "sensorDataUsed",
-        "sensorSource",
-        "sensorRows",
-        "latestStateRows",
-        "sensorMappedDays",
-        "sensorDateMappings",
-        "sensorFirstDate",
-        "sensorLastDate",
-        "latestKnownSoilStateAt",
-        "futureStateEstimated",
-        "futureEstimatedDays",
-        "futureEstimatedDateRange",
-        "sensorError",
-    ):
-        if key in baseline_summary:
-            summary[key] = baseline_summary[key]
-    _add_chart_summary(summary, chart_entries, start_date, end_date)
-    return {
-        "entries": entries,
-        "chartEntries": chart_entries,
-        "summary": summary,
-        "pots": _comparison_pot_info_entries(
-            snapshot.pots,
-            baseline,
-            fuzzy,
-            "fuzzy_water_usage_l",
-        ),
-    }
+    summary.update(comparison.sensor_summary())
+    return comparison.payload(entries, chart_entries, summary)
 
 
 def run_daily_anfis_experiment(
@@ -644,39 +852,32 @@ def run_daily_anfis_experiment(
     seed: int | None = 2026,
     generations: int = 35,
     population: int = 24,
-    parallel_workers: int | None = None,
-    parallel_backend: str = "process",
     persist: bool = False,
     snapshot: ExperimentSnapshot | None = None,
+    baseline_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apply an ANFIS controller to the same database weather/pot simulation."""
     if end_date < start_date:
         raise ValueError("end_date must not be before start_date")
 
     snapshot = _resolve_snapshot(start_date, end_date, snapshot)
-    weather_rows = snapshot.selected_weather_rows
-    pots = snapshot.pots
+    training_snapshot = _resolve_anfis_training_snapshot(end_date, snapshot)
+    training_sensor_context = training_snapshot.sensor_context
     sensor_context = snapshot.sensor_context
 
     start_time = perf_time.perf_counter()
-    train_dataset = _generate_database_anfis_dataset(
-        weather_rows,
-        pots,
-        train_samples,
+    anfis_dataset = _generate_database_anfis_dataset(
+        training_snapshot.selected_weather_rows,
+        training_snapshot.pots,
+        max(2, train_samples + test_samples),
         seed,
-        sensor_context,
-        snapshot.weather_by_day,
-        snapshot.day_profiles,
+        training_sensor_context,
+        training_snapshot.weather_by_day,
+        training_snapshot.day_profiles,
     )
-    test_dataset = _generate_database_anfis_dataset(
-        weather_rows,
-        pots,
-        test_samples,
-        (seed + 1) if seed is not None else None,
-        sensor_context,
-        snapshot.weather_by_day,
-        snapshot.day_profiles,
-    )
+    if not anfis_dataset:
+        raise ValueError("ANFIS training requires recorded sensor readings for the selected or lookback interval")
+    train_dataset, test_dataset = _split_anfis_dataset(anfis_dataset, train_samples, test_samples, seed)
 
     model = ANFIS()
     model.fit(
@@ -684,13 +885,18 @@ def run_daily_anfis_experiment(
         generations=generations,
         population=population,
         seed=seed,
-        parallel=True,
-        parallel_workers=parallel_workers,
-        parallel_backend=parallel_backend,
     )
     evaluation = _evaluate_anfis_model(model, test_dataset)
+    threshold_calibration = {
+        "threshold": ANFIS_DECISION_THRESHOLD,
+        "raw_threshold": ANFIS_DECISION_THRESHOLD,
+        "calibrated": False,
+        "reason": "fixed_threshold_no_sensor_calibration",
+    }
+    decision_threshold = ANFIS_DECISION_THRESHOLD
+    forecast_decision_threshold = ANFIS_FORECAST_DECISION_THRESHOLD
 
-    baseline = run_daily_irrigation_experiment(
+    baseline = baseline_result or run_default_dt_irrigation_control(
         start_date=start_date,
         end_date=end_date,
         persist=False,
@@ -702,132 +908,95 @@ def run_daily_anfis_experiment(
         model=model,
         persist=persist,
         snapshot=snapshot,
+        decision_threshold=decision_threshold,
+        forecast_decision_threshold=forecast_decision_threshold,
     )
 
-    baseline_by_date = {entry["date"]: entry for entry in baseline["entries"]}
-    entries = []
-    predicted_probabilities = []
-    baseline_irrigation_days = 0
-    anfis_irrigation_days = 0
+    comparison = _ExperimentComparison(start_date, end_date, snapshot, baseline, anfis, "anfis", "anfis_water_usage_l")
 
-    for anfis_entry in anfis["entries"]:
-        baseline_entry = baseline_by_date.get(anfis_entry["date"])
-        if baseline_entry is None:
-            continue
-
-        baseline_active = baseline_entry["irrigation_events"] > 0
-        anfis_active = anfis_entry["irrigation_events"] > 0
-        if baseline_active:
-            baseline_irrigation_days += 1
-        if anfis_active:
-            anfis_irrigation_days += 1
-
-        predicted_probability = anfis_entry["predicted_probability"]
-        predicted_probabilities.append(predicted_probability)
-
-        entries.append(
-            {
-                "date": anfis_entry["date"],
-                "timestamp": anfis_entry["timestamp"],
-                "day_label": anfis_entry["day_label"],
-                "chart_label": anfis_entry.get("chart_label", anfis_entry["day_label"]),
-                "moisture": baseline_entry["average_moisture"],
-                "baseline_moisture": baseline_entry["average_moisture"],
-                "anfis_moisture": anfis_entry["average_moisture"],
-                "temperature": anfis_entry["temperature"],
-                "max_temperature": anfis_entry["max_temperature"],
-                "humidity": anfis_entry["humidity"],
-                "cloud_cover_pct": anfis_entry["cloud_cover_pct"],
-                "rain_prediction": anfis_entry["rain_prediction"],
-                "rain_amount": anfis_entry["rain_amount"],
-                "predicted_probability": predicted_probability,
-                "predicted_probability_percent": round(predicted_probability * 100.0, 2),
-                "predicted_category": probability_category(predicted_probability),
-                "baseline_irrigation_active": baseline_active,
-                "anfis_irrigation_active": anfis_active,
-                "baseline_irrigation_events": baseline_entry["irrigation_events"],
-                "anfis_irrigation_events": anfis_entry["irrigation_events"],
-                "baseline_water_usage_l": baseline_entry["water_usage_l"],
-                "anfis_water_usage_l": anfis_entry["water_usage_l"],
-                "baseline_water_usage_ml": baseline_entry["water_usage_ml"],
-                "anfis_water_usage_ml": anfis_entry["water_usage_ml"],
-                "alerts": anfis_entry["alerts"],
-                **_combined_line_metadata(baseline_entry, anfis_entry),
-            }
-        )
-
-    baseline_chart_by_timestamp = {entry["timestamp"]: entry for entry in baseline.get("chartEntries", baseline["entries"])}
-    chart_entries = []
-    for anfis_entry in anfis.get("chartEntries", anfis["entries"]):
-        baseline_entry = baseline_chart_by_timestamp.get(anfis_entry["timestamp"]) or baseline_by_date.get(anfis_entry["date"])
-        if baseline_entry is None:
-            continue
-
+    def anfis_row(baseline_entry: dict[str, Any], anfis_entry: dict[str, Any]) -> dict[str, Any]:
         predicted_probability = anfis_entry.get("predicted_probability")
         predicted_probability_percent = anfis_entry.get("predicted_probability_percent")
         if predicted_probability is not None and predicted_probability_percent is None:
             predicted_probability_percent = round(predicted_probability * 100.0, 2)
+        trigger_probability = anfis_entry.get("trigger_probability", predicted_probability)
+        trigger_probability_percent = anfis_entry.get("trigger_probability_percent")
+        if trigger_probability is not None and trigger_probability_percent is None:
+            trigger_probability_percent = round(trigger_probability * 100.0, 2)
+        anfis_decision_threshold = anfis_entry.get("anfis_decision_threshold", decision_threshold)
+        anfis_decision_threshold_percent = anfis_entry.get("anfis_decision_threshold_percent")
+        if anfis_decision_threshold is not None and anfis_decision_threshold_percent is None:
+            anfis_decision_threshold_percent = round(float(anfis_decision_threshold) * 100.0, 2)
 
-        chart_entries.append(
+        return comparison.row(
+            baseline_entry,
+            anfis_entry,
             {
-                "date": anfis_entry["date"],
-                "timestamp": anfis_entry["timestamp"],
-                "day_label": anfis_entry["day_label"],
-                "chart_label": anfis_entry.get("chart_label", anfis_entry["day_label"]),
-                "moisture": baseline_entry["average_moisture"],
-                "baseline_moisture": baseline_entry["average_moisture"],
-                "anfis_moisture": anfis_entry["average_moisture"],
-                "temperature": anfis_entry["temperature"],
-                "max_temperature": anfis_entry["max_temperature"],
-                "humidity": anfis_entry["humidity"],
-                "cloud_cover_pct": anfis_entry["cloud_cover_pct"],
-                "rain_prediction": anfis_entry["rain_prediction"],
-                "rain_amount": anfis_entry["rain_amount"],
                 "predicted_probability": predicted_probability,
                 "predicted_probability_percent": predicted_probability_percent,
+                "trigger_probability": trigger_probability,
+                "trigger_probability_percent": trigger_probability_percent,
+                "anfis_decision_threshold": anfis_decision_threshold,
+                "anfis_decision_threshold_percent": anfis_decision_threshold_percent,
                 "predicted_category": probability_category(predicted_probability) if predicted_probability is not None else "not_applicable",
-                "baseline_irrigation_active": baseline_entry["irrigation_events"] > 0,
-                "anfis_irrigation_active": anfis_entry["irrigation_events"] > 0,
-                "baseline_irrigation_events": baseline_entry["irrigation_events"],
-                "anfis_irrigation_events": anfis_entry["irrigation_events"],
-                "baseline_valve_runs": baseline_entry.get("valve_runs", baseline_entry["irrigation_events"]),
-                "anfis_valve_runs": anfis_entry.get("valve_runs", anfis_entry["irrigation_events"]),
-                "baseline_water_usage_l": baseline_entry["water_usage_l"],
-                "anfis_water_usage_l": anfis_entry["water_usage_l"],
-                "baseline_water_usage_ml": baseline_entry["water_usage_ml"],
-                "anfis_water_usage_ml": anfis_entry["water_usage_ml"],
-                "alerts": anfis_entry["alerts"],
-                **_combined_line_metadata(baseline_entry, anfis_entry),
-            }
+                "trigger_predicted_category": probability_category(trigger_probability) if trigger_probability is not None else "not_applicable",
+            },
+            include_moisture_alias=True,
         )
 
+    entries = comparison.daily_entries(anfis_row)
+    chart_entries = comparison.chart_entries(anfis_row)
+    predicted_probabilities = [
+        float(entry["predicted_probability"])
+        for entry in entries
+        if entry.get("predicted_probability") is not None
+    ]
     execution_time_seconds = round(perf_time.perf_counter() - start_time, 3)
     pred_prob_mean = round(sum(predicted_probabilities) / max(len(predicted_probabilities), 1), 4) if predicted_probabilities else 0.0
     pred_prob_min = round(min(predicted_probabilities), 4) if predicted_probabilities else 0.0
     pred_prob_max = round(max(predicted_probabilities), 4) if predicted_probabilities else 0.0
 
-    baseline_summary = baseline["summary"]
-    anfis_summary = anfis["summary"]
+    anfis_summary = comparison.comparison_summary
+    totals = comparison.total_usage_counts(entries)
+    baseline_water = float(totals["baseline_total_water_usage_l"])
+    anfis_water = float(totals["anfis_total_water_usage_l"])
+    water_savings_l = baseline_water - anfis_water
     summary = {
-        "totalEntries": len(entries),
-        "daysAnalyzed": len(entries),
-        "potsAnalyzed": anfis_summary["potsAnalyzed"],
-        "baseline_irrigation_days": baseline_irrigation_days,
-        "anfis_irrigation_days": anfis_irrigation_days,
-        "baseline_irrigation_event_count": baseline_summary["irrigationEvents"],
-        "anfis_irrigation_event_count": anfis_summary["irrigationEvents"],
-        "baseline_valve_run_count": baseline_summary.get("valveRuns", baseline_summary["irrigationEvents"]),
-        "anfis_valve_run_count": anfis_summary.get("valveRuns", anfis_summary["irrigationEvents"]),
-        "baseline_total_water_usage_l": baseline_summary["totalWaterUsage"],
-        "anfis_total_water_usage_l": anfis_summary["totalWaterUsage"],
-        "anfis_probability_threshold": ANFIS_DECISION_THRESHOLD,
+        **comparison.base_summary(entries),
+        **comparison.irrigation_day_counts(entries),
+        **totals,
+        "water_savings_l": round(water_savings_l, 2),
+        "water_savings_percent": round(water_savings_l / baseline_water * 100.0, 2) if baseline_water > 0 else 0.0,
+        "anfis_probability_threshold": decision_threshold,
+        "anfis_forecast_probability_threshold": forecast_decision_threshold,
+        "anfis_default_probability_threshold": ANFIS_DECISION_THRESHOLD,
+        "anfis_threshold_calibration": threshold_calibration,
         "predicted_probability_mean": pred_prob_mean,
         "predicted_probability_min": pred_prob_min,
         "predicted_probability_max": pred_prob_max,
-        "train_samples": train_samples,
-        "test_samples": test_samples,
-        "parallel_workers": parallel_workers,
-        "parallel_backend": parallel_backend,
+        "train_samples": len(train_dataset),
+        "test_samples": len(test_dataset),
+        "requested_train_samples": train_samples,
+        "requested_test_samples": test_samples,
+        "anfisTrainingTarget": "recorded-sensor-readings-moisture-temperature-effective-rain-probability",
+        "anfisRainInputPolicy": "pot_effective_rain_by_rain_exposure",
+        "anfisInputFeatures": model.input_names,
+        "anfisOptimizer": "genetic-algorithm",
+        "trainingStartDate": training_snapshot.start_date.isoformat(),
+        "trainingEndDate": training_snapshot.end_date.isoformat(),
+        "trainingLookbackDays": (training_snapshot.end_date - training_snapshot.start_date).days + 1,
+        "stateSimulationStartDate": anfis_summary.get(
+            "stateSimulationStartDate",
+            baseline.get("summary", {}).get("stateSimulationStartDate"),
+        ),
+        "stateLookbackDays": anfis_summary.get(
+            "stateLookbackDays",
+            baseline.get("summary", {}).get("stateLookbackDays"),
+        ),
+        "stateAnchorPolicy": anfis_summary.get(
+            "stateAnchorPolicy",
+            baseline.get("summary", {}).get("stateAnchorPolicy"),
+        ),
         "decisionLevel": "valve_zone",
         "execution_time_seconds": execution_time_seconds,
         "startDate": start_date.isoformat(),
@@ -837,18 +1006,7 @@ def run_daily_anfis_experiment(
     }
     summary.update(_sensor_summary_fields(sensor_context))
     summary["source"] = _experiment_source(sensor_context)
-    _add_chart_summary(summary, chart_entries, start_date, end_date)
-    return {
-        "entries": entries,
-        "chartEntries": chart_entries,
-        "summary": summary,
-        "pots": _comparison_pot_info_entries(
-            snapshot.pots,
-            baseline,
-            anfis,
-            "anfis_water_usage_l",
-        ),
-    }
+    return comparison.payload(entries, chart_entries, summary)
 
 
 
@@ -895,12 +1053,6 @@ def _prepare_pot_row(row: dict[str, Any]) -> dict[str, Any]:
             pot[field] = float(pot[field])
     pot["_sun_factor"] = _sun_factor(pot)
     pot["_wind_factor"] = _wind_factor(pot)
-    pot["_outdoor_by_season"] = {
-        "winter": pot["winter_location"] == "outdoor",
-        "spring": pot["default_location"] == "outdoor",
-        "summer": pot["default_location"] == "outdoor",
-        "autumn": pot["default_location"] == "outdoor",
-    }
     return pot
 
 
@@ -919,9 +1071,8 @@ def _pot_info_entries(
                 "small_subtype": pot.get("small_subtype") or "",
                 "plant_type_code": pot["plant_type_code"],
                 "plant_type_label": pot.get("plant_type_label") or pot["plant_type_code"],
-                "default_location": pot["default_location"],
-                "winter_location": pot["winter_location"],
                 "balcony_zone": pot["balcony_zone"],
+                "rain_exposure": pot.get("rain_exposure", "partially_exposed"),
                 "sun_exposure": pot["sun_exposure"],
                 "wind_exposure": pot["wind_exposure"],
                 "container_material": pot["container_material"],
@@ -968,6 +1119,50 @@ def _apply_valve_rollup_to_entries(
     _apply_valve_counts(entries, rollup, hourly=False)
     _apply_valve_counts(detail_entries, rollup, hourly=True)
     return rollup
+
+
+def _execute_valve_zone_distribution(
+    pot_states: dict[int, PotState],
+    zone_pots: dict[str, list[dict[str, Any]]],
+    zone: str,
+    current_date: date,
+    hour_weather: dict[str, Any],
+    decision_by_pot_id: dict[int, dict[str, Any]],
+    decision_builder,
+    request_builder,
+    event_metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    request_items: list[tuple[dict[str, Any], PotState, dict[str, Any]]] = []
+    for zone_pot in _valve_managed_zone_pots(zone_pots, zone, current_date):
+        zone_decision = decision_builder(zone_pot, dict(decision_by_pot_id[int(zone_pot["id"])]))
+        request_event = _with_event_sensor_key(
+            request_builder(zone_pot, hour_weather, zone_decision),
+            zone_decision,
+        )
+        request_event.update(event_metadata)
+        request_items.append((zone_pot, pot_states[int(zone_pot["id"])], request_event))
+
+    total_requested_ml = sum(float(event.get("requested_volume_ml", event.get("planned_volume_ml", 0.0)) or 0.0) for _, _, event in request_items)
+    total_flow_ml_min = sum(float(event.get("flow_rate_ml_min") or 0.0) for _, _, event in request_items)
+    if total_requested_ml <= 0.0 or total_flow_ml_min <= 0.0:
+        return []
+
+    runtime_min = total_requested_ml / total_flow_ml_min
+    delivered_total_ml = total_requested_ml
+    events = []
+    for zone_pot, state, event in request_items:
+        flow_rate = max(float(event.get("flow_rate_ml_min") or zone_pot["drip_flow_ml_min"]), 1.0)
+        delivered_ml = flow_rate * runtime_min
+        event.update(
+            {
+                "zone_requested_volume_ml": round(total_requested_ml, 2),
+                "zone_delivered_volume_ml": round(delivered_total_ml, 2),
+                "zone_total_flow_ml_min": round(total_flow_ml_min, 2),
+                "valve_runtime_min": round(runtime_min, 3),
+            }
+        )
+        events.append(_apply_event_delivery(state, zone_pot, event, delivered_ml, runtime_min))
+    return events
 
 
 def _valve_rollup(
@@ -1024,6 +1219,44 @@ def _pots_by_valve_zone(pots: list[dict[str, Any]]) -> dict[str, list[dict[str, 
     return zones
 
 
+def _is_valve_managed_pot(pot: dict[str, Any], day: date) -> bool:
+    return _is_outdoor(pot, day)
+
+
+def _valve_managed_zone_pots(zone_pots: dict[str, list[dict[str, Any]]], zone: str, day: date) -> list[dict[str, Any]]:
+    return [pot for pot in zone_pots.get(zone, []) if _is_valve_managed_pot(pot, day)]
+
+
+def _apply_cold_month_indoor_skip(decision: dict[str, Any], pot: dict[str, Any], day: date) -> dict[str, Any]:
+    if decision.get("should_irrigate") and not _is_valve_managed_pot(pot, day):
+        skipped = dict(decision)
+        skipped["should_irrigate"] = False
+        skipped["reason_code"] = "winter_indoor_not_valve_managed"
+        skipped["reason_detail"] = (
+            "Skipped because the pot is indoors from November through March; "
+            "indoor irrigation is not implemented yet."
+        )
+        return skipped
+    return decision
+
+
+def _baseline_zone_dose_factor(trigger_decisions: list[dict[str, Any]]) -> float:
+    return max((float(decision.get("dose_factor") or 1.0) for decision in trigger_decisions), default=1.0)
+
+
+def _sparse_zone_dose_factor(
+    trigger_decisions: list[dict[str, Any]],
+    sample_interval_hours: int,
+    sample_now: bool,
+) -> float:
+    baseline_factor = _baseline_zone_dose_factor(trigger_decisions)
+    if sample_now or sample_interval_hours <= 24:
+        return baseline_factor
+    if sample_interval_hours <= 48:
+        return min(baseline_factor, 0.5)
+    return min(baseline_factor, 0.75)
+
+
 def _valve_decision_from_group(
     key: tuple[str, str, str, str],
     group: list[dict[str, Any]],
@@ -1037,10 +1270,14 @@ def _valve_decision_from_group(
     moisture_values = [float(decision.get("current_moisture_pct") or 0.0) for decision in group]
     target_values = [float(decision.get("target_moisture_pct") or 0.0) for decision in group]
     valve_number = _valve_number_for_zone(zone)
-    affected_pot_ids = [int(decision["pot_id"]) for decision in should]
-    affected_pot_codes = [decision.get("pot_code") for decision in should if decision.get("pot_code")]
+    managed = _valve_managed_zone_pots(zone_pots, zone, date.fromisoformat(decision_date))
+    trigger_pot_ids = [int(decision["pot_id"]) for decision in should]
+    trigger_pot_codes = [decision.get("pot_code") for decision in should if decision.get("pot_code")]
+    affected_pot_ids = [int(pot["id"]) for pot in managed] if should else []
+    affected_pot_codes = [pot["pot_code"] for pot in managed] if should else []
     reason_detail = (
-        f"Valve V{valve_number} controls {zone}; {len(affected_pot_ids)} of {len(group)} evaluated pots require irrigation."
+        f"Valve V{valve_number} controls {zone}; {len(trigger_pot_ids)} of {len(group)} evaluated pots require irrigation, "
+        f"so all {len(affected_pot_ids)} managed pots are watered."
         if should
         else f"Valve V{valve_number} controls {zone}; no evaluated pot requires irrigation."
     )
@@ -1056,11 +1293,14 @@ def _valve_decision_from_group(
         "current_moisture_pct": round(min(moisture_values), 2) if moisture_values else None,
         "target_moisture_pct": round(sum(target_values) / max(len(target_values), 1), 2) if target_values else None,
         "weather_hourly_id": group[0].get("weather_hourly_id"),
-        "managed_pots": len(zone_pots.get(zone, [])),
+        "managed_pots": len(managed),
         "evaluated_pots": len(group),
         "affected_pots": len(affected_pot_ids),
         "affected_pot_ids": affected_pot_ids,
         "affected_pot_codes": affected_pot_codes,
+        "trigger_pots": len(trigger_pot_ids),
+        "trigger_pot_ids": trigger_pot_ids,
+        "trigger_pot_codes": trigger_pot_codes,
         "priority_score": round(priority, 2),
         "decision_level": "valve_zone",
     }
@@ -1074,13 +1314,32 @@ def _valve_event_from_group(
 ) -> dict[str, Any]:
     event_date, slot, scheduled_key, zone = key
     valve_number = _valve_number_for_zone(zone)
-    managed = zone_pots.get(zone, [])
-    flow_rate = sum(float(pot["drip_flow_ml_min"]) for pot in managed)
+    managed = _valve_managed_zone_pots(zone_pots, zone, date.fromisoformat(event_date))
+    flow_rate = sum(float(event.get("flow_rate_ml_min") or 0.0) for event in group)
+    if flow_rate <= 0.0:
+        flow_rate = sum(float(pot["drip_flow_ml_min"]) for pot in managed)
     planned_volume = sum(float(event.get("planned_volume_ml") or 0.0) for event in group)
-    duration_min = planned_volume / max(flow_rate, 1.0)
+    requested_volume = sum(float(event.get("requested_volume_ml", event.get("planned_volume_ml", 0.0)) or 0.0) for event in group)
+    delivered_volume = sum(float(event.get("delivered_volume_ml", event.get("planned_volume_ml", 0.0)) or 0.0) for event in group)
+    duration_min = max(
+        (float(event.get("valve_runtime_min") or event.get("duration_min") or 0.0) for event in group),
+        default=0.0,
+    )
+    if duration_min <= 0.0:
+        duration_min = planned_volume / max(flow_rate, 1.0)
     scheduled_start = datetime.fromisoformat(scheduled_key).replace(tzinfo=LOCAL_TZ)
     scheduled_end = scheduled_start + timedelta(minutes=duration_min)
     affected_pots = [pot_by_id[int(event["pot_id"])] for event in group if int(event["pot_id"]) in pot_by_id]
+    trigger_pot_ids = sorted({
+        int(pot_id)
+        for event in group
+        for pot_id in event.get("zone_trigger_pot_ids", [])
+    })
+    trigger_pot_codes = [
+        pot_by_id[pot_id]["pot_code"]
+        for pot_id in trigger_pot_ids
+        if pot_id in pot_by_id
+    ]
     priority = max((_valve_event_priority(event, pot_by_id[int(event["pot_id"])]) for event in group), default=0.0)
     return {
         "valve_number": valve_number,
@@ -1093,17 +1352,42 @@ def _valve_event_from_group(
         "flow_rate_l_min": round(flow_rate / 1000.0, 3),
         "planned_volume_ml": round(planned_volume, 2),
         "planned_volume_l": round(planned_volume / 1000.0, 3),
+        "requested_volume_ml": round(requested_volume, 2),
+        "requested_volume_l": round(requested_volume / 1000.0, 3),
+        "delivered_volume_ml": round(delivered_volume, 2),
+        "delivered_volume_l": round(delivered_volume / 1000.0, 3),
+        "delivery_error_ml": round(delivered_volume - requested_volume, 2),
         "duration_min": round(duration_min, 1),
+        "physical_distribution_policy": "valve_runtime_x_pot_drip_flow",
+        "per_pot_distribution": _valve_pot_distribution(group),
         "cycle_count": 1,
         "soak_pause_min": 0,
         "managed_pots": len(managed),
         "affected_pots": len(group),
         "affected_pot_ids": [int(pot["id"]) for pot in affected_pots],
         "affected_pot_codes": [pot["pot_code"] for pot in affected_pots],
+        "trigger_pots": len(trigger_pot_ids),
+        "trigger_pot_ids": trigger_pot_ids,
+        "trigger_pot_codes": trigger_pot_codes,
         "priority_rank": 0 if any(event.get("priority_rank") == 0 for event in group) else 1,
         "priority_score": round(priority, 2),
         "decision_level": "valve_zone",
     }
+
+
+def _valve_pot_distribution(group: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "pot_id": int(event["pot_id"]),
+            "pot_code": event.get("pot_code"),
+            "flow_rate_ml_min": round(float(event.get("flow_rate_ml_min") or 0.0), 2),
+            "requested_volume_ml": round(float(event.get("requested_volume_ml", event.get("planned_volume_ml", 0.0)) or 0.0), 2),
+            "delivered_volume_ml": round(float(event.get("delivered_volume_ml", event.get("planned_volume_ml", 0.0)) or 0.0), 2),
+            "delivery_error_ml": round(float(event.get("delivery_error_ml") or 0.0), 2),
+            "delivery_ratio": event.get("delivery_ratio"),
+        }
+        for event in sorted(group, key=lambda item: int(item["pot_id"]))
+    ]
 
 
 def _apply_valve_counts(entries: list[dict[str, Any]], rollup: dict[str, list[dict[str, Any]]], hourly: bool) -> None:
@@ -1125,7 +1409,70 @@ def _apply_valve_counts(entries: list[dict[str, Any]], rollup: dict[str, list[di
         entry["irrigation_events"] = len({_local_timestamp_key(event["scheduled_start_at"]) for event in entry_events})
         entry["irrigation_active"] = bool(entry_events)
         entry["irrigated_pots"] = sum(int(event.get("affected_pots") or 0) for event in entry_events)
+        entry["activated_valve_numbers"] = _activated_valve_numbers(entry_events)
+        entry["activated_valves"] = _activated_valve_label(entry_events)
         entry["decision_level"] = "valve_zone"
+        if entry_events:
+            entry["irrigation_start_at"] = min(str(event["scheduled_start_at"]) for event in entry_events)
+            entry["irrigation_end_at"] = max(str(event["scheduled_end_at"]) for event in entry_events)
+            entry["planned_volume_l"] = round(
+                sum(float(event.get("planned_volume_ml") or 0.0) for event in entry_events) / 1000.0,
+                2,
+            )
+
+
+def _comparison_window_fields(prefix: str, entry: dict[str, Any]) -> dict[str, Any]:
+    fields = {}
+    if entry.get("activated_valves") is not None:
+        fields[f"{prefix}_activated_valves"] = entry["activated_valves"]
+    if entry.get("activated_valve_numbers") is not None:
+        fields[f"{prefix}_activated_valve_numbers"] = entry["activated_valve_numbers"]
+    if entry.get("irrigation_start_at"):
+        fields[f"{prefix}_irrigation_start_at"] = entry["irrigation_start_at"]
+    if entry.get("irrigation_end_at"):
+        fields[f"{prefix}_irrigation_end_at"] = entry["irrigation_end_at"]
+    if entry.get("planned_volume_l") is not None:
+        fields[f"{prefix}_planned_volume_l"] = entry["planned_volume_l"]
+    if entry.get("pre_irrigation_moisture") is not None:
+        fields[f"{prefix}_pre_irrigation_moisture"] = entry["pre_irrigation_moisture"]
+    if entry.get("post_irrigation_moisture") is not None:
+        fields[f"{prefix}_post_irrigation_moisture"] = entry["post_irrigation_moisture"]
+    return fields
+
+
+def _activated_valve_numbers(events: list[dict[str, Any]]) -> list[int]:
+    numbers = {
+        int(event["valve_number"])
+        for event in events
+        if event.get("valve_number") is not None
+    }
+    return sorted(numbers)
+
+
+def _activated_valve_label(events: list[dict[str, Any]]) -> str:
+    numbers = _activated_valve_numbers(events)
+    if not numbers:
+        return "none"
+
+    configured_numbers = sorted(int(item["valve_number"]) for item in VALVE_ZONE_DESIGN)
+    if numbers == configured_numbers:
+        return "all"
+
+    ranges = []
+    start = numbers[0]
+    previous = numbers[0]
+    for number in numbers[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+        ranges.append(_valve_range_label(start, previous))
+        start = previous = number
+    ranges.append(_valve_range_label(start, previous))
+    return ", ".join(ranges)
+
+
+def _valve_range_label(start: int, end: int) -> str:
+    return f"V{start}" if start == end else f"V{start}-V{end}"
 
 
 def _valve_decision_priority(decision: dict[str, Any], pot: dict[str, Any]) -> float:
@@ -1182,37 +1529,204 @@ def _comparison_pot_info_entries(
     )
 
 
-def _fuzzy_comparison_entry(baseline_entry: dict[str, Any], fuzzy_entry: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "date": fuzzy_entry["date"],
-        "timestamp": fuzzy_entry["timestamp"],
-        "day_label": fuzzy_entry["day_label"],
-        "chart_label": fuzzy_entry.get("chart_label", fuzzy_entry["day_label"]),
-        "moisture": baseline_entry["average_moisture"],
-        "baseline_moisture": baseline_entry["average_moisture"],
-        "fuzzy_moisture": fuzzy_entry["average_moisture"],
-        "temperature": fuzzy_entry["temperature"],
-        "max_temperature": fuzzy_entry["max_temperature"],
-        "humidity": fuzzy_entry["humidity"],
-        "cloud_cover_pct": fuzzy_entry["cloud_cover_pct"],
-        "rain_prediction": fuzzy_entry["rain_prediction"],
-        "rain_amount": fuzzy_entry["rain_amount"],
-        "etc_mm": fuzzy_entry.get("etc_mm", 0.0),
-        "fuzzy_prescription_mm": fuzzy_entry.get("fuzzy_prescription_mm", fuzzy_entry.get("avg_prescription_mm", 0.0)),
-        "avg_prescription_mm": fuzzy_entry.get("avg_prescription_mm", fuzzy_entry.get("fuzzy_prescription_mm", 0.0)),
-        "baseline_irrigation_active": baseline_entry["irrigation_events"] > 0,
-        "fuzzy_irrigation_active": fuzzy_entry["irrigation_events"] > 0,
-        "baseline_irrigation_events": baseline_entry["irrigation_events"],
-        "fuzzy_irrigation_events": fuzzy_entry["irrigation_events"],
-        "baseline_valve_runs": baseline_entry.get("valve_runs", baseline_entry["irrigation_events"]),
-        "fuzzy_valve_runs": fuzzy_entry.get("valve_runs", fuzzy_entry["irrigation_events"]),
-        "baseline_water_usage_l": baseline_entry["water_usage_l"],
-        "fuzzy_water_usage_l": fuzzy_entry["water_usage_l"],
-        "baseline_water_usage_ml": baseline_entry["water_usage_ml"],
-        "fuzzy_water_usage_ml": fuzzy_entry["water_usage_ml"],
-        "alerts": fuzzy_entry["alerts"],
-        **_combined_line_metadata(baseline_entry, fuzzy_entry),
-    }
+class _ExperimentComparison:
+    """Builds baseline-vs-controller experiment payloads."""
+
+    SENSOR_SUMMARY_KEYS = (
+        "sensorDataUsed",
+        "sensorSource",
+        "sensorRows",
+        "sensorLocationCount",
+        "sensorAssociatedPotCount",
+        "latestStateRows",
+        "sensorMappedDays",
+        "sensorDateMappings",
+        "sensorFirstDate",
+        "sensorLastDate",
+        "latestKnownSoilStateAt",
+        "futureStateEstimated",
+        "futureEstimatedDays",
+        "futureEstimatedDateRange",
+        "sensorError",
+    )
+
+    def __init__(
+        self,
+        start_date: date,
+        end_date: date,
+        snapshot: ExperimentSnapshot,
+        baseline: dict[str, Any],
+        comparison: dict[str, Any],
+        prefix: str,
+        water_usage_field: str,
+    ) -> None:
+        self.start_date = start_date
+        self.end_date = end_date
+        self.snapshot = snapshot
+        self.baseline = baseline
+        self.comparison = comparison
+        self.prefix = prefix
+        self.water_usage_field = water_usage_field
+        self.baseline_summary = baseline["summary"]
+        self.comparison_summary = comparison["summary"]
+        self._baseline_by_date = {entry["date"]: entry for entry in baseline["entries"]}
+
+    def daily_entries(self, row_builder) -> list[dict[str, Any]]:
+        return self._aligned_rows(
+            self.comparison["entries"],
+            self._baseline_by_date,
+            row_builder,
+        )
+
+    def chart_entries(self, row_builder) -> list[dict[str, Any]]:
+        baseline_by_timestamp = {
+            entry["timestamp"]: entry
+            for entry in self.baseline.get("chartEntries", self.baseline["entries"])
+        }
+        return self._aligned_rows(
+            self.comparison.get("chartEntries", self.comparison["entries"]),
+            baseline_by_timestamp,
+            row_builder,
+            fallback_lookup=self._baseline_by_date,
+            lookup_key="timestamp",
+        )
+
+    def row(
+        self,
+        baseline_entry: dict[str, Any],
+        comparison_entry: dict[str, Any],
+        extra: dict[str, Any] | None = None,
+        include_moisture_alias: bool = False,
+    ) -> dict[str, Any]:
+        baseline_active = self.is_active(baseline_entry)
+        comparison_active = self.is_active(comparison_entry)
+        row = {
+            "date": comparison_entry["date"],
+            "timestamp": comparison_entry["timestamp"],
+            "day_label": comparison_entry["day_label"],
+            "chart_label": comparison_entry.get("chart_label", comparison_entry["day_label"]),
+            "baseline_moisture": baseline_entry["average_moisture"],
+            f"{self.prefix}_moisture": comparison_entry["average_moisture"],
+            "temperature": comparison_entry["temperature"],
+            "max_temperature": comparison_entry["max_temperature"],
+            "min_temperature": comparison_entry.get("min_temperature", comparison_entry["temperature"]),
+            "humidity": comparison_entry["humidity"],
+            "cloud_cover_pct": comparison_entry["cloud_cover_pct"],
+            "rain_prediction": comparison_entry["rain_prediction"],
+            "rain_amount": comparison_entry["rain_amount"],
+            "baseline_irrigation_active": baseline_active,
+            f"{self.prefix}_irrigation_active": comparison_active,
+            "baseline_irrigation_events": baseline_entry["irrigation_events"],
+            f"{self.prefix}_irrigation_events": comparison_entry["irrigation_events"],
+            "baseline_valve_runs": baseline_entry.get("valve_runs", baseline_entry["irrigation_events"]),
+            f"{self.prefix}_valve_runs": comparison_entry.get("valve_runs", comparison_entry["irrigation_events"]),
+            "baseline_water_usage_l": baseline_entry["water_usage_l"],
+            f"{self.prefix}_water_usage_l": comparison_entry["water_usage_l"],
+            "baseline_water_usage_ml": baseline_entry["water_usage_ml"],
+            f"{self.prefix}_water_usage_ml": comparison_entry["water_usage_ml"],
+            **_comparison_window_fields("baseline", baseline_entry),
+            **_comparison_window_fields(self.prefix, comparison_entry),
+            "alerts": comparison_entry["alerts"],
+            **_combined_line_metadata(baseline_entry, comparison_entry),
+        }
+        if include_moisture_alias:
+            row["moisture"] = baseline_entry["average_moisture"]
+        if extra:
+            row.update(extra)
+        return row
+
+    def base_summary(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
+        total_entries = len(entries)
+        return {
+            "totalEntries": total_entries,
+            "daysAnalyzed": total_entries,
+            "potsAnalyzed": self.comparison_summary["potsAnalyzed"],
+        }
+
+    def irrigation_day_counts(self, entries: list[dict[str, Any]]) -> dict[str, int]:
+        return {
+            "baseline_irrigation_days": self.active_days(entries, "baseline"),
+            f"{self.prefix}_irrigation_days": self.active_days(entries, self.prefix),
+        }
+
+    def total_usage_counts(self, entries: list[dict[str, Any]]) -> dict[str, int | float]:
+        return {
+            "baseline_total_water_usage_l": self.water_total(entries, "baseline"),
+            f"{self.prefix}_total_water_usage_l": self.water_total(entries, self.prefix),
+            "baseline_irrigation_event_count": self.event_total(entries, "baseline"),
+            f"{self.prefix}_irrigation_event_count": self.event_total(entries, self.prefix),
+            "baseline_valve_run_count": self.valve_run_total(entries, "baseline"),
+            f"{self.prefix}_valve_run_count": self.valve_run_total(entries, self.prefix),
+        }
+
+    def decision_counts(self) -> dict[str, int]:
+        return {
+            "baseline_irrigation_decisions": self.baseline_summary["irrigationDecisions"],
+            f"{self.prefix}_irrigation_decisions": self.comparison_summary["irrigationDecisions"],
+        }
+
+    def sensor_summary(self, keys: tuple[str, ...] | None = None) -> dict[str, Any]:
+        allowed = keys or self.SENSOR_SUMMARY_KEYS
+        return {key: self.baseline_summary[key] for key in allowed if key in self.baseline_summary}
+
+    def payload(
+        self,
+        entries: list[dict[str, Any]],
+        chart_entries: list[dict[str, Any]],
+        summary: dict[str, Any],
+    ) -> dict[str, Any]:
+        _add_chart_summary(summary, chart_entries, self.start_date, self.end_date)
+        return {
+            "entries": entries,
+            "chartEntries": chart_entries,
+            "summary": summary,
+            "pots": _comparison_pot_info_entries(
+                self.snapshot.pots,
+                self.baseline,
+                self.comparison,
+                self.water_usage_field,
+            ),
+            "sampleDecisions": self.comparison.get("sampleDecisions", [])[:200],
+            "sampleEvents": self.comparison.get("sampleEvents", [])[:200],
+            "sampleAlerts": self.comparison.get("sampleAlerts", [])[:200],
+        }
+
+    @staticmethod
+    def is_active(entry: dict[str, Any]) -> bool:
+        return int(entry.get("irrigation_events") or 0) > 0
+
+    @staticmethod
+    def active_days(entries: list[dict[str, Any]], prefix: str) -> int:
+        return sum(1 for entry in entries if entry.get(f"{prefix}_irrigation_active"))
+
+    @staticmethod
+    def water_total(entries: list[dict[str, Any]], prefix: str) -> float:
+        return round(sum(float(entry.get(f"{prefix}_water_usage_l") or 0.0) for entry in entries), 2)
+
+    @staticmethod
+    def event_total(entries: list[dict[str, Any]], prefix: str) -> int:
+        return sum(int(entry.get(f"{prefix}_irrigation_events") or 0) for entry in entries)
+
+    @staticmethod
+    def valve_run_total(entries: list[dict[str, Any]], prefix: str) -> int:
+        return sum(int(entry.get(f"{prefix}_valve_runs") or 0) for entry in entries)
+
+    @staticmethod
+    def _aligned_rows(
+        comparison_entries: list[dict[str, Any]],
+        baseline_lookup: dict[Any, dict[str, Any]],
+        row_builder,
+        fallback_lookup: dict[Any, dict[str, Any]] | None = None,
+        lookup_key: str = "date",
+    ) -> list[dict[str, Any]]:
+        rows = []
+        for comparison_entry in comparison_entries:
+            baseline_entry = baseline_lookup.get(comparison_entry[lookup_key])
+            if baseline_entry is None and fallback_lookup is not None:
+                baseline_entry = fallback_lookup.get(comparison_entry["date"])
+            if baseline_entry is not None:
+                rows.append(row_builder(baseline_entry, comparison_entry))
+        return rows
 
 
 def _load_sensor_context(start_date: date, end_date: date, pots: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1248,13 +1762,18 @@ def _with_sensor_associations(sensor_context: dict[str, Any], pots: list[dict[st
     if not sensor_pots:
         return sensor_context
 
+    sensors_by_zone: dict[str, list[dict[str, Any]]] = {}
+    for sensor_pot in sensor_pots:
+        sensors_by_zone.setdefault(str(sensor_pot.get("balcony_zone") or ""), []).append(sensor_pot)
+
     associations = {}
     for pot in pots:
         pot_id = int(pot["id"])
         if pot_id in sensor_ids:
             associations[pot_id] = {"sensor_id": pot_id, "direct": True, "distance": 0.0}
             continue
-        sensor_pot = min(sensor_pots, key=lambda item: _sensor_association_distance(pot, item))
+        zone_sensors = sensors_by_zone.get(str(pot.get("balcony_zone") or "")) or sensor_pots
+        sensor_pot = min(zone_sensors, key=lambda item: _sensor_association_distance(pot, item))
         associations[pot_id] = {
             "sensor_id": int(sensor_pot["id"]),
             "direct": False,
@@ -1298,9 +1817,8 @@ def _sensor_association_distance(pot: dict[str, Any], sensor_pot: dict[str, Any]
         "plant_type_code": 3.0,
         "size_class": 1.8,
         "small_subtype": 0.8,
-        "default_location": 2.2,
-        "winter_location": 1.0,
         "balcony_zone": 1.3,
+        "rain_exposure": 1.3,
         "sun_exposure": 1.6,
         "wind_exposure": 1.2,
         "container_material": 0.8,
@@ -1327,32 +1845,164 @@ def _apply_sensor_reading(
     observed_at: datetime,
     sensor_context: dict[str, Any],
 ) -> dict[str, Any] | None:
-    reading = _sensor_reading_for_pot(sensor_context, pot, experiment_date, observed_at.hour)
+    reading = _sensor_reading_for_pot(sensor_context, pot, experiment_date, observed_at)
     if reading is None:
         return None
 
     reading = dict(reading)
+    if reading.get("source") != ACTUAL_SENSOR_SOURCE:
+        return reading
+
     sensor_moisture = _number(reading["soil_moisture_pct"], state.moisture)
     if reading.get("association_source") == "associated_sensor":
-        state.moisture = _clamp(sensor_moisture * 0.82 + state.moisture * 0.18, 0.0, 100.0)
+        sensor_weight = _associated_sensor_weight(observed_at)
+        state.moisture = _clamp(sensor_moisture * sensor_weight + state.moisture * (1.0 - sensor_weight), 0.0, 100.0)
         reading["soil_moisture_pct"] = round(state.moisture, 2)
+        reading["sensor_blend_weight"] = round(sensor_weight, 2)
     else:
         state.moisture = _clamp(sensor_moisture, 0.0, 100.0)
     return reading
+
+
+def _apply_sensor_calibration_marker(
+    state: PotState,
+    pot: dict[str, Any],
+    experiment_date: date,
+    observed_at: datetime,
+    sensor_context: dict[str, Any],
+    day_profile: dict[str, Any],
+) -> dict[str, Any] | None:
+    marker_time = _sensor_calibration_marker_time(observed_at, day_profile)
+    if marker_time is None:
+        return None
+    marker_at = datetime.combine(experiment_date, marker_time, tzinfo=LOCAL_TZ)
+    return _apply_stored_sensor_calibration(state, pot, experiment_date, marker_at, sensor_context)
+
+
+def _sensor_calibration_marker_time(observed_at: datetime, day_profile: dict[str, Any]) -> time | None:
+    if observed_at.hour == 6:
+        return MORNING_SENSOR_CALIBRATION_TIME
+    if (
+        observed_at.hour == 18
+        and _number(day_profile.get("max_temperature_c"), 20.0) > 32.0
+    ):
+        return EVENING_SENSOR_CALIBRATION_TIME
+    return None
+
+
+def _sampling_calibration_at(experiment_date: date, observed_at: datetime, day_profile: dict[str, Any]) -> datetime:
+    marker_time = _sensor_calibration_marker_time(observed_at, day_profile)
+    if marker_time is None:
+        return observed_at
+    return datetime.combine(experiment_date, marker_time, tzinfo=LOCAL_TZ)
+
+
+def _apply_stored_sensor_calibration(
+    state: PotState,
+    pot: dict[str, Any],
+    experiment_date: date,
+    observed_at: datetime,
+    sensor_context: dict[str, Any],
+) -> dict[str, Any] | None:
+    reading = _sensor_reading_for_pot(sensor_context, pot, experiment_date, observed_at)
+    if reading is None:
+        return None
+
+    return _apply_calibration_reading(state, reading, observed_at)
+
+
+def _apply_calibration_reading(
+    state: PotState,
+    reading: dict[str, Any],
+    observed_at: datetime,
+) -> dict[str, Any]:
+    reading = dict(reading)
+    sensor_moisture = _number(reading["soil_moisture_pct"], state.moisture)
+    state.moisture = _clamp(sensor_moisture, 0.0, 100.0)
+    if reading.get("association_source") == "associated_sensor":
+        reading["soil_moisture_pct"] = round(state.moisture, 2)
+        reading["sensor_blend_weight"] = 1.0
+    reading["calibration_marker_time"] = observed_at.time().replace(second=0, microsecond=0).isoformat()
+    return reading
+
+
+def _associated_sensor_weight(observed_at: datetime) -> float:
+    if _reading_slot_label(observed_at) == "evening":
+        return 0.95
+    return 0.82
+
+
+def _reading_slot_label(observed_at: datetime) -> str | None:
+    if observed_at.hour == 18:
+        return "evening"
+    if observed_at.hour == 6:
+        return "morning"
+    if observed_at.hour == 10:
+        return "winter_check"
+    return None
+
+
+def _new_sampling_estimation_stats() -> dict[str, float | int]:
+    return {
+        "estimation_points": 0,
+        "error_sum": 0.0,
+        "absolute_error_sum": 0.0,
+        "max_absolute_error": 0.0,
+        "sensor_refreshes": 0,
+        "direct_refreshes": 0,
+        "associated_refreshes": 0,
+        "forecast_refreshes": 0,
+        "missing_refreshes": 0,
+        "association_distance_sum": 0.0,
+    }
+
+
+def _record_sampling_estimation_error(
+    stats: dict[str, float | int],
+    controller_state: PotState,
+    actual_state: PotState,
+) -> None:
+    error = controller_state.moisture - actual_state.moisture
+    absolute_error = abs(error)
+    stats["estimation_points"] += 1
+    stats["error_sum"] += error
+    stats["absolute_error_sum"] += absolute_error
+    stats["max_absolute_error"] = max(float(stats["max_absolute_error"]), absolute_error)
+
+
+def _sampling_estimation_summary(stats: dict[str, float | int]) -> dict[str, Any]:
+    points = int(stats["estimation_points"])
+    associated_refreshes = int(stats["associated_refreshes"])
+    return {
+        "sampling_moisture_mae_pct": round(float(stats["absolute_error_sum"]) / max(points, 1), 2),
+        "sampling_moisture_bias_pct": round(float(stats["error_sum"]) / max(points, 1), 2),
+        "sampling_moisture_max_error_pct": round(float(stats["max_absolute_error"]), 2),
+        "sampling_estimation_points": points,
+        "sampling_sensor_refreshes": int(stats["sensor_refreshes"]),
+        "sampling_direct_refreshes": int(stats["direct_refreshes"]),
+        "sampling_associated_refreshes": associated_refreshes,
+        "sampling_forecast_refreshes": int(stats["forecast_refreshes"]),
+        "sampling_missing_refreshes": int(stats["missing_refreshes"]),
+        "sampling_average_association_distance": round(
+            float(stats["association_distance_sum"]) / max(associated_refreshes, 1),
+            2,
+        ),
+    }
 
 
 def _sensor_reading_for_pot(
     sensor_context: dict[str, Any] | None,
     pot: dict[str, Any],
     experiment_date: date,
-    hour: int,
+    observed_at: datetime | time | int,
 ) -> dict[str, Any] | None:
     if not sensor_context or not sensor_context.get("available"):
         return None
 
     lookup = sensor_context.get("lookup") or {}
     pot_id = int(pot["id"])
-    direct = lookup.get((experiment_date, hour, pot_id))
+    slot_time = _sensor_lookup_time(observed_at)
+    direct = _lookup_sensor_reading(lookup, experiment_date, slot_time, pot_id)
     if direct is not None:
         return direct
 
@@ -1360,13 +2010,75 @@ def _sensor_reading_for_pot(
     if not association:
         return None
     sensor_id = int(association["sensor_id"])
-    sensor_reading = lookup.get((experiment_date, hour, sensor_id))
+    sensor_reading = _lookup_sensor_reading(lookup, experiment_date, slot_time, sensor_id)
     if sensor_reading is None:
         return None
     sensor_pot = (sensor_context.get("sensor_pots") or {}).get(sensor_id)
     if sensor_pot is None:
         return sensor_reading
     return _associated_sensor_reading(pot, sensor_pot, sensor_reading)
+
+
+def _forecast_sensor_reading_for_pot(
+    pot_states: dict[int, PotState],
+    sensor_context: dict[str, Any] | None,
+    pot: dict[str, Any],
+    experiment_date: date,
+    observed_at: datetime | time | int,
+) -> dict[str, Any] | None:
+    if not sensor_context or not sensor_context.get("available"):
+        return None
+    if not _sensor_slot_is_prediction(sensor_context, experiment_date, observed_at):
+        return None
+
+    pot_id = int(pot["id"])
+    reference_state = pot_states.get(pot_id)
+    if reference_state is None:
+        return None
+
+    association = (sensor_context.get("associations") or {}).get(pot_id) or {}
+    physical_sensor_id = int(association.get("sensor_id", pot_id))
+    slot_time = _sensor_lookup_time(observed_at)
+    reading = {
+        "sensor_id": pot_id,
+        "source": SPARSE_FORECAST_SENSOR_SOURCE,
+        "soil_moisture_pct": round(reference_state.moisture, 2),
+        "local_date": experiment_date,
+        "local_time": slot_time,
+        "recorded_at": datetime.combine(experiment_date, slot_time, tzinfo=LOCAL_TZ),
+        "resolution": "forecast",
+        "sample_count": 1,
+        "association_source": "default_strategy_reference",
+        "sensor_blend_weight": 1.0,
+    }
+    if physical_sensor_id != pot_id:
+        reading["associated_sensor_id"] = physical_sensor_id
+    return reading
+
+
+def _sensor_lookup_time(value: datetime | time | int) -> time:
+    if isinstance(value, datetime):
+        return value.time().replace(second=0, microsecond=0)
+    if isinstance(value, time):
+        return value.replace(second=0, microsecond=0)
+    return time(int(value), 0)
+
+
+def _lookup_sensor_reading(
+    lookup: dict[tuple[Any, ...], dict[str, Any]],
+    experiment_date: date,
+    slot_time: time,
+    sensor_id: int,
+) -> dict[str, Any] | None:
+    exact = lookup.get((experiment_date, slot_time, sensor_id))
+    if exact is not None:
+        return exact
+
+    legacy = lookup.get((experiment_date, slot_time.hour, sensor_id))
+    if legacy is not None:
+        return legacy
+
+    return None
 
 
 def _associated_sensor_reading(
@@ -1399,8 +2111,12 @@ def _associated_sensor_reading(
 
 
 def _pot_exposure_index(pot: dict[str, Any]) -> float:
-    outdoor = 1.0 if pot.get("default_location") == "outdoor" else 0.0
-    return outdoor + (_sun_factor(pot) - 1.0) * 1.6 + (_wind_factor(pot) - 1.0) * 1.2
+    rain = {
+        "covered": 0.0,
+        "partially_exposed": 0.5,
+        "fully_exposed": 1.0,
+    }.get(str(pot.get("rain_exposure") or "partially_exposed"), 0.5)
+    return rain + (_sun_factor(pot) - 1.0) * 1.6 + (_wind_factor(pot) - 1.0) * 1.2
 
 
 def _latest_sensor_state_for_pot(sensor_context: dict[str, Any], pot: dict[str, Any]) -> dict[str, Any] | None:
@@ -1419,6 +2135,51 @@ def _latest_sensor_state_for_pot(sensor_context: dict[str, Any], pot: dict[str, 
     if latest is None or sensor_pot is None:
         return latest
     return _associated_sensor_reading(pot, sensor_pot, latest)
+
+
+def _initialize_states_from_first_day_sensor_readings(
+    pot_states: dict[int, PotState],
+    pots: list[dict[str, Any]],
+    sensor_context: dict[str, Any],
+    start_date: date,
+) -> dict[str, Any]:
+    if not sensor_context.get("available"):
+        return {"anchored_pots": 0, "anchor_date": start_date.isoformat(), "source": "initial_inventory_state"}
+
+    lookup = sensor_context.get("lookup") or {}
+    candidate_slots = sorted(
+        {
+            _sensor_lookup_time(slot_time)
+            for reading_date, slot_time, _sensor_id in lookup.keys()
+            if reading_date == start_date
+        }
+    )
+    if not candidate_slots:
+        return {"anchored_pots": 0, "anchor_date": start_date.isoformat(), "source": "initial_inventory_state"}
+
+    anchored_pots = 0
+    anchor_times: list[str] = []
+    for pot in pots:
+        pot_id = int(pot["id"])
+        for slot_time in candidate_slots:
+            reading = _lookup_sensor_reading(lookup, start_date, slot_time, pot_id)
+            if reading is None:
+                continue
+            pot_states[pot_id].moisture = _clamp(
+                _number(reading["soil_moisture_pct"], pot_states[pot_id].moisture),
+                0.0,
+                100.0,
+            )
+            anchored_pots += 1
+            anchor_times.append(slot_time.strftime("%H:%M"))
+            break
+
+    return {
+        "anchored_pots": anchored_pots,
+        "anchor_date": start_date.isoformat(),
+        "anchor_times": sorted(set(anchor_times)),
+        "source": "first_day_direct_sensor_readings",
+    }
 
 
 def _prime_future_states(
@@ -1461,6 +2222,7 @@ def _prime_future_states(
     current = (latest_state_at + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
     end = datetime.combine(start_date, time.min, tzinfo=LOCAL_TZ)
     warmup_day_profiles: dict[date, dict[str, Any]] = {}
+    zone_pots = _pots_by_valve_zone(pots)
     while current < end:
         day_weather = weather_by_day.get(current.date(), [])
         hour_weather = _weather_for_hour(day_weather, current)
@@ -1475,14 +2237,46 @@ def _prime_future_states(
             warmup_day_profiles[current_day] = day_profile
         for pot in pots:
             state = pot_states[pot["id"]]
-            _apply_hourly_environment(state, pot, hour_weather, day_profile, current.date())
-            slot = _decision_slot(current.date(), current, day_profile)
-            if slot is None:
-                continue
+            _apply_hourly_environment(
+                state,
+                pot,
+                hour_weather,
+                day_profile,
+                current.date(),
+                rain_exposure_factor=_rain_exposure_factor(pot, current.date()),
+            )
+        slot = _baseline_decision_slot(current.date(), current, day_profile)
+        if slot is None:
+            current += timedelta(hours=1)
+            continue
 
-            decision = _make_irrigation_decision(state, pot, hour_weather, day_profile, slot)
-            if decision["should_irrigate"]:
-                _apply_irrigation_event(state, pot, hour_weather, decision)
+        decision_by_pot_id: dict[int, dict[str, Any]] = {}
+        zone_trigger_decisions: dict[str, list[dict[str, Any]]] = {}
+        for pot in pots:
+            state = pot_states[pot["id"]]
+            decision = _make_baseline_irrigation_decision(state, pot, hour_weather, day_profile, slot)
+            decision = _apply_cold_month_indoor_skip(decision, pot, current_day)
+            decision_by_pot_id[int(pot["id"])] = decision
+            if decision["should_irrigate"] and _is_valve_managed_pot(pot, current_day):
+                zone_trigger_decisions.setdefault(pot["balcony_zone"], []).append(decision)
+
+        for zone, trigger_decisions in zone_trigger_decisions.items():
+            zone_dose_factor = _baseline_zone_dose_factor(trigger_decisions)
+            _execute_valve_zone_distribution(
+                pot_states,
+                zone_pots,
+                zone,
+                current_day,
+                hour_weather,
+                decision_by_pot_id,
+                lambda zone_pot, zone_decision: {
+                    **zone_decision,
+                    "should_irrigate": True,
+                    "dose_factor": zone_dose_factor,
+                },
+                _baseline_irrigation_request,
+                {"zone_triggered": True, "zone_dose_factor": zone_dose_factor, "zone": zone},
+            )
         current += timedelta(hours=1)
 
 
@@ -1493,26 +2287,13 @@ def _weather_for_hour(day_weather: list[dict[str, Any]], observed_at: datetime) 
     return day_weather[0] if day_weather else None
 
 
-def _weather_snapshot_for_time(sampled_weather: dict[str, Any], current_weather: dict[str, Any]) -> dict[str, Any]:
-    weather = dict(sampled_weather)
-    weather["id"] = current_weather["id"]
-    weather["observed_at"] = current_weather["observed_at"]
-    return weather
-
-
-def _sampled_day_profile_for_date(day: date, sampled_day_profile: dict[str, Any]) -> dict[str, Any]:
-    profile = dict(sampled_day_profile)
-    profile["season"] = _season(day)
-    return profile
-
-
 def _hourly_line_metadata(
     sensor_context: dict[str, Any],
     experiment_date: date,
     observed_local: datetime,
     weather: dict[str, Any],
 ) -> dict[str, Any]:
-    metadata = _sensor_line_metadata_for_hour(sensor_context, experiment_date, observed_local.hour)
+    metadata = _sensor_line_metadata_for_hour(sensor_context, experiment_date, observed_local)
     metadata["is_weather_prediction"] = _weather_row_is_prediction(weather)
     metadata["has_prediction_or_simulation"] = (
         metadata["is_weather_prediction"]
@@ -1545,8 +2326,9 @@ def _weather_day_is_prediction(experiment_date: date) -> bool:
     return experiment_date > datetime.now(LOCAL_TZ).date()
 
 
-def _sensor_line_metadata_for_hour(sensor_context: dict[str, Any], experiment_date: date, hour: int) -> dict[str, Any]:
+def _sensor_line_metadata_for_hour(sensor_context: dict[str, Any], experiment_date: date, observed_at: datetime | time | int) -> dict[str, Any]:
     has_reading_for_day = _has_sensor_reading_for_day(sensor_context, experiment_date)
+    hour = observed_at.hour if isinstance(observed_at, (datetime, time)) else int(observed_at)
     if _sensor_hour_is_future(experiment_date, hour):
         return _sensor_metadata(simulated=True, prediction=True, has_reading_for_day=has_reading_for_day)
     if _sensor_date_is_future(sensor_context, experiment_date):
@@ -1559,8 +2341,9 @@ def _sensor_line_metadata_for_hour(sensor_context: dict[str, Any], experiment_da
     if not sensor_ids:
         return _sensor_metadata(simulated=True, prediction=False, has_reading_for_day=has_reading_for_day)
 
+    slot_time = _sensor_lookup_time(observed_at)
     for sensor_id in sensor_ids:
-        reading = lookup.get((experiment_date, hour, sensor_id))
+        reading = _lookup_sensor_reading(lookup, experiment_date, slot_time, int(sensor_id))
         if reading is None or reading.get("source") != ACTUAL_SENSOR_SOURCE:
             return _sensor_metadata(simulated=True, prediction=False, has_reading_for_day=has_reading_for_day)
     return _sensor_metadata(simulated=False, prediction=False, has_reading_for_day=has_reading_for_day)
@@ -1580,7 +2363,7 @@ def _sensor_line_metadata_for_day(sensor_context: dict[str, Any], experiment_dat
 
     rows = [
         reading
-        for (reading_date, _hour, sensor_id), reading in lookup.items()
+        for (reading_date, _slot_time, sensor_id), reading in lookup.items()
         if reading_date == experiment_date and sensor_id in sensor_ids
     ]
     if not rows:
@@ -1604,9 +2387,160 @@ def _sensor_date_is_future(sensor_context: dict[str, Any], experiment_date: date
     return experiment_date in set(sensor_context.get("future_dates") or [])
 
 
+def _anfis_decision_threshold(
+    sensor_context: dict[str, Any],
+    experiment_date: date,
+    decision_threshold: float = ANFIS_DECISION_THRESHOLD,
+    forecast_decision_threshold: float = ANFIS_FORECAST_DECISION_THRESHOLD,
+) -> float:
+    if _sensor_date_is_future(sensor_context, experiment_date):
+        return forecast_decision_threshold
+    return decision_threshold
+
+
+def _make_anfis_execution_decision(
+    state: PotState,
+    pot: dict[str, Any],
+    weather: dict[str, Any],
+    day_profile: dict[str, Any],
+    slot: str,
+) -> dict[str, Any]:
+    observed_local = _local_observed_at(weather)
+    target = pot["winter_moisture_target_pct"] if slot == "winter_check" else pot["moisture_target_pct"]
+    reason_code = "anfis_probability_pending"
+    reason_detail = "Max valve ANFIS probability decides irrigation; ANFIS water-saving policy controls duration."
+    should_irrigate = False
+
+    if _number(weather.get("temperature_c"), day_profile["avg_temperature_c"]) <= 3.0:
+        reason_code = "freeze_risk"
+        reason_detail = "Skipped because temperature is too low for irrigation."
+
+    return {
+        "pot_id": pot["id"],
+        "pot_code": pot["pot_code"],
+        "decided_at": observed_local.isoformat(),
+        "date": observed_local.date().isoformat(),
+        "slot": slot,
+        "should_irrigate": should_irrigate,
+        "reason_code": reason_code,
+        "reason_detail": reason_detail,
+        "current_moisture_pct": round(state.moisture, 2),
+        "target_moisture_pct": round(target, 2),
+        "weather_hourly_id": weather["id"],
+        "dose_factor": 1.0,
+        "dose_policy_source": "anfis_water_saving_policy",
+    }
+
+
+def _anfis_duration_policy_note(decision: dict[str, Any]) -> str:
+    dose_factor = _number(decision.get("dose_factor"), 1.0)
+    if dose_factor < 1.0:
+        return f" ANFIS water-saving policy reduces runtime to {dose_factor * 100.0:.0f}%."
+    return " ANFIS water-saving policy keeps full runtime."
+
+
+def _anfis_zone_dose_factor(
+    trigger_decisions: list[dict[str, Any]],
+    slot_probability: float,
+    day_profile: dict[str, Any],
+) -> float:
+    max_deficit = max(
+        (
+            max(
+                0.0,
+                float(decision.get("target_moisture_pct") or 0.0)
+                - float(decision.get("current_moisture_pct") or 0.0),
+            )
+            for decision in trigger_decisions
+        ),
+        default=0.0,
+    )
+    if max_deficit <= 3.0:
+        need_factor = 0.5
+    elif max_deficit <= 7.0:
+        need_factor = 0.75
+    else:
+        need_factor = 1.0
+
+    if slot_probability < 0.80:
+        confidence_factor = 0.5
+    elif slot_probability < 0.88:
+        confidence_factor = 0.75
+    else:
+        confidence_factor = 1.0
+
+    rain_factor = 1.0
+    same_day_rain_mm = _number(day_profile.get("precipitation_mm"), 0.0)
+    if same_day_rain_mm >= 4.0:
+        rain_factor = 0.5
+    elif same_day_rain_mm >= 1.0:
+        rain_factor = 0.75
+
+    return _anfis_allowed_dose_factor(min(need_factor, confidence_factor, rain_factor))
+
+
+def _anfis_allowed_dose_factor(value: float) -> float:
+    number_value = _clamp(_number(value, 1.0), 0.5, 1.0)
+    if number_value <= 0.625:
+        return 0.5
+    if number_value <= 0.875:
+        return 0.75
+    return 1.0
+
+
+def _anfis_zone_cadence_days(day_profile: dict[str, Any]) -> int:
+    if day_profile.get("heatwave_day") or day_profile.get("dry_windy_day"):
+        return 1
+    if _number(day_profile.get("avg_temperature_c"), 20.0) < 18.0:
+        return 3
+    return 2
+
+
+def _anfis_zone_cadence_blocks(
+    last_irrigated_by_zone: dict[str, date],
+    zone: str,
+    current_date: date,
+    trigger_decisions: list[dict[str, Any]],
+    slot_probability: float,
+    day_profile: dict[str, Any],
+) -> bool:
+    last_irrigated = last_irrigated_by_zone.get(zone)
+    if last_irrigated is None:
+        return False
+    if any(bool(decision.get("anfis_below_safety_threshold")) for decision in trigger_decisions):
+        return False
+    max_deficit = max(
+        (
+            max(
+                0.0,
+                float(decision.get("target_moisture_pct") or 0.0)
+                - float(decision.get("current_moisture_pct") or 0.0),
+            )
+            for decision in trigger_decisions
+        ),
+        default=0.0,
+    )
+    if slot_probability >= 0.88 or max_deficit >= 8.0:
+        return False
+    cadence_days = _anfis_zone_cadence_days(day_profile)
+    return (current_date - last_irrigated).days < cadence_days
+
+
 def _sensor_hour_is_future(experiment_date: date, hour: int) -> bool:
     observed_at = datetime.combine(experiment_date, time(hour, 0), tzinfo=LOCAL_TZ)
     return observed_at > datetime.now(LOCAL_TZ)
+
+
+def _sensor_slot_is_prediction(
+    sensor_context: dict[str, Any],
+    experiment_date: date,
+    observed_at: datetime | time | int,
+) -> bool:
+    slot_time = _sensor_lookup_time(observed_at)
+    return _sensor_date_is_future(sensor_context, experiment_date) or _sensor_hour_is_future(
+        experiment_date,
+        slot_time.hour,
+    )
 
 
 def _sensor_metadata(simulated: bool, prediction: bool, has_reading_for_day: bool) -> dict[str, Any]:
@@ -1634,17 +2568,26 @@ def _combined_line_metadata(*entries: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _anfis_inputs(state: PotState, weather: dict[str, Any], sensor_reading: dict[str, Any] | None) -> dict[str, float]:
+def _anfis_inputs(
+    state: PotState,
+    weather: dict[str, Any],
+    sensor_reading: dict[str, Any] | None,
+    pot: dict[str, Any],
+    day_profile: dict[str, Any],
+) -> dict[str, float]:
+    observed_day = _local_observed_at(weather).date()
+    rain = _number(day_profile.get("precipitation_mm"), _number(weather.get("precipitation_mm"), 0.0))
+    effective_rain = rain * _rain_exposure_factor(pot, observed_day)
     if sensor_reading:
-        return {
-            "moisture": state.moisture,
-            "humidity": _number(sensor_reading["air_humidity_pct"], _number(weather["relative_humidity_pct"], 60.0)),
-            "temperature": _number(sensor_reading["air_temperature_c"], _number(weather["temperature_c"], 20.0)),
-        }
+        moisture = _number(sensor_reading["soil_moisture_pct"], state.moisture)
+        temperature = _number(sensor_reading["air_temperature_c"], _number(weather["temperature_c"], 20.0))
+    else:
+        moisture = state.moisture
+        temperature = _number(weather["temperature_c"], 20.0)
     return {
-        "moisture": state.moisture,
-        "humidity": _number(weather["relative_humidity_pct"], 60.0),
-        "temperature": _number(weather["temperature_c"], 20.0),
+        "moisture": float(moisture),
+        "temperature": float(temperature),
+        "rain": float(effective_rain),
     }
 
 
@@ -1701,174 +2644,473 @@ def _run_sparse_daily_irrigation(
     persist: bool = False,
     snapshot: ExperimentSnapshot | None = None,
 ) -> dict[str, Any]:
-    if end_date < start_date:
-        raise ValueError("end_date must not be before start_date")
+    return _SparseSamplingController(
+        start_date=start_date,
+        end_date=end_date,
+        sample_interval_hours=sample_interval_hours,
+        persist=persist,
+        snapshot=snapshot,
+    ).run()
 
-    snapshot = _resolve_snapshot(start_date, end_date, snapshot)
-    weather_rows = snapshot.selected_weather_rows
-    pots = snapshot.pots
-    sensor_context = snapshot.sensor_context
-    weather_by_day = snapshot.weather_by_day
-    actual_states = _copy_pot_states(snapshot.initial_pot_states)
-    controller_states = _copy_pot_states(snapshot.initial_pot_states)
 
-    entries = []
-    detail_entries = []
-    decisions = []
-    events = []
-    alerts = []
+class _SparseSamplingController:
+    """Sparse sampling controller evaluated at default strategy decision slots."""
 
-    total_water_ml = 0.0
-    total_irrigation_events = 0
-    total_irrigation_decisions = 0
-    hour_index = 0
-    sampled_weather = None
-    sampled_day_profile = None
-    sampled_weather_count = 0
+    def __init__(
+        self,
+        start_date: date,
+        end_date: date,
+        sample_interval_hours: int,
+        persist: bool,
+        snapshot: ExperimentSnapshot | None,
+    ) -> None:
+        if end_date < start_date:
+            raise ValueError("end_date must not be before start_date")
 
-    current_date = start_date
-    while current_date <= end_date:
-        day_weather = weather_by_day.get(current_date, [])
-        if not day_weather:
+        self.start_date = start_date
+        self.end_date = end_date
+        self.sample_interval_hours = max(1, int(sample_interval_hours))
+        self.persist = persist
+        self.selected_snapshot = _resolve_snapshot(start_date, end_date, snapshot)
+        self.simulation_start_date, self.simulation_snapshot = _resolve_simulation_snapshot(
+            start_date,
+            end_date,
+            self.selected_snapshot,
+        )
+        self.weather_rows = self.selected_snapshot.selected_weather_rows
+        self.pots = self.simulation_snapshot.pots
+        self.zone_pots = _pots_by_valve_zone(self.pots)
+        self.sensor_context = self.simulation_snapshot.sensor_context
+        self.selected_sensor_context = self.selected_snapshot.sensor_context
+        self.weather_by_day = self.simulation_snapshot.weather_by_day
+        self.states = _copy_pot_states(self.simulation_snapshot.initial_pot_states)
+        self.probe_states = _copy_pot_states(self.simulation_snapshot.initial_pot_states)
+        self.sensor_state_anchor = _initialize_states_from_first_day_sensor_readings(
+            self.states,
+            self.pots,
+            self.sensor_context,
+            self.simulation_start_date,
+        )
+        _initialize_states_from_first_day_sensor_readings(
+            self.probe_states,
+            self.pots,
+            self.sensor_context,
+            self.simulation_start_date,
+        )
+        self.entries: list[dict[str, Any]] = []
+        self.detail_entries: list[dict[str, Any]] = []
+        self.decisions: list[dict[str, Any]] = []
+        self.events: list[dict[str, Any]] = []
+        self.alerts: list[dict[str, Any]] = []
+        self.total_water_ml = 0.0
+        self.total_irrigation_decisions = 0
+        self.last_sensor_sample_at: datetime | None = None
+        self.sensor_sample_count = 0
+        self.sensor_sample_row_count = 0
+        self.sampled_weather_rows = 0
+        self.sampling_stats = _new_sampling_estimation_stats()
+
+    def run(self) -> dict[str, Any]:
+        current_date = self.simulation_start_date
+        while current_date <= self.end_date:
+            self._run_day(current_date)
             current_date += timedelta(days=1)
-            continue
 
-        day_profile = snapshot.day_profiles.get(current_date) or _day_profile(current_date, day_weather, weather_by_day)
+        valve_rollup = _apply_valve_rollup_to_entries(
+            self.entries,
+            self.detail_entries,
+            self.pots,
+            self.decisions,
+            self.events,
+        )
+        summary = self._summary(valve_rollup)
+        chart_entries = _chart_entries_for_range(self.start_date, self.end_date, self.entries, self.detail_entries)
+        _add_chart_summary(summary, chart_entries, self.start_date, self.end_date)
+        return {
+            "entries": self.entries,
+            "chartEntries": chart_entries,
+            "summary": summary,
+            "pots": _pot_info_entries(
+                self.pots,
+                {"period_water_usage_l": _event_water_usage_l_by_pot(self.events)},
+            ),
+            "sampleDecisions": valve_rollup["decisions"][:200],
+            "sampleEvents": valve_rollup["events"][:200],
+            "samplePotDecisions": self.decisions[:200],
+            "samplePotEvents": self.events[:200],
+            "sampleAlerts": self.alerts[:200],
+        }
+
+    def _run_day(self, current_date: date) -> None:
+        day_weather = self.weather_by_day.get(current_date, [])
+        if not day_weather:
+            return
+
+        record_date = current_date >= self.start_date
+        day_profile = self.simulation_snapshot.day_profiles.get(current_date) or _day_profile(
+            current_date,
+            day_weather,
+            self.weather_by_day,
+        )
         daily_water_ml = 0.0
         daily_events = 0
         daily_decisions = 0
         daily_alerts = 0
+        daily_sensor_samples = 0
+        daily_moisture_tracker = _new_daily_moisture_tracker()
+        record_hourly = record_date and _uses_hourly_chart(self.start_date, self.end_date)
 
         for hour_weather in day_weather:
             observed_local = _local_observed_at(hour_weather)
-            sample_now = hour_index % sample_interval_hours == 0
-            if sample_now or sampled_weather is None or sampled_day_profile is None:
-                sampled_weather = hour_weather
-                sampled_day_profile = day_profile
-                sampled_weather_count += 1
+            slot = _baseline_decision_slot(current_date, observed_local, day_profile)
+            self._apply_weather_window(current_date, [hour_weather], self.states)
+            self._apply_weather_window(current_date, [hour_weather], self.probe_states)
+            self._calibrate_probe_states(current_date, observed_local, day_profile)
 
-            controller_weather = _weather_snapshot_for_time(sampled_weather, hour_weather)
-            controller_day_profile = _sampled_day_profile_for_date(current_date, sampled_day_profile)
             hourly_water_ml = 0.0
             hourly_events = 0
             hourly_decisions = 0
             hourly_alerts = 0
+            sample_now = False
+            hourly_sensor_samples = 0
 
-            for pot in pots:
-                actual_state = actual_states[pot["id"]]
-                controller_state = controller_states[pot["id"]]
-                _apply_hourly_environment(actual_state, pot, hour_weather, day_profile, observed_local.date())
-                _apply_sensor_reading(actual_state, pot, current_date, observed_local, sensor_context)
-
+            if slot is not None:
+                sample_now = record_date and self._should_sample(observed_local)
+                calibrate_now = sample_now or not record_date
                 if sample_now:
-                    controller_state.moisture = actual_state.moisture
-                else:
-                    _apply_hourly_environment(controller_state, pot, controller_weather, controller_day_profile, observed_local.date())
+                    self.last_sensor_sample_at = observed_local
+                    self.sensor_sample_count += 1
+                if record_date:
+                    self.sampled_weather_rows += 1
 
-                slot = _decision_slot(current_date, observed_local, controller_day_profile)
-                if slot is None:
-                    if _is_emergency_dryness(actual_state, pot, current_date, observed_local):
-                        alerts.append(_alert_row(pot, hour_weather, "emergency_dryness", "warning", "Emergency dryness outside watering window"))
-                        daily_alerts += 1
-                        hourly_alerts += 1
-                    continue
-
-                decision = _with_sensor_key(
-                    _make_irrigation_decision(controller_state, pot, controller_weather, controller_day_profile, slot),
-                    pot,
-                    sensor_context,
+                slot_result = self._run_slot(
+                    current_date,
+                    hour_weather,
+                    day_profile,
+                    slot,
+                    calibrate_now,
+                    sample_now,
+                    record_date,
+                    daily_moisture_tracker,
                 )
-                decisions.append(decision)
-                daily_decisions += 1
-                hourly_decisions += 1
+                hourly_sensor_samples = int(slot_result["sensor_samples"])
+                self.sensor_sample_row_count += hourly_sensor_samples
+                daily_sensor_samples += hourly_sensor_samples
+                hourly_water_ml = slot_result["water_ml"]
+                hourly_events = slot_result["events"]
+                hourly_decisions = slot_result["decisions"]
+                hourly_alerts = slot_result["alerts"]
+                daily_water_ml += hourly_water_ml
+                daily_events += hourly_events
+                daily_decisions += hourly_decisions
+                daily_alerts += hourly_alerts
+                self._run_probe_slot(current_date, hour_weather, day_profile, slot)
+            else:
+                snapshot_label = _daily_moisture_snapshot_label(current_date, observed_local, day_profile)
+                if record_date and snapshot_label:
+                    _record_daily_moisture_snapshot(daily_moisture_tracker, self.states, snapshot_label)
 
-                if decision["should_irrigate"]:
-                    event = _with_event_sensor_key(_apply_irrigation_event(controller_state, pot, controller_weather, decision), decision)
-                    _apply_planned_volume(actual_state, pot, event["planned_volume_ml"])
-                    events.append(event)
-                    daily_events += 1
-                    daily_water_ml += event["planned_volume_ml"]
-                    hourly_events += 1
-                    hourly_water_ml += event["planned_volume_ml"]
-
-                if actual_state.moisture > pot["moisture_max_pct"]:
-                    actual_state.too_wet_hours += 1
-                    if actual_state.too_wet_hours == 24:
-                        alerts.append(_alert_row(pot, hour_weather, "too_wet_too_long", "warning", "Pot stayed above maximum moisture for 24 hours"))
-                        daily_alerts += 1
-                        hourly_alerts += 1
-                else:
-                    actual_state.too_wet_hours = 0
-            if _uses_hourly_chart(start_date, end_date):
-                detail_entries.append(
+            if record_hourly:
+                self.detail_entries.append(
                     _hourly_aggregate_entry(
                         observed_local,
                         hour_weather,
                         day_profile,
-                        actual_states,
+                        self.states,
                         hourly_water_ml,
                         hourly_events,
                         hourly_decisions,
                         hourly_alerts,
-                        _hourly_line_metadata(sensor_context, current_date, observed_local, hour_weather),
+                        {
+                            **_hourly_line_metadata(self.selected_sensor_context, current_date, observed_local, hour_weather),
+                            "sparse_sensor_sample": sample_now,
+                            "sparse_sensor_samples": hourly_sensor_samples,
+                        },
                     )
                 )
-            hour_index += 1
+        if not record_date:
+            return
 
-        entries.append(
+        self.entries.append(
             _daily_aggregate_entry(
                 current_date,
                 day_profile,
-                actual_states,
+                self.states,
                 daily_water_ml,
                 daily_events,
                 daily_decisions,
                 daily_alerts,
-                _daily_line_metadata(sensor_context, current_date, day_weather),
+                {
+                    **_daily_line_metadata(self.selected_sensor_context, current_date, day_weather),
+                    "sparse_sensor_sample": daily_sensor_samples > 0,
+                    "sparse_sensor_samples": daily_sensor_samples,
+                },
+                moisture_summary=_daily_moisture_summary(daily_moisture_tracker, self.states),
             )
         )
-        total_water_ml += daily_water_ml
-        total_irrigation_events += daily_events
-        total_irrigation_decisions += daily_decisions
-        current_date += timedelta(days=1)
+        self.total_water_ml += daily_water_ml
+        self.total_irrigation_decisions += daily_decisions
 
-    valve_rollup = _apply_valve_rollup_to_entries(entries, detail_entries, pots, decisions, events)
+    def _should_sample(self, observed_local: datetime) -> bool:
+        if self.last_sensor_sample_at is None:
+            return True
+        elapsed_hours = (observed_local - self.last_sensor_sample_at).total_seconds() / 3600.0
+        return elapsed_hours >= self.sample_interval_hours
 
-    summary = _daily_summary(
-        entries=entries,
-        pots=pots,
-        weather_rows=weather_rows,
-        total_water_ml=total_water_ml,
-        total_irrigation_events=len(valve_rollup["events"]),
-        total_irrigation_decisions=len(valve_rollup["decisions"]),
-        alerts=alerts,
-        start_date=start_date,
-        end_date=end_date,
-        sensor_context=sensor_context,
-    )
-    summary["potIrrigationDecisions"] = total_irrigation_decisions
-    summary["potIrrigationActions"] = len(events)
-    summary["decisionLevel"] = "valve_zone"
-    summary["sampledWeatherRows"] = sampled_weather_count
-    summary["samplingDataPolicy"] = "sensor-and-weather-sampled"
-    if persist:
-        _persist_daily_results("sampling", start_date, end_date, decisions, events, alerts)
-    chart_entries = _chart_entries_for_range(start_date, end_date, entries, detail_entries)
-    _add_chart_summary(summary, chart_entries, start_date, end_date)
-    return {
-        "entries": entries,
-        "chartEntries": chart_entries,
-        "summary": summary,
-        "pots": _pot_info_entries(
-            pots,
-            {"period_water_usage_l": _event_water_usage_l_by_pot(events)},
-        ),
-        "sampleDecisions": valve_rollup["decisions"][:200],
-        "sampleEvents": valve_rollup["events"][:200],
-        "samplePotDecisions": decisions[:200],
-        "samplePotEvents": events[:200],
-        "sampleAlerts": alerts[:200],
-    }
+    def _run_slot(
+        self,
+        current_date: date,
+        hour_weather: dict[str, Any],
+        day_profile: dict[str, Any],
+        slot: str,
+        calibrate_now: bool,
+        sample_now: bool,
+        record_date: bool,
+        daily_moisture_tracker: dict[str, Any],
+    ) -> dict[str, float | int]:
+        observed_local = _local_observed_at(hour_weather)
+        water_ml = 0.0
+        events = 0
+        decisions = 0
+        alerts = 0
+        sample_sensor_ids: set[int] = set()
+        decision_by_pot_id: dict[int, dict[str, Any]] = {}
+        zone_trigger_decisions: dict[str, list[dict[str, Any]]] = {}
+
+        for pot in self.pots:
+            state = self.states[pot["id"]]
+            if calibrate_now:
+                sensor_id = self._refresh_state_from_sensor(
+                    state,
+                    pot,
+                    current_date,
+                    observed_local,
+                    day_profile,
+                    record_stats=sample_now,
+                )
+                if sample_now and sensor_id is not None:
+                    sample_sensor_ids.add(sensor_id)
+
+            if _is_emergency_dryness(state, pot, current_date, observed_local) and record_date:
+                self.alerts.append(_alert_row(pot, hour_weather, "emergency_dryness", "warning", "Emergency dryness at sparse decision slot"))
+                alerts += 1
+
+            decision = _with_sensor_key(
+                _make_baseline_irrigation_decision(state, pot, hour_weather, day_profile, slot),
+                pot,
+                self.sensor_context,
+            )
+            decision = _apply_cold_month_indoor_skip(decision, pot, current_date)
+            decision_by_pot_id[int(pot["id"])] = decision
+            if record_date:
+                self.decisions.append(decision)
+                decisions += 1
+
+            if decision["should_irrigate"] and _is_valve_managed_pot(pot, current_date):
+                zone_trigger_decisions.setdefault(pot["balcony_zone"], []).append(decision)
+
+        snapshot_label = _daily_moisture_snapshot_label(current_date, observed_local, day_profile)
+        if record_date and snapshot_label:
+            _record_daily_moisture_snapshot(daily_moisture_tracker, self.states, snapshot_label)
+
+        for zone, trigger_decisions in zone_trigger_decisions.items():
+            trigger_pot_ids = [int(decision["pot_id"]) for decision in trigger_decisions]
+            trigger_pot_codes = [decision["pot_code"] for decision in trigger_decisions if decision.get("pot_code")]
+            zone_dose_factor = _sparse_zone_dose_factor(trigger_decisions, self.sample_interval_hours, sample_now)
+            zone_events = _execute_valve_zone_distribution(
+                self.states,
+                self.zone_pots,
+                zone,
+                current_date,
+                hour_weather,
+                decision_by_pot_id,
+                lambda zone_pot, zone_decision: {
+                    **zone_decision,
+                    "should_irrigate": True,
+                    "dose_factor": zone_dose_factor,
+                },
+                _baseline_irrigation_request,
+                {
+                    "zone_triggered": True,
+                    "zone_trigger_pot_ids": trigger_pot_ids,
+                    "zone_trigger_pot_codes": trigger_pot_codes,
+                    "zone_dose_factor": zone_dose_factor,
+                    "zone": zone,
+                },
+            )
+            for event in zone_events:
+                if record_date:
+                    self.events.append(event)
+                    events += 1
+                    water_ml += event["planned_volume_ml"]
+
+        return {
+            "water_ml": water_ml,
+            "events": events,
+            "decisions": decisions,
+            "alerts": alerts,
+            "sensor_samples": len(sample_sensor_ids),
+        }
+
+    def _refresh_state_from_sensor(
+        self,
+        state: PotState,
+        pot: dict[str, Any],
+        experiment_date: date,
+        observed_at: datetime,
+        day_profile: dict[str, Any],
+        record_stats: bool = True,
+    ) -> int | None:
+        calibration_at = _sampling_calibration_at(experiment_date, observed_at, day_profile)
+        before = PotState(state.moisture)
+        pot_id = int(pot["id"])
+        association = (self.sensor_context.get("associations") or {}).get(pot_id) or {}
+        reading = _sensor_reading_for_pot(self.sensor_context, pot, experiment_date, calibration_at)
+        if reading is None:
+            reading = _forecast_sensor_reading_for_pot(
+                self.probe_states,
+                self.sensor_context,
+                pot,
+                experiment_date,
+                calibration_at,
+            )
+        if reading is None:
+            if record_stats:
+                self.sampling_stats["missing_refreshes"] += 1
+            return None
+        reading = _apply_calibration_reading(state, reading, calibration_at)
+
+        if record_stats:
+            _record_sampling_estimation_error(self.sampling_stats, before, state)
+            self.sampling_stats["sensor_refreshes"] += 1
+            if reading.get("source") == SPARSE_FORECAST_SENSOR_SOURCE:
+                self.sampling_stats["forecast_refreshes"] += 1
+        inferred = reading.get("association_source") == "associated_sensor"
+        if record_stats and inferred:
+            distance = _number(association.get("distance"), 1.0)
+            self.sampling_stats["associated_refreshes"] += 1
+            self.sampling_stats["association_distance_sum"] += distance
+        elif record_stats:
+            self.sampling_stats["direct_refreshes"] += 1
+        return int(reading.get("associated_sensor_id") or reading.get("sensor_id") or pot["id"])
+
+    def _apply_weather_window(
+        self,
+        current_date: date,
+        weather_rows: list[dict[str, Any]],
+        states: dict[int, PotState],
+    ) -> None:
+        if not weather_rows:
+            return
+
+        reference_et_mm = sum(_hourly_reference_et_mm(row) for row in weather_rows)
+        precipitation_mm = sum(_number(row.get("precipitation_mm"), 0.0) for row in weather_rows)
+        indoor_hours = len(weather_rows)
+        for pot in self.pots:
+            state = states[pot["id"]]
+            if _is_outdoor(pot, current_date):
+                loss = reference_et_mm * pot["evaporation_factor"] * pot["_sun_factor"] * pot["_wind_factor"]
+                if pot["plant_type_code"] in {"vegetables", "herbs"}:
+                    loss *= 1.12
+                elif pot["plant_type_code"] == "succulents":
+                    loss *= 0.48
+                loss *= _low_retention_drydown_multiplier(pot)
+                rain_gain = min(
+                    8.0,
+                    precipitation_mm * _rain_exposure_factor(pot, current_date) * 0.85,
+                )
+                state.moisture += rain_gain - loss
+            else:
+                state.moisture -= _indoor_hourly_moisture_loss(pot, current_date) * indoor_hours
+            state.moisture = _clamp(state.moisture, _minimum_realistic_moisture(pot, current_date), 100.0)
+
+    def _calibrate_probe_states(
+        self,
+        current_date: date,
+        observed_local: datetime,
+        day_profile: dict[str, Any],
+    ) -> None:
+        for pot in self.pots:
+            _apply_sensor_calibration_marker(
+                self.probe_states[pot["id"]],
+                pot,
+                current_date,
+                observed_local,
+                self.sensor_context,
+                day_profile,
+            )
+
+    def _run_probe_slot(
+        self,
+        current_date: date,
+        hour_weather: dict[str, Any],
+        day_profile: dict[str, Any],
+        slot: str,
+    ) -> None:
+        decision_by_pot_id: dict[int, dict[str, Any]] = {}
+        zone_trigger_decisions: dict[str, list[dict[str, Any]]] = {}
+
+        for pot in self.pots:
+            state = self.probe_states[pot["id"]]
+            decision = _make_baseline_irrigation_decision(state, pot, hour_weather, day_profile, slot)
+            decision = _apply_cold_month_indoor_skip(decision, pot, current_date)
+            decision_by_pot_id[int(pot["id"])] = decision
+            if decision["should_irrigate"] and _is_valve_managed_pot(pot, current_date):
+                zone_trigger_decisions.setdefault(pot["balcony_zone"], []).append(decision)
+
+        for zone, trigger_decisions in zone_trigger_decisions.items():
+            zone_dose_factor = _baseline_zone_dose_factor(trigger_decisions)
+            _execute_valve_zone_distribution(
+                self.probe_states,
+                self.zone_pots,
+                zone,
+                current_date,
+                hour_weather,
+                decision_by_pot_id,
+                lambda zone_pot, zone_decision: {
+                    **zone_decision,
+                    "should_irrigate": True,
+                    "dose_factor": zone_dose_factor,
+                },
+                _baseline_irrigation_request,
+                {"zone_triggered": True, "zone_dose_factor": zone_dose_factor, "zone": zone},
+            )
+
+    def _summary(self, valve_rollup: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+        summary = _daily_summary(
+            entries=self.entries,
+            pots=self.pots,
+            weather_rows=self.weather_rows,
+            total_water_ml=self.total_water_ml,
+            total_irrigation_events=len(valve_rollup["events"]),
+            total_irrigation_decisions=len(valve_rollup["decisions"]),
+            alerts=self.alerts,
+            start_date=self.start_date,
+            end_date=self.end_date,
+            sensor_context=self.selected_sensor_context,
+        )
+        sampling_estimation = _sampling_estimation_summary(self.sampling_stats)
+        summary.update(sampling_estimation)
+        summary.update(
+            {
+                "potIrrigationDecisions": self.total_irrigation_decisions,
+                "potIrrigationActions": len(self.events),
+                "decisionLevel": "valve_zone",
+                "sampledWeatherRows": self.sampled_weather_rows,
+                "sampledSensorMoments": self.sensor_sample_count,
+                "sampledSensorRows": self.sensor_sample_row_count,
+                "weatherSamplingPolicy": "hourly-weather-state-decision-slot-control",
+                "samplingDataPolicy": "decision-slot-sensor-sampling-hourly-state",
+                "forecastSensorCalibrationPolicy": "sparse-sampling-fully-calibrates-to-default-strategy-at-sampling-points",
+                "stateSimulationStartDate": self.simulation_start_date.isoformat(),
+                "stateLookbackDays": (self.end_date - self.simulation_start_date).days + 1,
+                "stateAnchorPolicy": "stable_daily_timeline",
+                "sparseSimulationGranularity": "hourly_state_decision_slot_control",
+            }
+        )
+        if self.sensor_state_anchor is not None:
+            summary["stateSensorAnchor"] = self.sensor_state_anchor
+        return summary
 
 
 def _run_fuzzy_dt_daily_irrigation(
@@ -1876,14 +3118,22 @@ def _run_fuzzy_dt_daily_irrigation(
     end_date: date,
     persist: bool = False,
     snapshot: ExperimentSnapshot | None = None,
-    controller: str = "fuzzy_dt",
 ) -> dict[str, Any]:
-    snapshot = _resolve_snapshot(start_date, end_date, snapshot)
-    weather_rows = snapshot.selected_weather_rows
-    pots = snapshot.pots
-    sensor_context = snapshot.sensor_context
-    weather_by_day = snapshot.weather_by_day
-    pot_states = _copy_pot_states(snapshot.initial_pot_states)
+    selected_snapshot = _resolve_snapshot(start_date, end_date, snapshot)
+    simulation_start_date, simulation_snapshot = _resolve_simulation_snapshot(start_date, end_date, selected_snapshot)
+    weather_rows = selected_snapshot.selected_weather_rows
+    pots = simulation_snapshot.pots
+    zone_pots = _pots_by_valve_zone(pots)
+    sensor_context = simulation_snapshot.sensor_context
+    selected_sensor_context = selected_snapshot.sensor_context
+    weather_by_day = simulation_snapshot.weather_by_day
+    pot_states = _copy_pot_states(simulation_snapshot.initial_pot_states)
+    sensor_state_anchor = _initialize_states_from_first_day_sensor_readings(
+        pot_states,
+        pots,
+        sensor_context,
+        simulation_start_date,
+    )
 
     entries = []
     detail_entries = []
@@ -1896,25 +3146,22 @@ def _run_fuzzy_dt_daily_irrigation(
     total_irrigation_decisions = 0
     prescription_sum = 0.0
     prescription_count = 0
-    etc_sum = 0.0
-    etc_count = 0
 
-    current_date = start_date
+    current_date = simulation_start_date
     while current_date <= end_date:
         day_weather = weather_by_day.get(current_date, [])
         if not day_weather:
             current_date += timedelta(days=1)
             continue
 
-        day_profile = snapshot.day_profiles.get(current_date) or _day_profile(current_date, day_weather, weather_by_day)
+        record_date = current_date >= start_date
+        day_profile = simulation_snapshot.day_profiles.get(current_date) or _day_profile(current_date, day_weather, weather_by_day)
         daily_water_ml = 0.0
         daily_events = 0
         daily_decisions = 0
         daily_alerts = 0
         daily_prescription_sum = 0.0
         daily_prescription_count = 0
-        daily_etc_sum = 0.0
-        daily_etc_count = 0
 
         for hour_weather in day_weather:
             observed_local = _local_observed_at(hour_weather)
@@ -1924,65 +3171,113 @@ def _run_fuzzy_dt_daily_irrigation(
             hourly_alerts = 0
             hourly_prescription_sum = 0.0
             hourly_prescription_count = 0
-            hourly_etc_sum = 0.0
-            hourly_etc_count = 0
+            slot = _baseline_decision_slot(current_date, observed_local, day_profile)
+            decision_by_pot_id: dict[int, dict[str, Any]] = {}
+            zone_trigger_decisions: dict[str, list[dict[str, Any]]] = {}
 
             for pot in pots:
                 state = pot_states[pot["id"]]
-                _apply_hourly_environment(state, pot, hour_weather, day_profile, observed_local.date())
-                _apply_sensor_reading(state, pot, current_date, observed_local, sensor_context)
+                _apply_hourly_environment(
+                    state,
+                    pot,
+                    hour_weather,
+                    day_profile,
+                    observed_local.date(),
+                    rain_exposure_factor=_rain_exposure_factor(pot, observed_local.date()),
+                )
+                _apply_sensor_calibration_marker(state, pot, current_date, observed_local, sensor_context, day_profile)
 
-                if observed_local.hour != 8:
+                if slot is None:
                     if _is_emergency_dryness(state, pot, current_date, observed_local):
-                        alerts.append(_alert_row(pot, hour_weather, "emergency_dryness", "warning", "Emergency dryness outside watering window"))
-                        daily_alerts += 1
-                        hourly_alerts += 1
+                        if record_date:
+                            alerts.append(_alert_row(pot, hour_weather, "emergency_dryness", "warning", "Emergency dryness outside watering window"))
+                            daily_alerts += 1
+                            hourly_alerts += 1
                     continue
 
-                if controller == "fao_pm":
-                    decision = _make_fao_pm_decision(state, pot, hour_weather, day_profile)
-                else:
-                    decision = _make_fuzzy_dt_decision(state, pot, hour_weather, day_profile)
+                decision = _make_fuzzy_dt_decision(state, pot, hour_weather, day_profile)
                 decision = _with_sensor_key(decision, pot, sensor_context)
-                decisions.append(decision)
-                daily_decisions += 1
-                hourly_decisions += 1
-                total_irrigation_decisions += 1
+                decision = _apply_cold_month_indoor_skip(decision, pot, current_date)
+                decision_by_pot_id[int(pot["id"])] = decision
 
                 prescription_mm = float(decision.get("prescription_mm", 0.0))
-                etc_mm = float(decision.get("etc_mm", 0.0))
-                prescription_sum += prescription_mm
-                prescription_count += 1
-                daily_prescription_sum += prescription_mm
-                daily_prescription_count += 1
-                hourly_prescription_sum += prescription_mm
-                hourly_prescription_count += 1
-                etc_sum += etc_mm
-                etc_count += 1
-                daily_etc_sum += etc_mm
-                daily_etc_count += 1
-                hourly_etc_sum += etc_mm
-                hourly_etc_count += 1
+                if record_date:
+                    decisions.append(decision)
+                    daily_decisions += 1
+                    hourly_decisions += 1
+                    total_irrigation_decisions += 1
+                    prescription_sum += prescription_mm
+                    prescription_count += 1
+                    daily_prescription_sum += prescription_mm
+                    daily_prescription_count += 1
+                    hourly_prescription_sum += prescription_mm
+                    hourly_prescription_count += 1
 
-                if decision["should_irrigate"]:
-                    event = _with_event_sensor_key(_apply_fuzzy_prescribed_event(state, pot, hour_weather, decision), decision)
-                    events.append(event)
-                    daily_events += 1
-                    daily_water_ml += event["planned_volume_ml"]
-                    hourly_events += 1
-                    hourly_water_ml += event["planned_volume_ml"]
-                    total_irrigation_events += 1
+                if decision["should_irrigate"] and _is_valve_managed_pot(pot, current_date):
+                    zone_trigger_decisions.setdefault(pot["balcony_zone"], []).append(decision)
 
-                if state.moisture > pot["moisture_max_pct"]:
-                    state.too_wet_hours += 1
-                    if state.too_wet_hours == 24:
-                        alerts.append(_alert_row(pot, hour_weather, "too_wet_too_long", "warning", "Pot stayed above maximum moisture for 24 hours"))
-                        daily_alerts += 1
-                        hourly_alerts += 1
-                else:
-                    state.too_wet_hours = 0
+            if slot is not None:
+                for zone, trigger_decisions in zone_trigger_decisions.items():
+                    trigger_pot_ids = [int(decision["pot_id"]) for decision in trigger_decisions]
+                    trigger_pot_codes = [decision["pot_code"] for decision in trigger_decisions if decision.get("pot_code")]
+                    trigger_prescriptions = [float(decision.get("prescription_mm") or 0.0) for decision in trigger_decisions]
+                    zone_max_prescription_mm = max(trigger_prescriptions, default=0.0)
+                    zone_average_prescription_mm = sum(trigger_prescriptions) / max(len(trigger_prescriptions), 1)
 
-            if _uses_hourly_chart(start_date, end_date):
+                    def fuzzy_zone_decision(zone_pot: dict[str, Any], zone_decision: dict[str, Any]) -> dict[str, Any]:
+                        if zone_decision.get("should_irrigate"):
+                            zone_decision["reason_code"] = "valve_zone_prescription"
+                            zone_decision["reason_detail"] = (
+                                f"Valve zone {zone} is triggered by {len(trigger_pot_ids)} pot(s); "
+                                "this pot keeps its own fuzzy prescription."
+                            )
+                        else:
+                            zone_decision["reason_code"] = "valve_zone_passive_delivery"
+                            zone_decision["reason_detail"] = (
+                                f"Valve zone {zone} is triggered by another pot; this pot keeps its own "
+                                "soft fuzzy prescription while the valve is open."
+                            )
+                        return zone_decision
+
+                    zone_events = _execute_valve_zone_distribution(
+                        pot_states,
+                        zone_pots,
+                        zone,
+                        current_date,
+                        hour_weather,
+                        decision_by_pot_id,
+                        fuzzy_zone_decision,
+                        _fuzzy_prescribed_request,
+                        {
+                            "zone_triggered": True,
+                            "zone_trigger_pot_ids": trigger_pot_ids,
+                            "zone_trigger_pot_codes": trigger_pot_codes,
+                            "zone_prescription_mm": round(zone_average_prescription_mm, 2),
+                            "zone_max_prescription_mm": round(zone_max_prescription_mm, 2),
+                            "zone": zone,
+                        },
+                    )
+                    for event in zone_events:
+                        if record_date:
+                            events.append(event)
+                            daily_events += 1
+                            daily_water_ml += event["planned_volume_ml"]
+                            hourly_events += 1
+                            hourly_water_ml += event["planned_volume_ml"]
+                            total_irrigation_events += 1
+
+                for pot in pots:
+                    state = pot_states[pot["id"]]
+                    if state.moisture > pot["moisture_max_pct"]:
+                        state.too_wet_hours += 1
+                        if record_date and state.too_wet_hours == 24:
+                            alerts.append(_alert_row(pot, hour_weather, "too_wet_too_long", "warning", "Pot stayed above maximum moisture for 24 hours"))
+                            daily_alerts += 1
+                            hourly_alerts += 1
+                    else:
+                        state.too_wet_hours = 0
+
+            if record_date and _uses_hourly_chart(start_date, end_date):
                 detail_entries.append(
                     _hourly_aggregate_entry(
                         observed_local,
@@ -1994,13 +3289,16 @@ def _run_fuzzy_dt_daily_irrigation(
                         hourly_decisions,
                         hourly_alerts,
                         {
-                            **_hourly_line_metadata(sensor_context, current_date, observed_local, hour_weather),
+                            **_hourly_line_metadata(selected_sensor_context, current_date, observed_local, hour_weather),
                             "fuzzy_prescription_mm": round(hourly_prescription_sum / max(hourly_prescription_count, 1), 2),
                             "avg_prescription_mm": round(hourly_prescription_sum / max(hourly_prescription_count, 1), 2),
-                            "etc_mm": round(hourly_etc_sum / max(hourly_etc_count, 1), 2),
                         },
                     )
                 )
+
+        if not record_date:
+            current_date += timedelta(days=1)
+            continue
 
         entries.append(
             _daily_aggregate_entry(
@@ -2012,10 +3310,9 @@ def _run_fuzzy_dt_daily_irrigation(
                 daily_decisions,
                 daily_alerts,
                 {
-                    **_daily_line_metadata(sensor_context, current_date, day_weather),
+                    **_daily_line_metadata(selected_sensor_context, current_date, day_weather),
                     "fuzzy_prescription_mm": round(daily_prescription_sum / max(daily_prescription_count, 1), 2),
                     "avg_prescription_mm": round(daily_prescription_sum / max(daily_prescription_count, 1), 2),
-                    "etc_mm": round(daily_etc_sum / max(daily_etc_count, 1), 2),
                 },
             )
         )
@@ -2034,16 +3331,18 @@ def _run_fuzzy_dt_daily_irrigation(
         alerts=alerts,
         start_date=start_date,
         end_date=end_date,
-        sensor_context=sensor_context,
+        sensor_context=selected_sensor_context,
     )
     summary["potIrrigationDecisions"] = total_irrigation_decisions
     summary["potIrrigationActions"] = len(events)
     summary["decisionLevel"] = "valve_zone"
     summary["averagePrescriptionMm"] = round(prescription_sum / max(prescription_count, 1), 2)
-    summary["averageEtcMm"] = round(etc_sum / max(etc_count, 1), 2)
-    summary["fuzzyDataPolicy"] = "daily-fis-prescription" if controller == "fuzzy_dt" else "daily-fao-penman-monteith-prescription"
-    if persist:
-        _persist_daily_results(controller, start_date, end_date, decisions, events, alerts)
+    summary["fuzzyDataPolicy"] = "daily-fis-prescription"
+    summary["stateSimulationStartDate"] = simulation_start_date.isoformat()
+    summary["stateLookbackDays"] = (end_date - simulation_start_date).days + 1
+    summary["stateAnchorPolicy"] = "stable_historical_timeline"
+    if sensor_state_anchor is not None:
+        summary["stateSensorAnchor"] = sensor_state_anchor
     chart_entries = _chart_entries_for_range(start_date, end_date, entries, detail_entries)
     _add_chart_summary(summary, chart_entries, start_date, end_date)
     return {
@@ -2068,13 +3367,19 @@ def _run_anfis_daily_irrigation(
     model: ANFIS,
     persist: bool = False,
     snapshot: ExperimentSnapshot | None = None,
+    decision_threshold: float = ANFIS_DECISION_THRESHOLD,
+    forecast_decision_threshold: float = ANFIS_FORECAST_DECISION_THRESHOLD,
 ) -> dict[str, Any]:
-    snapshot = _resolve_snapshot(start_date, end_date, snapshot)
-    weather_rows = snapshot.selected_weather_rows
-    pots = snapshot.pots
-    sensor_context = snapshot.sensor_context
-    weather_by_day = snapshot.weather_by_day
-    pot_states = _copy_pot_states(snapshot.initial_pot_states)
+    selected_snapshot = _resolve_snapshot(start_date, end_date, snapshot)
+    simulation_start_date, simulation_snapshot = _resolve_simulation_snapshot(start_date, end_date, selected_snapshot)
+
+    weather_rows = selected_snapshot.selected_weather_rows
+    pots = simulation_snapshot.pots
+    zone_pots = _pots_by_valve_zone(pots)
+    sensor_context = simulation_snapshot.sensor_context
+    selected_sensor_context = selected_snapshot.sensor_context
+    weather_by_day = simulation_snapshot.weather_by_day
+    pot_states = _copy_pot_states(simulation_snapshot.initial_pot_states)
 
     entries = []
     detail_entries = []
@@ -2085,21 +3390,37 @@ def _run_anfis_daily_irrigation(
     total_water_ml = 0.0
     total_irrigation_events = 0
     total_irrigation_decisions = 0
+    last_irrigated_by_zone: dict[str, date] = {}
+    sensor_state_anchor = _initialize_states_from_first_day_sensor_readings(
+        pot_states,
+        pots,
+        sensor_context,
+        start_date,
+    )
 
-    current_date = start_date
+    current_date = simulation_start_date
     while current_date <= end_date:
         day_weather = weather_by_day.get(current_date, [])
         if not day_weather:
             current_date += timedelta(days=1)
             continue
 
-        day_profile = snapshot.day_profiles.get(current_date) or _day_profile(current_date, day_weather, weather_by_day)
+        record_date = current_date >= start_date
+        day_profile = simulation_snapshot.day_profiles.get(current_date) or _day_profile(current_date, day_weather, weather_by_day)
         daily_water_ml = 0.0
         daily_events = 0
         daily_decisions = 0
         daily_alerts = 0
+        daily_moisture_tracker = _new_daily_moisture_tracker()
         probability_sum = 0.0
         probability_count = 0
+        probability_max = 0.0
+        current_decision_threshold = _anfis_decision_threshold(
+            sensor_context,
+            current_date,
+            decision_threshold,
+            forecast_decision_threshold,
+        )
 
         for hour_weather in day_weather:
             observed_local = _local_observed_at(hour_weather)
@@ -2109,73 +3430,253 @@ def _run_anfis_daily_irrigation(
             hourly_alerts = 0
             hourly_probability_sum = 0.0
             hourly_probability_count = 0
+            hourly_probability_max = 0.0
+            slot = _baseline_decision_slot(current_date, observed_local, day_profile)
+            decision_by_pot_id: dict[int, dict[str, Any]] = {}
+            slot_decisions: list[dict[str, Any]] = []
+            eligible_decisions_by_zone: dict[str, list[dict[str, Any]]] = {}
+            safety_decisions_by_zone: dict[str, list[dict[str, Any]]] = {}
+            zone_trigger_decisions: dict[str, list[dict[str, Any]]] = {}
 
             for pot in pots:
                 state = pot_states[pot["id"]]
-                _apply_hourly_environment(state, pot, hour_weather, day_profile, observed_local.date())
-                sensor_reading = _apply_sensor_reading(state, pot, current_date, observed_local, sensor_context)
+                _apply_hourly_environment(
+                    state,
+                    pot,
+                    hour_weather,
+                    day_profile,
+                    observed_local.date(),
+                    rain_exposure_factor=_rain_exposure_factor(pot, observed_local.date()),
+                )
+                _apply_sensor_calibration_marker(state, pot, current_date, observed_local, sensor_context, day_profile)
 
-                slot = _decision_slot(current_date, observed_local, day_profile)
                 if slot is None:
                     if _is_emergency_dryness(state, pot, current_date, observed_local):
-                        alerts.append(_alert_row(pot, hour_weather, "emergency_dryness", "warning", "Emergency dryness outside watering window"))
-                        daily_alerts += 1
-                        hourly_alerts += 1
+                        if record_date:
+                            alerts.append(_alert_row(pot, hour_weather, "emergency_dryness", "warning", "Emergency dryness outside watering window"))
+                            daily_alerts += 1
+                            hourly_alerts += 1
                     continue
 
-                rule_decision = _make_irrigation_decision(state, pot, hour_weather, day_profile, slot)
-                predicted_probability = model.predict(_anfis_inputs(state, hour_weather, sensor_reading))
+                anfis_input = _anfis_inputs(state, hour_weather, None, pot, day_profile)
+                rule_decision = _make_anfis_execution_decision(state, pot, hour_weather, day_profile, slot)
+                predicted_probability = model.predict(anfis_input)
                 probability_sum += predicted_probability
                 probability_count += 1
+                probability_max = max(probability_max, predicted_probability)
                 hourly_probability_sum += predicted_probability
                 hourly_probability_count += 1
+                hourly_probability_max = max(hourly_probability_max, predicted_probability)
 
-                hard_stop = rule_decision["reason_code"] in {
-                    "freeze_risk",
-                    "winter_conditions_not_met",
-                    "rain_sufficient",
-                    "second_watering_not_needed",
-                }
-                should_irrigate = (
-                    predicted_probability >= ANFIS_DECISION_THRESHOLD
-                    and not hard_stop
-                    and state.moisture < rule_decision["target_moisture_pct"]
-                )
+                valve_managed = _is_valve_managed_pot(pot, current_date)
 
                 decision = dict(rule_decision)
                 decision = _with_sensor_key(decision, pot, sensor_context)
-                decision["should_irrigate"] = should_irrigate
+                decision["should_irrigate"] = False
                 decision["predicted_probability"] = round(predicted_probability, 4)
+                decision["anfis_decision_threshold"] = current_decision_threshold
                 decision["predicted_category"] = probability_category(predicted_probability)
-                if should_irrigate:
-                    decision["reason_code"] = "anfis_probability_high"
-                    decision["reason_detail"] = f"ANFIS probability {predicted_probability:.2f} is above threshold {ANFIS_DECISION_THRESHOLD:.2f}."
-                elif not hard_stop:
-                    decision["reason_code"] = "anfis_probability_low"
-                    decision["reason_detail"] = f"ANFIS probability {predicted_probability:.2f} is below threshold {ANFIS_DECISION_THRESHOLD:.2f}."
+                decision["simulated_moisture_pct"] = decision["current_moisture_pct"]
+                decision["current_moisture_pct"] = round(anfis_input["moisture"], 2)
+                decision["anfis_input_moisture_pct"] = round(anfis_input["moisture"], 2)
+                decision["anfis_input_temperature_c"] = round(anfis_input["temperature"], 2)
+                decision["anfis_input_rain_mm"] = round(anfis_input["rain"], 2)
+                skip_reason = _three_input_irrigation_skip_reason(
+                    float(anfis_input["moisture"]),
+                    float(anfis_input["temperature"]),
+                    float(anfis_input["rain"]),
+                )
+                if skip_reason:
+                    decision["reason_code"] = f"anfis_{skip_reason['code']}"
+                    decision["reason_detail"] = skip_reason["detail"]
+                decision = _apply_cold_month_indoor_skip(decision, pot, current_date)
+                hard_stop = decision["reason_code"] in ANFIS_HARD_STOP_REASON_CODES
+                below_target = state.moisture < decision["target_moisture_pct"]
+                safety_threshold = _threshold_for_pot(pot, day_profile, slot)
+                trigger_threshold = _baseline_threshold_for_pot(pot, day_profile, slot)
+                below_trigger_threshold = state.moisture < trigger_threshold
+                decision["anfis_trigger_threshold_pct"] = round(trigger_threshold, 2)
+                below_safety_threshold = state.moisture < safety_threshold
+                decision["anfis_safety_threshold_pct"] = round(safety_threshold, 2)
+                decision["anfis_below_safety_threshold"] = below_safety_threshold
+                rain_policy = _baseline_rain_policy(pot, current_date, day_profile)
+                covered_rain_need = (
+                    _baseline_covered_rain_day(rain_policy, day_profile)
+                    and state.moisture < decision["target_moisture_pct"]
+                )
+                decision["anfis_covered_rain_need"] = covered_rain_need
 
-                decisions.append(decision)
-                daily_decisions += 1
-                hourly_decisions += 1
+                if record_date:
+                    decisions.append(decision)
+                    daily_decisions += 1
+                    hourly_decisions += 1
+                decision_by_pot_id[int(pot["id"])] = decision
+                slot_decisions.append(decision)
 
-                if should_irrigate:
-                    event = _with_event_sensor_key(_apply_irrigation_event(state, pot, hour_weather, decision), decision)
-                    events.append(event)
-                    daily_events += 1
-                    daily_water_ml += event["planned_volume_ml"]
-                    hourly_events += 1
-                    hourly_water_ml += event["planned_volume_ml"]
+                if not hard_stop and valve_managed and (
+                    (below_target and below_trigger_threshold)
+                    or covered_rain_need
+                ):
+                    eligible_decisions_by_zone.setdefault(pot["balcony_zone"], []).append(decision)
+                if not hard_stop and below_safety_threshold and valve_managed:
+                    safety_decisions_by_zone.setdefault(pot["balcony_zone"], []).append(decision)
 
-                if state.moisture > pot["moisture_max_pct"]:
-                    state.too_wet_hours += 1
-                    if state.too_wet_hours == 24:
-                        alerts.append(_alert_row(pot, hour_weather, "too_wet_too_long", "warning", "Pot stayed above maximum moisture for 24 hours"))
-                        daily_alerts += 1
-                        hourly_alerts += 1
+            snapshot_label = _daily_moisture_snapshot_label(current_date, observed_local, day_profile)
+            if record_date and snapshot_label:
+                _record_daily_moisture_snapshot(daily_moisture_tracker, pot_states, snapshot_label)
+
+            if slot is not None:
+                slot_average_probability = hourly_probability_sum / max(hourly_probability_count, 1)
+                slot_max_probability = hourly_probability_max
+                for decision in slot_decisions:
+                    decision["anfis_slot_average_probability"] = round(slot_average_probability, 4)
+                    decision["anfis_slot_average_probability_percent"] = round(slot_average_probability * 100.0, 2)
+                    decision["anfis_slot_max_probability"] = round(slot_max_probability, 4)
+                    decision["anfis_slot_max_probability_percent"] = round(slot_max_probability * 100.0, 2)
+
+                if slot_max_probability >= current_decision_threshold:
+                    for zone, eligible_decisions in eligible_decisions_by_zone.items():
+                        for decision in eligible_decisions:
+                            decision["should_irrigate"] = True
+                            decision["reason_code"] = "anfis_max_valve_probability_high"
+                            decision["reason_detail"] = (
+                                f"Max valve ANFIS probability {slot_max_probability:.2f} is above threshold "
+                                f"{current_decision_threshold:.2f}; average probability is {slot_average_probability:.2f}, "
+                                "and this pot is below target moisture."
+                                f"{_anfis_duration_policy_note(decision)}"
+                            )
+                        zone_trigger_decisions[zone] = eligible_decisions
+
+                    if zone_trigger_decisions:
+                        for decision in slot_decisions:
+                            if not decision.get("should_irrigate") and decision["reason_code"] not in ANFIS_HARD_STOP_REASON_CODES:
+                                decision["reason_code"] = "anfis_max_valve_high_pot_not_triggering"
+                                decision["reason_detail"] = (
+                                    f"Max valve ANFIS probability {slot_max_probability:.2f} is above threshold "
+                                    f"{current_decision_threshold:.2f}, but this pot is not a managed below-target trigger."
+                                )
+                    else:
+                        for decision in slot_decisions:
+                            if decision["reason_code"] not in ANFIS_HARD_STOP_REASON_CODES:
+                                decision["reason_code"] = "anfis_max_valve_high_no_moisture_deficit"
+                                decision["reason_detail"] = (
+                                    f"Max valve ANFIS probability {slot_max_probability:.2f} is above threshold "
+                                    f"{current_decision_threshold:.2f}, but no managed pot is below target moisture."
+                                )
+                elif safety_decisions_by_zone:
+                    for zone, safety_decisions in safety_decisions_by_zone.items():
+                        for decision in safety_decisions:
+                            decision["should_irrigate"] = True
+                            decision["reason_code"] = "anfis_moisture_safety_threshold"
+                            decision["reason_detail"] = (
+                                f"Moisture {decision['current_moisture_pct']:.1f}% is below safety threshold "
+                                f"{decision['anfis_safety_threshold_pct']:.1f}%; ANFIS probability "
+                                f"{slot_max_probability:.2f} is below threshold {current_decision_threshold:.2f}, "
+                                f"so a moisture safety override waters the valve zone."
+                                f"{_anfis_duration_policy_note(decision)}"
+                            )
+                        zone_trigger_decisions[zone] = safety_decisions
+
+                    for decision in slot_decisions:
+                        if not decision.get("should_irrigate") and decision["reason_code"] not in ANFIS_HARD_STOP_REASON_CODES:
+                            decision["reason_code"] = "anfis_probability_low_safety_not_triggering"
+                            decision["reason_detail"] = (
+                                f"ANFIS probability {slot_max_probability:.2f} is below threshold "
+                                f"{current_decision_threshold:.2f}; another managed pot in the valve zone "
+                                "triggered the moisture safety override."
+                            )
                 else:
-                    state.too_wet_hours = 0
+                    for decision in slot_decisions:
+                        if decision["reason_code"] not in ANFIS_HARD_STOP_REASON_CODES:
+                            decision["reason_code"] = "anfis_max_valve_probability_low"
+                            decision["reason_detail"] = (
+                                f"Max valve ANFIS probability {slot_max_probability:.2f} is below threshold "
+                                f"{current_decision_threshold:.2f}; average probability is {slot_average_probability:.2f}."
+                            )
 
-            if _uses_hourly_chart(start_date, end_date):
+                for zone in list(zone_trigger_decisions):
+                    trigger_decisions = zone_trigger_decisions[zone]
+                    if not _anfis_zone_cadence_blocks(
+                        last_irrigated_by_zone,
+                        zone,
+                        current_date,
+                        trigger_decisions,
+                        slot_max_probability,
+                        day_profile,
+                    ):
+                        continue
+                    cadence_days = _anfis_zone_cadence_days(day_profile)
+                    last_irrigated = last_irrigated_by_zone.get(zone)
+                    for decision in trigger_decisions:
+                        decision["should_irrigate"] = False
+                        decision["reason_code"] = "anfis_water_saving_cadence"
+                        decision["reason_detail"] = (
+                            f"ANFIS probability {slot_max_probability:.2f} is above threshold "
+                            f"{current_decision_threshold:.2f}, but valve zone {zone} was watered on "
+                            f"{last_irrigated.isoformat() if last_irrigated else 'a recent day'}; "
+                            f"water-saving cadence waits {cadence_days} days unless moisture is unsafe."
+                        )
+                    del zone_trigger_decisions[zone]
+
+                for zone, trigger_decisions in zone_trigger_decisions.items():
+                    trigger_pot_ids = [int(decision["pot_id"]) for decision in trigger_decisions]
+                    trigger_pot_codes = [decision["pot_code"] for decision in trigger_decisions if decision.get("pot_code")]
+                    zone_dose_factor = _anfis_zone_dose_factor(trigger_decisions, slot_max_probability, day_profile)
+                    for decision in trigger_decisions:
+                        decision["dose_factor"] = zone_dose_factor
+                        decision["dose_policy_source"] = "anfis_water_saving_policy"
+                        decision["reason_detail"] = (
+                            f"{decision['reason_detail']} Final ANFIS zone dose is "
+                            f"{zone_dose_factor * 100.0:.0f}% of calculated need."
+                        )
+
+                    def anfis_zone_decision(zone_pot: dict[str, Any], zone_decision: dict[str, Any]) -> dict[str, Any]:
+                        zone_decision["should_irrigate"] = True
+                        zone_decision["dose_factor"] = zone_dose_factor
+                        zone_decision["dose_policy_source"] = "anfis_water_saving_policy"
+                        zone_state = pot_states[zone_pot["id"]]
+                        zone_decision["full_dose_start_moisture_pct"] = round(zone_state.moisture, 2)
+                        return zone_decision
+
+                    zone_events = _execute_valve_zone_distribution(
+                        pot_states,
+                        zone_pots,
+                        zone,
+                        current_date,
+                        hour_weather,
+                        decision_by_pot_id,
+                        anfis_zone_decision,
+                        _baseline_irrigation_request,
+                        {
+                            "zone_triggered": True,
+                            "zone_trigger_pot_ids": trigger_pot_ids,
+                            "zone_trigger_pot_codes": trigger_pot_codes,
+                            "zone_dose_factor": zone_dose_factor,
+                            "zone": zone,
+                            "dose_policy_source": "anfis_water_saving_policy",
+                        },
+                    )
+                    for event in zone_events:
+                        if record_date:
+                            events.append(event)
+                            daily_events += 1
+                            daily_water_ml += event["planned_volume_ml"]
+                            hourly_events += 1
+                            hourly_water_ml += event["planned_volume_ml"]
+                    last_irrigated_by_zone[zone] = current_date
+
+                for pot in pots:
+                    state = pot_states[pot["id"]]
+                    if state.moisture > pot["moisture_max_pct"]:
+                        state.too_wet_hours += 1
+                        if record_date and state.too_wet_hours == 24:
+                            alerts.append(_alert_row(pot, hour_weather, "too_wet_too_long", "warning", "Pot stayed above maximum moisture for 24 hours"))
+                            daily_alerts += 1
+                            hourly_alerts += 1
+                    else:
+                        state.too_wet_hours = 0
+
+            if record_date and _uses_hourly_chart(start_date, end_date):
                 hourly_probability = hourly_probability_sum / hourly_probability_count if hourly_probability_count else 0.0
                 detail_entries.append(
                     _hourly_aggregate_entry(
@@ -2188,14 +3689,23 @@ def _run_anfis_daily_irrigation(
                         hourly_decisions,
                         hourly_alerts,
                         {
-                            **_hourly_line_metadata(sensor_context, current_date, observed_local, hour_weather),
+                            **_hourly_line_metadata(selected_sensor_context, current_date, observed_local, hour_weather),
                             "predicted_probability": round(hourly_probability, 4),
                             "predicted_probability_percent": round(hourly_probability * 100.0, 2),
+                            "trigger_probability": round(hourly_probability_max, 4),
+                            "trigger_probability_percent": round(hourly_probability_max * 100.0, 2),
+                            "anfis_decision_threshold": round(current_decision_threshold, 4),
+                            "anfis_decision_threshold_percent": round(current_decision_threshold * 100.0, 2),
                         },
                     )
                 )
 
+        if not record_date:
+            current_date += timedelta(days=1)
+            continue
+
         predicted_probability = probability_sum / max(probability_count, 1)
+        moisture_summary = _daily_moisture_summary(daily_moisture_tracker, pot_states)
         entries.append(
             _daily_aggregate_entry(
                 current_date,
@@ -2206,9 +3716,15 @@ def _run_anfis_daily_irrigation(
                 daily_decisions,
                 daily_alerts,
                 {
-                    **_daily_line_metadata(sensor_context, current_date, day_weather),
+                    **_daily_line_metadata(selected_sensor_context, current_date, day_weather),
                     "predicted_probability": round(predicted_probability, 4),
+                    "predicted_probability_percent": round(predicted_probability * 100.0, 2),
+                    "trigger_probability": round(probability_max, 4),
+                    "trigger_probability_percent": round(probability_max * 100.0, 2),
+                    "anfis_decision_threshold": round(current_decision_threshold, 4),
+                    "anfis_decision_threshold_percent": round(current_decision_threshold * 100.0, 2),
                 },
+                moisture_summary=moisture_summary,
             )
         )
         total_water_ml += daily_water_ml
@@ -2228,13 +3744,16 @@ def _run_anfis_daily_irrigation(
         alerts=alerts,
         start_date=start_date,
         end_date=end_date,
-        sensor_context=sensor_context,
+        sensor_context=selected_sensor_context,
     )
+    summary["stateSimulationStartDate"] = simulation_start_date.isoformat()
+    summary["stateLookbackDays"] = (end_date - simulation_start_date).days + 1
+    summary["stateAnchorPolicy"] = "stable_historical_timeline"
+    if sensor_state_anchor is not None:
+        summary["anfisSensorStateAnchor"] = sensor_state_anchor
     summary["potIrrigationDecisions"] = total_irrigation_decisions
     summary["potIrrigationActions"] = len(events)
     summary["decisionLevel"] = "valve_zone"
-    if persist:
-        _persist_daily_results("anfis", start_date, end_date, decisions, events, alerts)
     chart_entries = _chart_entries_for_range(start_date, end_date, entries, detail_entries)
     _add_chart_summary(summary, chart_entries, start_date, end_date)
     return {
@@ -2323,6 +3842,7 @@ def _hourly_aggregate_entry(
         "max_moisture": round(max(moistures), 2),
         "temperature": round(temperature, 2),
         "max_temperature": round(temperature, 2),
+        "min_temperature": round(day_profile["min_temperature_c"], 2),
         "humidity": round(humidity, 2),
         "cloud_cover_pct": round(cloud_cover, 2),
         "rain_prediction": rain_amount >= 0.5,
@@ -2353,21 +3873,27 @@ def _daily_aggregate_entry(
     daily_decisions: int,
     daily_alerts: int,
     extra: dict[str, Any] | None = None,
+    moisture_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    moistures = [state.moisture for state in pot_states.values()]
-    avg_moisture = sum(moistures) / max(len(moistures), 1)
+    moisture = moisture_summary or _daily_moisture_summary(_new_daily_moisture_tracker(), pot_states)
     valve_runs = max(0, int(daily_events or 0))
     entry = {
         "date": current_date.isoformat(),
         "timestamp": datetime.combine(current_date, time(12, 0), tzinfo=LOCAL_TZ).isoformat(),
         "day_label": current_date.strftime("%Y-%m-%d"),
         "chart_label": current_date.strftime("%Y-%m-%d"),
-        "moisture": round(avg_moisture, 2),
-        "average_moisture": round(avg_moisture, 2),
-        "min_moisture": round(min(moistures), 2),
-        "max_moisture": round(max(moistures), 2),
+        "moisture": moisture["moisture"],
+        "average_moisture": moisture["average_moisture"],
+        "min_moisture": moisture["min_moisture"],
+        "max_moisture": moisture["max_moisture"],
+        "moisture_sample_count": moisture.get("moisture_sample_count", 0),
+        "moisture_sample_method": moisture.get("moisture_sample_method", "end_of_day"),
+        "moisture_sample_labels": moisture.get("moisture_sample_labels", []),
+        "pre_irrigation_moisture": moisture.get("pre_irrigation_moisture"),
+        "post_irrigation_moisture": moisture.get("post_irrigation_moisture"),
         "temperature": round(day_profile["avg_temperature_c"], 2),
         "max_temperature": round(day_profile["max_temperature_c"], 2),
+        "min_temperature": round(day_profile["min_temperature_c"], 2),
         "humidity": round(day_profile["avg_humidity_pct"], 2),
         "cloud_cover_pct": round(day_profile["avg_cloud_cover_pct"], 2),
         "rain_prediction": day_profile["precipitation_mm"] >= 0.5,
@@ -2431,8 +3957,20 @@ def _day_profile(day: date, day_weather: list[dict[str, Any]], weather_by_day: d
     reference_et = sum(_hourly_reference_et_mm(row) for row in day_weather)
     rain_probabilities = [_number(row.get("precipitation_probability_pct"), 0.0) for row in day_weather]
     gusts = [_number(row["wind_gust_kmh"], _number(row["wind_speed_kmh"], 0.0)) for row in day_weather]
+    lookahead_rows = [
+        row
+        for offset in range(BASELINE_WINTER_LOOKAHEAD_DAYS)
+        for row in weather_by_day.get(day + timedelta(days=offset), [])
+    ]
+    lookahead_temperatures = [_number(row["temperature_c"], 20.0) for row in lookahead_rows] or temperatures
+    lookahead_precipitation = sum(_number(row["precipitation_mm"], 0.0) for row in lookahead_rows)
+    lookahead_probabilities = [
+        _number(row.get("precipitation_probability_pct"), 0.0)
+        for row in lookahead_rows
+    ]
     freeze_risk = min(temperatures) <= 0 or _upcoming_freeze(day, weather_by_day)
     no_rain_10_days = _precipitation_last_days(day, weather_by_day, days=10) < 1.0
+    dry_streak_days = _dry_streak_days(day, weather_by_day)
 
     max_temperature = max(temperatures)
     max_gust = max(gusts)
@@ -2441,20 +3979,39 @@ def _day_profile(day: date, day_weather: list[dict[str, Any]], weather_by_day: d
 
     return {
         "season": _season(day),
+        "dormant_period": day.month in {12, 1, 2, 3},
         "avg_temperature_c": sum(temperatures) / max(len(temperatures), 1),
         "max_temperature_c": max_temperature,
         "min_temperature_c": min(temperatures),
         "avg_humidity_pct": avg_humidity,
         "avg_cloud_cover_pct": avg_cloud_cover,
         "precipitation_mm": precipitation,
+        "precipitation_next_14_days_mm": lookahead_precipitation,
         "reference_evapotranspiration_mm": reference_et,
         "max_precipitation_probability_pct": max(rain_probabilities) if rain_probabilities else 0.0,
+        "max_precipitation_probability_next_14_days_pct": max(lookahead_probabilities) if lookahead_probabilities else 0.0,
         "max_wind_gust_kmh": max_gust,
+        "min_temperature_next_14_days_c": min(lookahead_temperatures),
         "heatwave_day": max_temperature >= 30.0,
         "dry_windy_day": max_gust >= 35.0 and avg_humidity <= 55.0,
         "freeze_risk": freeze_risk,
         "no_rain_10_days": no_rain_10_days,
+        "dry_streak_days": dry_streak_days,
     }
+
+
+def _dry_streak_days(day: date, weather_by_day: dict[date, list[dict[str, Any]]]) -> int:
+    streak = 0
+    current = day
+    while True:
+        rows = weather_by_day.get(current)
+        if not rows:
+            return streak
+        precipitation = sum(_number(row.get("precipitation_mm"), 0.0) for row in rows)
+        if precipitation >= 0.5:
+            return streak
+        streak += 1
+        current -= timedelta(days=1)
 
 
 def _weather_cloud_cover_pct(weather: dict[str, Any], default: float) -> float:
@@ -2477,10 +4034,15 @@ def _hourly_reference_et_mm(weather: dict[str, Any]) -> float:
     return max(0.01, 0.025 + (temp / 38.0) * ((100.0 - humidity) / 100.0) * (1.0 + wind / 45.0))
 
 
-def _apply_hourly_environment(state: PotState, pot: dict[str, Any], weather: dict[str, Any], day_profile: dict[str, Any], local_day: date) -> None:
-    outdoor_by_season = pot.get("_outdoor_by_season")
-    outdoor = bool(outdoor_by_season.get(day_profile["season"])) if outdoor_by_season is not None else _is_outdoor(pot, local_day)
-    if outdoor:
+def _apply_hourly_environment(
+    state: PotState,
+    pot: dict[str, Any],
+    weather: dict[str, Any],
+    day_profile: dict[str, Any],
+    local_day: date,
+    rain_exposure_factor: float = 1.0,
+) -> None:
+    if _is_outdoor(pot, local_day):
         evap_mm = _number(weather["evapotranspiration_mm"], None)
         if evap_mm is None:
             temp = _number(weather["temperature_c"], 20.0)
@@ -2493,13 +4055,32 @@ def _apply_hourly_environment(state: PotState, pot: dict[str, Any], weather: dic
             loss *= 1.12
         elif pot["plant_type_code"] == "succulents":
             loss *= 0.48
+        loss *= _low_retention_drydown_multiplier(pot)
 
-        rain_gain = min(8.0, _number(weather["precipitation_mm"], 0.0) * 0.85)
+        effective_rain_mm = _number(weather["precipitation_mm"], 0.0) * _clamp(rain_exposure_factor, 0.0, 1.0)
+        rain_gain = min(8.0, effective_rain_mm * 0.85)
         state.moisture += rain_gain - loss
     else:
-        state.moisture -= 0.018 if pot["plant_type_code"] != "succulents" else 0.006
+        state.moisture -= _indoor_hourly_moisture_loss(pot, local_day)
 
-    state.moisture = _clamp(state.moisture, 0.0, 100.0)
+    state.moisture = _clamp(state.moisture, _minimum_realistic_moisture(pot, local_day), 100.0)
+
+
+def _low_retention_drydown_multiplier(pot: dict[str, Any]) -> float:
+    retention = _clamp(_number(pot.get("retention_factor"), 1.0), 0.1, 2.0)
+    return 1.0 + max(0.0, 1.0 - retention) * 0.65
+
+
+def _indoor_hourly_moisture_loss(pot: dict[str, Any], local_day: date) -> float:
+    if local_day.month in {11, 12, 1, 2, 3}:
+        return 0.003 if pot["plant_type_code"] != "succulents" else 0.001
+    return 0.018 if pot["plant_type_code"] != "succulents" else 0.006
+
+
+def _minimum_realistic_moisture(pot: dict[str, Any], local_day: date) -> float:
+    if local_day.month in {11, 12, 1, 2, 3}:
+        return max(8.0, float(pot["winter_moisture_target_pct"]) - 6.0)
+    return max(7.0, float(pot["moisture_min_pct"]) - 8.0)
 
 
 def _generate_database_anfis_dataset(
@@ -2512,55 +4093,158 @@ def _generate_database_anfis_dataset(
     day_profiles: dict[date, dict[str, Any]] | None = None,
 ) -> list[dict[str, float | str]]:
     rng = random.Random(seed)
+    if not sensor_context or not sensor_context.get("available"):
+        return []
+
+    pot_by_sensor_id = {int(pot["id"]): pot for pot in pots}
+    lookup = sensor_context.get("lookup") or {}
     weather_by_day = weather_by_day or _group_weather_by_day(weather_rows)
     day_profiles = day_profiles or {}
-    dataset = []
+    dataset: list[dict[str, float | str]] = []
+    seen: set[tuple[date, time, int]] = set()
 
-    for _ in range(samples):
-        weather = rng.choice(weather_rows)
-        pot = rng.choice(pots)
-        observed_local = _local_observed_at(weather)
-        observed_date = observed_local.date()
-        day_weather = weather_by_day.get(observed_date, [weather])
-        day_profile = day_profiles.get(observed_date) or _day_profile(observed_date, day_weather, weather_by_day)
-        threshold = _threshold_for_pot(pot, day_profile, "morning")
-        target = pot["moisture_target_pct"]
-        sensor_reading = _sensor_reading_for_pot(
-            sensor_context,
-            pot,
-            observed_local.date(),
-            observed_local.hour,
-        )
+    sorted_keys = sorted(
+        lookup.keys(),
+        key=lambda item: (item[0], _sensor_lookup_time(item[1]), int(item[2])),
+    )
+    for reading_date, slot_time, sensor_id in sorted_keys:
+        slot_time = _sensor_lookup_time(slot_time)
+        key = (reading_date, slot_time, int(sensor_id))
+        if key in seen:
+            continue
+        seen.add(key)
 
-        if sensor_reading:
-            moisture = _number(sensor_reading["soil_moisture_pct"], target)
-            temperature = _number(sensor_reading["air_temperature_c"], _number(weather["temperature_c"], 20.0))
-            humidity = _number(sensor_reading["air_humidity_pct"], _number(weather["relative_humidity_pct"], 60.0))
-        else:
-            moisture = _clamp(rng.gauss(target, 16.0), 0.0, 100.0)
-            temperature = _number(weather["temperature_c"], 20.0)
-            humidity = _number(weather["relative_humidity_pct"], 60.0)
+        pot = pot_by_sensor_id.get(int(sensor_id))
+        if pot is None:
+            continue
+        sensor_reading = _lookup_sensor_reading(lookup, reading_date, slot_time, int(sensor_id))
+        if sensor_reading is None:
+            continue
 
-        if day_profile["freeze_risk"] or day_profile["precipitation_mm"] >= 2.0 and moisture > threshold * 0.85:
-            probability = 0.12
-        elif moisture < threshold:
-            probability = 0.85
-        elif moisture < target and (temperature >= 28.0 or day_profile["dry_windy_day"]):
-            probability = 0.52
-        else:
-            probability = 0.18
+        day_weather = weather_by_day.get(reading_date, [])
+        if not day_weather:
+            continue
+        observed_at = datetime.combine(reading_date, slot_time, tzinfo=LOCAL_TZ)
+        weather = _weather_for_hour(day_weather, observed_at)
+        if weather is None:
+            continue
+        day_profile = day_profiles.get(reading_date) or _day_profile(reading_date, day_weather, weather_by_day)
+        decision_slot = _baseline_decision_slot(reading_date, observed_at, day_profile)
+        if decision_slot is None:
+            decision_slot = _anfis_training_slot(reading_date, day_profile, rng)
 
-        dataset.append(
-            {
-                "moisture": float(moisture),
-                "temperature": float(temperature),
-                "humidity": float(humidity),
-                "target_probability": probability,
-                "target_category": probability_category(probability),
-            }
-        )
+        example = _anfis_training_example(pot, sensor_reading, weather, day_profile, decision_slot)
+        if example is not None:
+            dataset.append(example)
 
+    if samples > 0 and len(dataset) > samples:
+        return rng.sample(dataset, samples)
     return dataset
+
+
+def _split_anfis_dataset(
+    dataset: list[dict[str, float | str]],
+    train_samples: int,
+    test_samples: int,
+    seed: int | None = None,
+) -> tuple[list[dict[str, float | str]], list[dict[str, float | str]]]:
+    if len(dataset) == 1:
+        return dataset, dataset
+
+    rng = random.Random(seed)
+    requested_train = max(1, train_samples)
+    requested_test = max(1, test_samples)
+    requested_total = min(len(dataset), requested_train + requested_test)
+    working = rng.sample(dataset, requested_total) if len(dataset) > requested_total else list(dataset)
+    rng.shuffle(working)
+
+    train_count = min(requested_train, max(1, len(working) - 1))
+    remaining = len(working) - train_count
+    if remaining <= 0:
+        train_count = max(1, len(working) - 1)
+    test_count = min(requested_test, len(working) - train_count)
+    test_dataset = _stratified_anfis_test_sample(working, test_count, rng)
+    test_ids = {id(item) for item in test_dataset}
+    train_dataset = [item for item in working if id(item) not in test_ids][:train_count]
+    if not test_dataset:
+        test_dataset = train_dataset
+    if not train_dataset:
+        train_dataset = test_dataset
+    return train_dataset, test_dataset
+
+
+def _stratified_anfis_test_sample(
+    dataset: list[dict[str, float | str]],
+    test_count: int,
+    rng: random.Random,
+) -> list[dict[str, float | str]]:
+    if test_count <= 0:
+        return []
+
+    by_category: dict[str, list[dict[str, float | str]]] = {}
+    for item in dataset:
+        by_category.setdefault(str(item.get("target_category", "unknown")), []).append(item)
+    for rows in by_category.values():
+        rng.shuffle(rows)
+
+    selected: list[dict[str, float | str]] = []
+    for rows in by_category.values():
+        category_count = int(round(test_count * len(rows) / len(dataset)))
+        if category_count == 0 and len(rows) > 1 and len(selected) < test_count:
+            category_count = 1
+        category_count = min(category_count, len(rows) - 1 if len(rows) > 1 else len(rows))
+        selected.extend(rows[:category_count])
+
+    if len(selected) < test_count:
+        selected_ids = {id(item) for item in selected}
+        remaining = [item for item in dataset if id(item) not in selected_ids]
+        rng.shuffle(remaining)
+        selected.extend(remaining[: test_count - len(selected)])
+    elif len(selected) > test_count:
+        rng.shuffle(selected)
+        selected = selected[:test_count]
+
+    return selected
+
+
+def _anfis_training_example(
+    pot: dict[str, Any],
+    sensor_reading: dict[str, Any],
+    weather: dict[str, Any],
+    day_profile: dict[str, Any],
+    slot: str,
+) -> dict[str, float | str] | None:
+    moisture = _number(sensor_reading.get("soil_moisture_pct"), None)
+    if moisture is None:
+        return None
+
+    state = PotState(moisture=_clamp(float(moisture), 0.0, 100.0))
+    inputs = _anfis_inputs(state, weather, sensor_reading, pot, day_profile)
+    probability = _anfis_training_target_probability(inputs)
+    return {
+        **inputs,
+        "target_probability": probability,
+        "target_category": probability_category(probability),
+    }
+
+
+def _anfis_training_target_probability(
+    inputs: dict[str, float],
+) -> float:
+    probability = target_probability(
+        float(inputs["moisture"]),
+        float(inputs["temperature"]),
+        float(inputs["rain"]),
+    )
+    return round(_clamp(probability, 0.02, 0.95), 4)
+
+
+def _anfis_training_slot(observed_date: date, day_profile: dict[str, Any], rng: random.Random) -> str:
+    if observed_date.month in {12, 1, 2, 3}:
+        return "winter_check"
+    if _number(day_profile.get("max_temperature_c"), 20.0) >= 32.0 and rng.random() < 0.35:
+        return "evening"
+    return "morning"
 
 
 def _evaluate_anfis_model(model: ANFIS, dataset: list[dict[str, float | str]]) -> dict[str, Any]:
@@ -2578,380 +4262,6 @@ def _evaluate_anfis_model(model: ANFIS, dataset: list[dict[str, float | str]]) -
         "test_mse": round(mse, 6),
         "test_accuracy_percent": round(matches / max(len(dataset), 1) * 100.0, 2),
         "test_samples": len(dataset),
-    }
-
-
-def _persist_daily_results(
-    experiment_type: str,
-    start_date: date,
-    end_date: date,
-    decisions: list[dict[str, Any]],
-    events: list[dict[str, Any]],
-    alerts: list[dict[str, Any]],
-) -> None:
-    start_ts = datetime.combine(start_date, time.min, tzinfo=LOCAL_TZ)
-    end_ts = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=LOCAL_TZ)
-    current_day = datetime.now(LOCAL_TZ).date()
-    current_day_start = datetime.combine(current_day, time.min, tzinfo=LOCAL_TZ)
-    current_day_end = current_day_start + timedelta(days=1)
-    with get_connection() as conn:
-        conn.execute(
-            """
-            UPDATE irrigation_actuations
-            SET status = 'cancelled',
-                changed_at = now()
-            WHERE status = 'planned'
-              AND (
-                    scheduled_start_at < %(current_day_start)s
-                 OR scheduled_start_at >= %(current_day_end)s
-              )
-            """,
-            {
-                "current_day_start": current_day_start,
-                "current_day_end": current_day_end,
-            },
-        )
-        conn.execute(
-            """
-            UPDATE irrigation_actuations
-            SET status = 'cancelled',
-                changed_at = now()
-            WHERE experiment_type = %(experiment_type)s
-              AND scheduled_start_at >= %(start_ts)s
-              AND scheduled_start_at < %(end_ts)s
-              AND status = 'planned'
-            """,
-            {"experiment_type": experiment_type, "start_ts": start_ts, "end_ts": end_ts},
-        )
-        conn.execute(
-            """
-            UPDATE irrigation_events
-            SET status = 'cancelled',
-                changed_at = now()
-            WHERE experiment_type = %(experiment_type)s
-              AND scheduled_start_at >= %(start_ts)s
-              AND scheduled_start_at < %(end_ts)s
-              AND status = 'planned'
-            """,
-            {"experiment_type": experiment_type, "start_ts": start_ts, "end_ts": end_ts},
-        )
-        decision_rows = _decision_persist_rows(experiment_type, decisions)
-        if decision_rows:
-            conn.execute(
-                """
-                WITH input_rows AS (
-                    SELECT *
-                    FROM jsonb_to_recordset(%(rows)s::jsonb) AS x(
-                        experiment_type text,
-                        sensor_id bigint,
-                        decided_at timestamptz,
-                        decision_date date,
-                        decision_slot text,
-                        should_irrigate boolean,
-                        reason_code text,
-                        reason_detail text,
-                        current_moisture_pct numeric,
-                        target_moisture_pct numeric,
-                        weather_hourly_id bigint
-                    )
-                )
-                INSERT INTO irrigation_decisions (
-                    experiment_type, sensor_id, decided_at, decision_date, decision_slot, should_irrigate,
-                    reason_code, reason_detail, current_moisture_pct, target_moisture_pct,
-                    weather_hourly_id
-                )
-                SELECT
-                    experiment_type, sensor_id, decided_at, decision_date, decision_slot, should_irrigate,
-                    reason_code, reason_detail, current_moisture_pct, target_moisture_pct,
-                    weather_hourly_id
-                FROM input_rows
-                ON CONFLICT (experiment_type, sensor_id, decided_at, decision_slot) DO UPDATE SET
-                    decision_date = EXCLUDED.decision_date,
-                    should_irrigate = EXCLUDED.should_irrigate,
-                    reason_code = EXCLUDED.reason_code,
-                    reason_detail = EXCLUDED.reason_detail,
-                    current_moisture_pct = EXCLUDED.current_moisture_pct,
-                    target_moisture_pct = EXCLUDED.target_moisture_pct,
-                    weather_hourly_id = EXCLUDED.weather_hourly_id,
-                    changed_at = now()
-                """,
-                {"rows": Jsonb(decision_rows)},
-            )
-
-        decision_ids = _load_persisted_decision_ids(conn, experiment_type, start_ts, end_ts)
-        event_rows = _event_persist_rows(experiment_type, events, decision_ids)
-        if event_rows:
-            conn.execute(
-                """
-                WITH input_rows AS (
-                    SELECT *
-                    FROM jsonb_to_recordset(%(rows)s::jsonb) AS x(
-                        experiment_type text,
-                        decision_id bigint,
-                        sensor_id bigint,
-                        scheduled_start_at timestamptz,
-                        scheduled_end_at timestamptz,
-                        flow_rate_ml_min numeric,
-                        planned_volume_ml numeric,
-                        cycle_count integer,
-                        soak_pause_min integer
-                    )
-                )
-                INSERT INTO irrigation_events (
-                    experiment_type, decision_id, sensor_id, scheduled_start_at, scheduled_end_at,
-                    flow_rate_ml_min, planned_volume_ml, cycle_count, soak_pause_min, status
-                )
-                SELECT
-                    experiment_type, decision_id, sensor_id, scheduled_start_at, scheduled_end_at,
-                    flow_rate_ml_min, planned_volume_ml, cycle_count, soak_pause_min, 'planned'
-                FROM input_rows
-                ON CONFLICT (experiment_type, sensor_id, scheduled_start_at) DO UPDATE SET
-                    decision_id = EXCLUDED.decision_id,
-                    scheduled_end_at = EXCLUDED.scheduled_end_at,
-                    flow_rate_ml_min = EXCLUDED.flow_rate_ml_min,
-                    planned_volume_ml = EXCLUDED.planned_volume_ml,
-                    cycle_count = EXCLUDED.cycle_count,
-                    soak_pause_min = EXCLUDED.soak_pause_min,
-                    status = CASE
-                        WHEN irrigation_events.status IN ('completed', 'running') THEN irrigation_events.status
-                        ELSE EXCLUDED.status
-                    END,
-                    changed_at = now()
-                """,
-                {"rows": Jsonb(event_rows)},
-            )
-
-        event_ids = _load_persisted_event_ids(conn, experiment_type, start_ts, end_ts)
-        current_day_event_rows = [
-            event
-            for event in event_rows
-            if _local_date(event["scheduled_start_at"]) == current_day
-        ]
-        actuation_rows = _actuation_persist_rows(current_day_event_rows, event_ids)
-        if actuation_rows:
-            conn.execute(
-                """
-                WITH input_rows AS (
-                    SELECT *
-                    FROM jsonb_to_recordset(%(rows)s::jsonb) AS x(
-                        event_id bigint,
-                        experiment_type text,
-                        pot_id bigint,
-                        scheduled_start_at timestamptz,
-                        scheduled_end_at timestamptz,
-                        flow_rate_ml_min numeric,
-                        planned_volume_ml numeric,
-                        cycle_count integer,
-                        soak_pause_min integer
-                    )
-                )
-                INSERT INTO irrigation_actuations (
-                    event_id, experiment_type, pot_id, scheduled_start_at, scheduled_end_at,
-                    flow_rate_ml_min, planned_volume_ml, cycle_count, soak_pause_min, status
-                )
-                SELECT
-                    event_id, experiment_type, pot_id, scheduled_start_at, scheduled_end_at,
-                    flow_rate_ml_min, planned_volume_ml, cycle_count, soak_pause_min, 'planned'
-                FROM input_rows
-                ON CONFLICT (experiment_type, pot_id, scheduled_start_at) DO UPDATE SET
-                    event_id = EXCLUDED.event_id,
-                    scheduled_end_at = EXCLUDED.scheduled_end_at,
-                    flow_rate_ml_min = EXCLUDED.flow_rate_ml_min,
-                    planned_volume_ml = EXCLUDED.planned_volume_ml,
-                    cycle_count = EXCLUDED.cycle_count,
-                    soak_pause_min = EXCLUDED.soak_pause_min,
-                    status = CASE
-                        WHEN irrigation_actuations.status IN ('completed', 'running') THEN irrigation_actuations.status
-                        ELSE EXCLUDED.status
-                    END,
-                    changed_at = now()
-                """,
-                {"rows": Jsonb(actuation_rows)},
-            )
-
-        alert_rows = _alert_persist_rows(experiment_type, alerts)
-        if alert_rows:
-            conn.execute(
-                """
-                WITH input_rows AS (
-                    SELECT *
-                    FROM jsonb_to_recordset(%(rows)s::jsonb) AS x(
-                        experiment_type text,
-                        pot_id bigint,
-                        raised_at timestamptz,
-                        alert_type text,
-                        severity text,
-                        title text,
-                        detail text
-                    )
-                )
-                INSERT INTO alerts (experiment_type, pot_id, raised_at, alert_type, severity, title, detail)
-                SELECT experiment_type, pot_id, raised_at, alert_type, severity, title, detail
-                FROM input_rows
-                ON CONFLICT (experiment_type, pot_id, raised_at, alert_type) DO UPDATE SET
-                    severity = EXCLUDED.severity,
-                    title = EXCLUDED.title,
-                    detail = EXCLUDED.detail,
-                    changed_at = now()
-                """,
-                {"rows": Jsonb(alert_rows)},
-            )
-        conn.commit()
-
-
-def _decision_persist_rows(experiment_type: str, decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    rows_by_key: dict[tuple[str, int, str, str], dict[str, Any]] = {}
-    for decision in decisions:
-        sensor_id = int(decision.get("sensor_id", decision["pot_id"]))
-        row = {
-            "experiment_type": experiment_type,
-            "sensor_id": sensor_id,
-            "decided_at": decision["decided_at"],
-            "decision_date": decision["date"],
-            "decision_slot": decision["slot"],
-            "should_irrigate": bool(decision["should_irrigate"]),
-            "reason_code": decision["reason_code"],
-            "reason_detail": decision["reason_detail"],
-            "current_moisture_pct": decision.get("current_moisture_pct"),
-            "target_moisture_pct": decision.get("target_moisture_pct"),
-            "weather_hourly_id": decision.get("weather_hourly_id"),
-        }
-        key = (experiment_type, sensor_id, _local_timestamp_key(row["decided_at"]), row["decision_slot"])
-        if key in rows_by_key:
-            rows_by_key[key] = _merge_sensor_decision_row(rows_by_key[key], row)
-        else:
-            rows_by_key[key] = row
-    return list(rows_by_key.values())
-
-
-def _merge_sensor_decision_row(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
-    if incoming["should_irrigate"] and not existing["should_irrigate"]:
-        merged = dict(incoming)
-    else:
-        merged = dict(existing)
-        merged["should_irrigate"] = bool(existing["should_irrigate"] or incoming["should_irrigate"])
-    if existing.get("current_moisture_pct") is not None and incoming.get("current_moisture_pct") is not None:
-        merged["current_moisture_pct"] = min(existing["current_moisture_pct"], incoming["current_moisture_pct"])
-    if existing.get("target_moisture_pct") is not None and incoming.get("target_moisture_pct") is not None:
-        merged["target_moisture_pct"] = max(existing["target_moisture_pct"], incoming["target_moisture_pct"])
-    return merged
-
-
-def _event_persist_rows(
-    experiment_type: str,
-    events: list[dict[str, Any]],
-    decision_ids: dict[tuple[int, str, str], int],
-) -> list[dict[str, Any]]:
-    rows_by_key: dict[tuple[str, int, str], dict[str, Any]] = {}
-    for event in events:
-        sensor_id = int(event.get("sensor_id", event["pot_id"]))
-        row = {
-            "experiment_type": experiment_type,
-            "decision_id": decision_ids.get((sensor_id, _local_timestamp_key(event["scheduled_start_at"]), event["slot"])),
-            "sensor_id": sensor_id,
-            "actuator_pot_id": int(event.get("pot_id", sensor_id)),
-            "scheduled_start_at": event["scheduled_start_at"],
-            "scheduled_end_at": event["scheduled_end_at"],
-            "flow_rate_ml_min": event["flow_rate_ml_min"],
-            "planned_volume_ml": event["planned_volume_ml"],
-            "cycle_count": int(event["cycle_count"]),
-            "soak_pause_min": int(event["soak_pause_min"]),
-        }
-        key = (experiment_type, sensor_id, _local_timestamp_key(row["scheduled_start_at"]))
-        if key in rows_by_key:
-            rows_by_key[key] = _merge_sensor_event_row(rows_by_key[key], row)
-        else:
-            rows_by_key[key] = row
-    return list(rows_by_key.values())
-
-
-def _merge_sensor_event_row(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(existing)
-    merged["planned_volume_ml"] = float(existing["planned_volume_ml"]) + float(incoming["planned_volume_ml"])
-    merged["flow_rate_ml_min"] = float(existing["flow_rate_ml_min"]) + float(incoming["flow_rate_ml_min"])
-    merged["scheduled_end_at"] = max(existing["scheduled_end_at"], incoming["scheduled_end_at"])
-    merged["cycle_count"] = max(int(existing["cycle_count"]), int(incoming["cycle_count"]))
-    merged["soak_pause_min"] = max(int(existing["soak_pause_min"]), int(incoming["soak_pause_min"]))
-    return merged
-
-
-def _actuation_persist_rows(
-    event_rows: list[dict[str, Any]],
-    event_ids: dict[tuple[int, str], int],
-) -> list[dict[str, Any]]:
-    return [
-        {
-            "event_id": event_ids.get((int(event["sensor_id"]), _local_timestamp_key(event["scheduled_start_at"]))),
-            "experiment_type": event["experiment_type"],
-            "pot_id": int(event.get("actuator_pot_id", event["sensor_id"])),
-            "scheduled_start_at": event["scheduled_start_at"],
-            "scheduled_end_at": event["scheduled_end_at"],
-            "flow_rate_ml_min": event["flow_rate_ml_min"],
-            "planned_volume_ml": event["planned_volume_ml"],
-            "cycle_count": event["cycle_count"],
-            "soak_pause_min": event["soak_pause_min"],
-        }
-        for event in event_rows
-    ]
-
-
-def _local_date(value: str | datetime) -> date:
-    if isinstance(value, str):
-        local_value = datetime.fromisoformat(value)
-    else:
-        local_value = value
-    if local_value.tzinfo is not None:
-        local_value = local_value.astimezone(LOCAL_TZ)
-    return local_value.date()
-
-
-def _alert_persist_rows(experiment_type: str, alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    rows_by_key: dict[tuple[str, int, str, str], dict[str, Any]] = {}
-    for alert in alerts:
-        row = {
-            "experiment_type": experiment_type,
-            "pot_id": int(alert["pot_id"]),
-            "raised_at": alert["raised_at"],
-            "alert_type": alert["alert_type"],
-            "severity": alert["severity"],
-            "title": alert["title"],
-            "detail": alert["detail"],
-        }
-        rows_by_key[(experiment_type, row["pot_id"], _local_timestamp_key(row["raised_at"]), row["alert_type"])] = row
-    return list(rows_by_key.values())
-
-
-def _load_persisted_decision_ids(conn, experiment_type: str, start_ts: datetime, end_ts: datetime) -> dict[tuple[int, str, str], int]:
-    rows = conn.execute(
-        """
-        SELECT id, sensor_id, decided_at AT TIME ZONE 'Europe/Bucharest' AS decided_local_at, decision_slot
-        FROM irrigation_decisions
-        WHERE experiment_type = %(experiment_type)s
-          AND decided_at >= %(start_ts)s
-          AND decided_at < %(end_ts)s
-        """,
-        {"experiment_type": experiment_type, "start_ts": start_ts, "end_ts": end_ts},
-    ).fetchall()
-    return {
-        (int(row[1]), _local_timestamp_key(row[2]), row[3]): int(row[0])
-        for row in rows
-    }
-
-
-def _load_persisted_event_ids(conn, experiment_type: str, start_ts: datetime, end_ts: datetime) -> dict[tuple[int, str], int]:
-    rows = conn.execute(
-        """
-        SELECT id, sensor_id, scheduled_start_at AT TIME ZONE 'Europe/Bucharest' AS scheduled_local_at
-        FROM irrigation_events
-        WHERE experiment_type = %(experiment_type)s
-          AND scheduled_start_at >= %(start_ts)s
-          AND scheduled_start_at < %(end_ts)s
-        """,
-        {"experiment_type": experiment_type, "start_ts": start_ts, "end_ts": end_ts},
-    ).fetchall()
-    return {
-        (int(row[1]), _local_timestamp_key(row[2])): int(row[0])
-        for row in rows
     }
 
 

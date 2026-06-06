@@ -15,9 +15,11 @@ sap.ui.define([
                 template: new ColumnListItem({
                     cells: [
                         new Text({ text: "{rank}" }),
+                        new Text({ text: "{valve_label}" }),
                         new Text({ text: "{pot_code}" }),
                         new Text({ text: "{pot_label}" }),
                         new Text({ text: "{balcony_zone}" }),
+                        new Text({ text: "{rain_exposure}" }),
                         new Text({ text: "{sun_exposure}" }),
                         new Text({ text: "{size_class}" }),
                         new Text({ text: "{plant_type_label}" }),
@@ -30,9 +32,11 @@ sap.ui.define([
 
         [
             ["Rank", "4rem"],
+            ["Valve", "5rem"],
             ["Code", "6rem"],
             ["Pot", "12rem"],
             ["Zone", "9rem"],
+            ["Rain", "9rem"],
             ["Sun", "8rem"],
             ["Size", "7rem"],
             ["Plant", "9rem"],

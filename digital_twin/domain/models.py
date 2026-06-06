@@ -27,9 +27,8 @@ class Pot:
     label: str
     size_class: str
     plant_type_code: str
-    default_location: str
-    winter_location: str
     balcony_zone: str
+    rain_exposure: str
     sun_exposure: str
     wind_exposure: str
     drip_flow_ml_min: Decimal

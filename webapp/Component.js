@@ -1,7 +1,8 @@
 sap.ui.define([
     "sap/ui/core/UIComponent",
+    "disertatie/model/flpUser",
     "disertatie/model/models"
-], (UIComponent, models) => {
+], (UIComponent, flpUser, models) => {
     "use strict";
 
     return UIComponent.extend("disertatie.Component", {
@@ -18,6 +19,7 @@ sap.ui.define([
 
             // set the device model
             this.setModel(models.createDeviceModel(), "device");
+            flpUser.install();
 
             // enable routing
             const router = this.getRouter();

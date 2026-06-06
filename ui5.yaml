@@ -26,3 +26,4 @@ server:
       configuration:
         flp:
           theme: sap_horizon
+          init: /model/flpUser

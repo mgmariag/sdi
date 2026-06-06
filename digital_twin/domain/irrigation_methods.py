@@ -14,7 +14,7 @@ METHOD_LABELS: dict[IrrigationMethod, str] = {
     IrrigationMethod.BASELINE: "Baseline",
     IrrigationMethod.SAMPLING: "Sampling",
     IrrigationMethod.ANFIS_GA: "ANFIS-GA",
-    IrrigationMethod.FUZZY_DT: "Fuzzy DT / FAO-PM",
+    IrrigationMethod.FUZZY_DT: "Fuzzy DT",
 }
 
 VALVE_ZONE_DESIGN = (
@@ -24,6 +24,7 @@ VALVE_ZONE_DESIGN = (
     {"valve_number": 4, "zone": "north_shelter"},
     {"valve_number": 5, "zone": "hanging_row"},
 )
+VALVE_COUNT = len(VALVE_ZONE_DESIGN)
 VALVE_ZONE_ORDER = {item["zone"]: item["valve_number"] for item in VALVE_ZONE_DESIGN}
 
-__all__ = ["IrrigationMethod", "METHOD_LABELS", "VALVE_ZONE_DESIGN", "VALVE_ZONE_ORDER"]
+__all__ = ["IrrigationMethod", "METHOD_LABELS", "VALVE_COUNT", "VALVE_ZONE_DESIGN", "VALVE_ZONE_ORDER"]

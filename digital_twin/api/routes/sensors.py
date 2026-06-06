@@ -10,13 +10,12 @@ from digital_twin.api.errors import http_error
 from digital_twin.core.config import get_settings
 from digital_twin.core.time import today_local
 from digital_twin.db.repositories.sensor_repository import OverviewRepository, PotRepository
-from digital_twin.services.sensor_placements import DEFAULT_SENSOR_COUNT, SensorPlacementService
+from digital_twin.services.sensor_placements import DEFAULT_SENSOR_COUNT, MIN_SENSOR_COUNT, SensorPlacementService
 from digital_twin.services.sensor_service import SensorService
 
 
 system_router = APIRouter()
 api_router = APIRouter(prefix="/api/sensors")
-service_router = APIRouter(prefix="/sensors")
 service = SensorService()
 placement_service = SensorPlacementService()
 overview_repository = OverviewRepository()
@@ -59,7 +58,7 @@ def _seed_sensor_history_if_placement_changed(result: dict) -> dict:
 
 @system_router.get("/")
 def root() -> dict[str, str]:
-    return {"message": "Digital Twin Irrigation API running"}
+    return {"message": "Smart Irrigation API running"}
 
 
 @system_router.get("/api/hello")
@@ -144,7 +143,7 @@ def api_sensor_placements():
 
 
 @api_router.post("/placements/recommend")
-def api_recommend_sensor_placements(count: int = Query(DEFAULT_SENSOR_COUNT, ge=1, le=500)):
+def api_recommend_sensor_placements(count: int = Query(DEFAULT_SENSOR_COUNT, ge=MIN_SENSOR_COUNT, le=500)):
     try:
         return _seed_sensor_history_if_placement_changed(placement_service.recommend(sensor_count=count))
     except Exception as exc:
@@ -152,62 +151,14 @@ def api_recommend_sensor_placements(count: int = Query(DEFAULT_SENSOR_COUNT, ge=
 
 
 @api_router.post("/placements/ensure")
-def api_ensure_sensor_placements(count: int = Query(DEFAULT_SENSOR_COUNT, ge=1, le=500)):
+def api_ensure_sensor_placements(count: int = Query(DEFAULT_SENSOR_COUNT, ge=MIN_SENSOR_COUNT, le=500)):
     try:
         return _seed_sensor_history_if_placement_changed(placement_service.ensure(sensor_count=count))
     except Exception as exc:
         raise http_error(exc, 500, "Sensor placement synchronization failed") from exc
 
 
-@service_router.get("/summary")
-def service_sensors_summary(source: str | None = Query(get_settings().sensor_source)):
-    try:
-        return service.summary(source=source)
-    except Exception as exc:
-        raise http_error(exc, 503, "Sensor readings unavailable") from exc
-
-
-@service_router.post("/cleanup")
-def service_cleanup_sensors(source: str | None = Query(get_settings().sensor_source)):
-    try:
-        return service.cleanup(source=source)
-    except Exception as exc:
-        raise http_error(exc, 500, "Sensor cleanup failed") from exc
-
-
-@service_router.post("/ingest")
-def service_ingest_actual_sensor_readings(payload: SensorReadingIngestRequest):
-    try:
-        return service.ingest_actual(payload.as_tool_readings(), recorded_at=payload.recorded_at)
-    except Exception as exc:
-        raise http_error(exc, 400, "Sensor ingestion failed") from exc
-
-
-@service_router.get("/placements")
-def service_sensor_placements():
-    try:
-        return placement_service.current()
-    except Exception as exc:
-        raise http_error(exc, 503, "Sensor placements unavailable") from exc
-
-
-@service_router.post("/placements/recommend")
-def service_recommend_sensor_placements(count: int = Query(DEFAULT_SENSOR_COUNT, ge=1, le=500)):
-    try:
-        return _seed_sensor_history_if_placement_changed(placement_service.recommend(sensor_count=count))
-    except Exception as exc:
-        raise http_error(exc, 500, "Sensor placement recommendation failed") from exc
-
-
-@service_router.post("/placements/ensure")
-def service_ensure_sensor_placements(count: int = Query(DEFAULT_SENSOR_COUNT, ge=1, le=500)):
-    try:
-        return _seed_sensor_history_if_placement_changed(placement_service.ensure(sensor_count=count))
-    except Exception as exc:
-        raise http_error(exc, 500, "Sensor placement synchronization failed") from exc
-
-
-@service_router.post("/seed")
+@api_router.post("/seed")
 def seed_sensors(
     start: date = Query(get_settings().sensor_history_start),
     end: date | None = Query(None),
@@ -222,7 +173,7 @@ def seed_sensors(
         raise http_error(exc, 500, "Sensor seeding failed") from exc
 
 
-@service_router.post("/run-due")
+@api_router.post("/run-due")
 def run_due_sensor_readings(source: str = Query(get_settings().sensor_source)):
     try:
         return {"items": service.generate_due(source=source)}
@@ -230,7 +181,7 @@ def run_due_sensor_readings(source: str = Query(get_settings().sensor_source)):
         raise http_error(exc, 500, "Sensor generation failed") from exc
 
 
-@service_router.post("/run-at")
+@api_router.post("/run-at")
 def run_sensor_readings_at(
     recorded_at: datetime = Query(...),
     source: str = Query(get_settings().sensor_source),

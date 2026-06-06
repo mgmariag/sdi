@@ -4,12 +4,12 @@ Master's thesis application for simulating and evaluating irrigation decisions w
 
 ## Architecture
 
-The application is organized around one FastAPI backend, one SAPUI5 frontend, and PostgreSQL:
+The application is organized around one FastAPI backend, one SAPUI5 frontend, and PostgreSQL. Sensor updates, weather refresh, prescription dispatch, and actuator consumption run as internal backend workers.
 
 | Service | Port | Responsibility |
 | --- | ---: | --- |
 | `frontend` | `8080` | SAPUI5 user interface served by Nginx |
-| `backend` | `8000` | API routes, weather/sensor ingestion, experiment execution, cached results |
+| `backend` | `8000` | API routes, weather/sensor ingestion, scheduled workers, default control execution, experiment execution, cached results |
 | `postgres` | `5432` | Shared persistent database |
 
 The frontend calls the backend through `/api/...`. The backend code lives under `digital_twin/`; legacy prototype folders were removed.
@@ -18,9 +18,11 @@ The frontend calls the backend through `/api/...`. The backend code lives under 
 
 - `digital_twin/api/` - FastAPI app factory and route modules.
 - `digital_twin/services/` - experiment, weather, irrigation, and sensor services.
+- `digital_twin/workers/` - internal schedulers for prescription dispatch and actuator consumption.
+- `digital_twin/control/` - default digital-twin irrigation control strategies.
 - `digital_twin/domain/` - domain models and irrigation method definitions.
 - `digital_twin/db/` - database connection, schema initialization, and repositories.
-- `digital_twin/experiments/` - baseline, sampling, ANFIS-GA, and fuzzy DT experiment wrappers.
+- `digital_twin/experiments/` - sampling, ANFIS-GA, and fuzzy DT experiment wrappers.
 - `digital_twin/simulation/` - split simulation engine, DTOs, soil/weather models, and irrigation controller logic.
 - `webapp/` - SAPUI5 frontend.
 

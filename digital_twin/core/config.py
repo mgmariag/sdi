@@ -70,6 +70,10 @@ class Settings:
     sensor_scheduler_enabled: bool = True
     sensor_cleanup_enabled: bool = True
     sensor_cleanup_time: time = time(3, 15)
+    prescription_scheduler_enabled: bool = True
+    prescription_dispatch_time: time = time(21, 0)
+    actuation_scheduler_enabled: bool = True
+    actuation_poll_seconds: int = 60
     experiment_snapshot_cache_ttl_seconds: int = 15 * 60
     experiment_precompute_related: bool = True
     experiment_precompute_anfis: bool = True
@@ -92,6 +96,10 @@ def get_settings() -> Settings:
         sensor_scheduler_enabled=_env_bool("SENSOR_SCHEDULER_ENABLED", True),
         sensor_cleanup_enabled=_env_bool("SENSOR_CLEANUP_ENABLED", True),
         sensor_cleanup_time=_env_time("SENSOR_CLEANUP_TIME", time(3, 15)),
+        prescription_scheduler_enabled=_env_bool("PRESCRIPTION_SCHEDULER_ENABLED", True),
+        prescription_dispatch_time=_env_time("PRESCRIPTION_DISPATCH_TIME", time(21, 0)),
+        actuation_scheduler_enabled=_env_bool("ACTUATION_SCHEDULER_ENABLED", True),
+        actuation_poll_seconds=_env_int("ACTUATION_POLL_SECONDS", 60),
         experiment_snapshot_cache_ttl_seconds=_env_int("EXPERIMENT_SNAPSHOT_CACHE_TTL_SECONDS", 15 * 60),
         experiment_precompute_related=_env_bool("EXPERIMENT_PRECOMPUTE_RELATED", True),
         experiment_precompute_anfis=_env_bool("EXPERIMENT_PRECOMPUTE_ANFIS", True),

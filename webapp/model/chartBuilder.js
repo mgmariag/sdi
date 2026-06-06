@@ -1,6 +1,13 @@
 sap.ui.define([], () => {
     "use strict";
 
+    const WATER_BAR_MAX_CHART_VALUE = 20;
+    const MOISTURE_THRESHOLD_PCT = 37;
+    const MOISTURE_THRESHOLD_COLOR = "#43bfd2";
+    const ANFIS_SCORE_MEASURE = "ANFIS-GA irrigation score (%)";
+    const FUZZY_SCORE_MEASURE = "Fuzzy irrigation score (%)";
+    const FUZZY_PRESCRIPTION_SCORE_MAX_MM = 8;
+
     function toChartNumber(value) {
         const numberValue = Number(value);
         return Number.isFinite(numberValue) ? numberValue : 0;
@@ -28,10 +35,25 @@ sap.ui.define([], () => {
                 chart_label: entry.chart_label || entry.day_label || entry.timestamp || ""
             });
             mappings.forEach((mapping) => {
-                const chartValue = maxWater > 0 ? (toChartNumber(entry[mapping.sourceKey]) / maxWater) * 20 : 0;
+                const chartValue = maxWater > 0
+                    ? (toChartNumber(entry[mapping.sourceKey]) / maxWater) * WATER_BAR_MAX_CHART_VALUE
+                    : 0;
                 output[mapping.targetKey] = Number(chartValue.toFixed(2));
             });
             return output;
+        });
+    }
+
+    function withDerivedChartFields(entries) {
+        const rows = Array.isArray(entries) ? entries : [];
+        return rows.map((entry) => {
+            const prescriptionScore = Math.min(
+                100,
+                Math.max(0, toChartNumber(entry.fuzzy_prescription_mm) / FUZZY_PRESCRIPTION_SCORE_MAX_MM * 100)
+            );
+            return Object.assign({}, entry, {
+                fuzzy_prescription_score_pct: Number(prescriptionScore.toFixed(2))
+            });
         });
     }
 
@@ -44,139 +66,348 @@ sap.ui.define([], () => {
         return Number.isNaN(parsed.getTime()) ? null : parsed;
     }
 
-    function withLineStyleMetadata(entries, summary) {
-        const rows = Array.isArray(entries) ? entries : [];
-        const now = new Date();
-
-        return rows.map((entry) => {
-            const output = Object.assign({}, entry);
-            const timestamp = entryTimestamp(entry);
-            const hasBackendProvenance = Object.prototype.hasOwnProperty.call(entry, "has_prediction_or_simulation")
-                || Object.prototype.hasOwnProperty.call(entry, "is_weather_prediction")
-                || Object.prototype.hasOwnProperty.call(entry, "is_sensor_prediction")
-                || Object.prototype.hasOwnProperty.call(entry, "is_sensor_simulated")
-                || Object.prototype.hasOwnProperty.call(entry, "is_sensor_missing_reading");
-            const fallbackPrediction = Boolean(!hasBackendProvenance && timestamp && timestamp > now);
-            const isPrediction = Boolean(entry.is_weather_prediction || entry.is_sensor_prediction || fallbackPrediction);
-            const isSimulatedHistory = Boolean(entry.is_sensor_simulated && timestamp && timestamp <= now);
-            output.is_prediction = isPrediction;
-            output.is_simulated_history = isSimulatedHistory;
-            output.has_interrupted_line = Boolean(
-                entry.has_prediction_or_simulation
-                || isPrediction
-                || entry.is_sensor_simulated
-                || entry.is_sensor_missing_reading
-            );
-            return output;
-        });
-    }
-
     function prepareChartResult(result, waterMappings) {
-        const entries = Array.isArray(result.entries) ? result.entries : [];
-        const chartEntries = Array.isArray(result.chartEntries) && result.chartEntries.length > 0 ? result.chartEntries : entries;
+        const entries = withDerivedChartFields(Array.isArray(result.entries) ? result.entries : []);
+        const chartEntries = Array.isArray(result.chartEntries) && result.chartEntries.length > 0
+            ? result.chartEntries
+            : entries;
         const usesDetailRows = result.summary && result.summary.chartGranularity && result.summary.chartGranularity !== "daily";
-        const tableEntries = usesDetailRows ? chartEntries : entries;
-        const scaledChartEntries = withScaledChartWater(chartEntries, waterMappings);
+        const tableEntries = usesDetailRows ? withDerivedChartFields(chartEntries) : entries;
+        const scaledChartEntries = withDerivedChartFields(withScaledChartWater(chartEntries, waterMappings));
         return Object.assign({}, result, {
             entries,
-            chartEntries: withLineStyleMetadata(scaledChartEntries, result.summary),
+            chartEntries: scaledChartEntries,
             tableEntries,
             pots: Array.isArray(result.pots) ? result.pots : []
         });
     }
 
+    const EXPERIMENT_CHART_IDS = [
+        "samplingMoistureChart",
+        "samplingContextChart",
+        "anfisMoistureChart",
+        "anfisContextChart",
+        "fuzzyMoistureChart",
+        "fuzzyContextChart"
+    ];
+
+    const CHART_DATA_PATHS = {
+        samplingMoistureChart: "/samplingChartEntries",
+        samplingContextChart: "/samplingChartEntries",
+        anfisMoistureChart: "/anfisChartEntries",
+        anfisContextChart: "/anfisChartEntries",
+        fuzzyMoistureChart: "/fuzzyChartEntries",
+        fuzzyContextChart: "/fuzzyChartEntries"
+    };
+
+    const CHART_SOURCE_DATA_PATHS = {
+        samplingMoistureChart: "/samplingChartAllEntries",
+        samplingContextChart: "/samplingChartAllEntries",
+        anfisMoistureChart: "/anfisChartAllEntries",
+        anfisContextChart: "/anfisChartAllEntries",
+        fuzzyMoistureChart: "/fuzzyChartAllEntries",
+        fuzzyContextChart: "/fuzzyChartAllEntries"
+    };
+
     const CHART_PALETTES = {
-        samplingChart: ["#4d82d8", "#9dbef7", "#43bfd2", "#b9e98e", "#f7df8a", "#56ccf2"],
-        anfisChart: ["#4d82d8", "#9dbef7", "#43bfd2", "#cdefa7", "#b9e98e", "#f7df8a", "#56ccf2"],
-        fuzzyChart: ["#4d82d8", "#9dbef7", "#43bfd2", "#d7b6dd", "#d5addd", "#f7df8a", "#56ccf2"]
+        samplingMoistureChart: ["#2FC2CC ", "#7FCF45"],
+        samplingContextChart: ["#2FC2CC ", "#7FCF45", "#b7d8ff", "#F4B740"],
+        anfisMoistureChart: ["#2FC2CC ", "#2b8cbe", "#7FCF45"],
+        anfisContextChart: ["#2FC2CC ", "#2b8cbe", "#b7d8ff", "#F4B740"],
+        fuzzyMoistureChart: ["#2FC2CC", "#ACA8F2", "#7FCF45"],
+        fuzzyContextChart: ["#2FC2CC", "#ACA8F2", "#b7d8ff", "#F4B740"]
     };
 
     const CHART_FORMATS = {
+        samplingMoistureChart: {
+            "Baseline Moisture": "DT_PERCENT",
+            "Sparse Moisture": "DT_PERCENT"
+        },
+        samplingContextChart: {
+            "Baseline Irrigation (L)": "DT_NUMBER",
+            "Sparse-Sensing Irrigation (L)": "DT_NUMBER",
+            "Rain (mm)": "DT_MM",
+            "Max Temperature (C)": "DT_CELSIUS"
+        },
+        anfisMoistureChart: {
+            "Baseline Moisture": "DT_PERCENT",
+            "ANFIS Moisture": "DT_PERCENT",
+            [ANFIS_SCORE_MEASURE]: "DT_PERCENT"
+        },
+        anfisContextChart: {
+            "Baseline Irrigation (L)": "DT_NUMBER",
+            "ANFIS Water Usage (L)": "DT_NUMBER",
+            "Rain (mm)": "DT_MM",
+            "Max Temperature (C)": "DT_CELSIUS"
+        },
+        fuzzyMoistureChart: {
+            "Baseline Moisture": "DT_PERCENT",
+            "Fuzzy Moisture": "DT_PERCENT",
+            [FUZZY_SCORE_MEASURE]: "DT_PERCENT"
+        },
+        fuzzyContextChart: {
+            "Baseline Irrigation (L)": "DT_NUMBER",
+            "Fuzzy Water Usage (L)": "DT_NUMBER",
+            "Rain (mm)": "DT_MM",
+            "Max Temperature (C)": "DT_CELSIUS"
+        },
         samplingChart: {
             "Baseline Moisture": "DT_PERCENT",
             "Baseline Water Usage (L)": "DT_NUMBER",
             "Sparse Moisture": "DT_PERCENT",
             "Sparse Water Usage (L)": "DT_NUMBER",
             "Max Temp (C)": "DT_CELSIUS",
-            "Rain (L/m2)": "DT_LM2"
+            "Rain (mm)": "DT_MM"
         },
         anfisChart: {
             "Baseline Moisture": "DT_PERCENT",
             "Baseline Water Usage (L)": "DT_NUMBER",
             "ANFIS Moisture": "DT_PERCENT",
-            "Predicted Probability": "DT_PERCENT",
             "ANFIS Water Usage (L)": "DT_NUMBER",
+            [ANFIS_SCORE_MEASURE]: "DT_PERCENT",
             "Max Temp (C)": "DT_CELSIUS",
-            "Rain (L/m2)": "DT_LM2"
+            "Rain (mm)": "DT_MM"
         },
         fuzzyChart: {
             "Baseline Moisture": "DT_PERCENT",
             "Baseline Water Usage (L)": "DT_NUMBER",
             "Fuzzy Moisture": "DT_PERCENT",
-            "Fuzzy Prescription (mm)": "DT_MM",
+            [FUZZY_SCORE_MEASURE]: "DT_PERCENT",
             "Fuzzy Water Usage (L)": "DT_NUMBER",
             "Max Temp (C)": "DT_CELSIUS",
-            "Rain (L/m2)": "DT_LM2"
+            "Rain (mm)": "DT_MM"
         }
     };
 
     const CHART_DATA_SHAPES = {
+        samplingMoistureChart: ["line", "line"],
+        samplingContextChart: ["bar", "bar", "bar", "line"],
+        anfisMoistureChart: ["line", "line", "line"],
+        anfisContextChart: ["bar", "bar", "bar", "line"],
+        fuzzyMoistureChart: ["line", "line", "line"],
+        fuzzyContextChart: ["bar", "bar", "bar", "line"],
         samplingChart: ["line", "bar", "line", "bar", "line", "bar"],
-        anfisChart: ["line", "bar", "line", "line", "bar", "line", "bar"],
+        anfisChart: ["line", "bar", "line", "bar", "line", "line", "bar"],
         fuzzyChart: ["line", "bar", "line", "line", "bar", "line", "bar"]
     };
 
-    const SENSOR_DEPENDENT_LINE_MEASURES = new Set([
+    const CHART_BASELINE_MEASURES = new Set([
         "Baseline Moisture",
-        "Sparse Moisture",
-        "ANFIS Moisture",
-        "Fuzzy Moisture"
+        "Baseline Water Usage (L)",
+        "Baseline Irrigation (L)"
     ]);
 
-    const WEATHER_LINE_MEASURES = new Set([
-        "Max Temp (C)"
+    const CHART_WEATHER_MEASURES = new Set([
+        "Max Temp (C)",
+        "Max Temperature (C)",
+        "Rain (mm)"
+    ]);
+
+    const CHART_BASELINE_FIELD_KEYS = [
+        "baseline_moisture",
+        "baseline_water_usage_chart",
+        "baseline_water_usage_l"
+    ];
+
+    const CHART_WEATHER_FIELD_KEYS = [
+        "max_temperature",
+        "rain_amount"
+    ];
+
+    const CONTEXT_CHART_IDS = new Set([
+        "samplingContextChart",
+        "anfisContextChart",
+        "fuzzyContextChart"
+    ]);
+
+    const SECONDARY_AXIS_MEASURES = new Set([
+        "Max Temperature (C)",
+        "Rain (mm)"
     ]);
 
     const CHART_MEASURES = {
+        samplingMoistureChart: [
+            "Baseline Moisture",
+            "Sparse Moisture"
+        ],
+        samplingContextChart: [
+            "Baseline Irrigation (L)",
+            "Sparse-Sensing Irrigation (L)",
+            "Rain (mm)",
+            "Max Temperature (C)"
+        ],
+        anfisMoistureChart: [
+            "Baseline Moisture",
+            "ANFIS Moisture",
+            ANFIS_SCORE_MEASURE
+        ],
+        anfisContextChart: [
+            "Baseline Irrigation (L)",
+            "ANFIS Water Usage (L)",
+            "Rain (mm)",
+            "Max Temperature (C)"
+        ],
+        fuzzyMoistureChart: [
+            "Baseline Moisture",
+            "Fuzzy Moisture",
+            FUZZY_SCORE_MEASURE
+        ],
+        fuzzyContextChart: [
+            "Baseline Irrigation (L)",
+            "Fuzzy Water Usage (L)",
+            "Rain (mm)",
+            "Max Temperature (C)"
+        ],
         samplingChart: [
             "Baseline Moisture",
             "Baseline Water Usage (L)",
             "Sparse Moisture",
             "Sparse Water Usage (L)",
             "Max Temp (C)",
-            "Rain (L/m2)"
+            "Rain (mm)"
         ],
         anfisChart: [
             "Baseline Moisture",
             "Baseline Water Usage (L)",
             "ANFIS Moisture",
-            "Predicted Probability",
             "ANFIS Water Usage (L)",
+            ANFIS_SCORE_MEASURE,
             "Max Temp (C)",
-            "Rain (L/m2)"
+            "Rain (mm)"
         ],
         fuzzyChart: [
             "Baseline Moisture",
             "Baseline Water Usage (L)",
             "Fuzzy Moisture",
-            "Fuzzy Prescription (mm)",
+            FUZZY_SCORE_MEASURE,
             "Fuzzy Water Usage (L)",
             "Max Temp (C)",
-            "Rain (L/m2)"
+            "Rain (mm)"
         ]
     };
+
+    function normalizedChartVisibility(visibility) {
+        const options = visibility || {};
+        return {
+            baseline: options.baseline !== false,
+            weather: options.weather !== false
+        };
+    }
+
+    function visibleChartMeasureIndexes(chartId, visibility) {
+        const measures = CHART_MEASURES[chartId] || [];
+        const options = normalizedChartVisibility(visibility);
+        const indexes = measures.reduce((output, measure, index) => {
+            const hiddenBaseline = !options.baseline && CHART_BASELINE_MEASURES.has(measure);
+            const hiddenWeather = !options.weather && CHART_WEATHER_MEASURES.has(measure);
+            if (!hiddenBaseline && !hiddenWeather) {
+                output.push(index);
+            }
+            return output;
+        }, []);
+        return indexes.length ? indexes : measures.map((measure, index) => index);
+    }
+
+    function visibleChartMeasures(chartId, visibility) {
+        const measures = CHART_MEASURES[chartId] || [];
+        return visibleChartMeasureIndexes(chartId, visibility).map((index) => measures[index]);
+    }
+
+    function visibleChartDataShapes(chartId, visibility) {
+        const shapes = CHART_DATA_SHAPES[chartId] || [];
+        return visibleChartMeasureIndexes(chartId, visibility).map((index) => shapes[index]).filter(Boolean);
+    }
+
+    function visibleChartPalette(chartId, visibility) {
+        const palette = CHART_PALETTES[chartId] || [];
+        return visibleChartMeasureIndexes(chartId, visibility).map((index) => palette[index]).filter(Boolean);
+    }
+
+    function chartMeasureColor(chartId, measure) {
+        const measures = CHART_MEASURES[chartId] || [];
+        const index = measures.indexOf(measure);
+        if (index < 0) {
+            return null;
+        }
+        return (CHART_PALETTES[chartId] || [])[index] || null;
+    }
+
+    function isSecondaryAxisMeasure(chartId, measure) {
+        return (CONTEXT_CHART_IDS.has(chartId) && SECONDARY_AXIS_MEASURES.has(measure))
+            || (chartId === "anfisMoistureChart" && measure === ANFIS_SCORE_MEASURE);
+    }
+
+    function visibleChartMeasuresByAxis(chartId, visibility) {
+        return visibleChartMeasureIndexes(chartId, visibility).reduce((axes, index) => {
+            const measure = (CHART_MEASURES[chartId] || [])[index];
+            const axisKey = isSecondaryAxisMeasure(chartId, measure) ? "secondaryAxis" : "primaryAxis";
+            axes[axisKey].push(measure);
+            return axes;
+        }, { primaryAxis: [], secondaryAxis: [] });
+    }
+
+    function visibleChartDataShapesByAxis(chartId, visibility) {
+        return visibleChartMeasureIndexes(chartId, visibility).reduce((axes, index) => {
+            const measure = (CHART_MEASURES[chartId] || [])[index];
+            const shape = (CHART_DATA_SHAPES[chartId] || [])[index];
+            if (!shape) {
+                return axes;
+            }
+            const axisKey = isSecondaryAxisMeasure(chartId, measure) ? "secondaryAxis" : "primaryAxis";
+            axes[axisKey].push(shape);
+            return axes;
+        }, { primaryAxis: [], secondaryAxis: [] });
+    }
+
+    function withChartVisibility(entries, visibility) {
+        const rows = Array.isArray(entries) ? entries : [];
+        const options = normalizedChartVisibility(visibility);
+        const hiddenKeys = [];
+        if (!options.baseline) {
+            hiddenKeys.push(...CHART_BASELINE_FIELD_KEYS);
+        }
+        if (!options.weather) {
+            hiddenKeys.push(...CHART_WEATHER_FIELD_KEYS);
+        }
+
+        if (!hiddenKeys.length) {
+            return rows;
+        }
+
+        return rows.map((entry) => {
+            const output = Object.assign({}, entry);
+            hiddenKeys.forEach((key) => {
+                output[key] = null;
+            });
+            return output;
+        });
+    }
 
     const INITIAL_VISIBLE_CHART_DAYS = 30;
 
     return {
+        CHART_BASELINE_MEASURES,
+        CHART_BASELINE_FIELD_KEYS,
+        CHART_DATA_PATHS,
         CHART_DATA_SHAPES,
         CHART_FORMATS,
         CHART_MEASURES,
         CHART_PALETTES,
+        CHART_SOURCE_DATA_PATHS,
+        CHART_WEATHER_FIELD_KEYS,
+        CHART_WEATHER_MEASURES,
+        EXPERIMENT_CHART_IDS,
         INITIAL_VISIBLE_CHART_DAYS,
-        SENSOR_DEPENDENT_LINE_MEASURES,
-        WEATHER_LINE_MEASURES,
+        MOISTURE_THRESHOLD_COLOR,
+        MOISTURE_THRESHOLD_PCT,
+        chartMeasureColor,
         entryTimestamp,
-        prepareChartResult
+        prepareChartResult,
+        visibleChartDataShapes,
+        visibleChartDataShapesByAxis,
+        visibleChartMeasures,
+        visibleChartMeasuresByAxis,
+        visibleChartPalette,
+        withChartVisibility
     };
 });

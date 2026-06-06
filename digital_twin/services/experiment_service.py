@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import calendar
 from concurrent.futures import Future, ProcessPoolExecutor
-from datetime import date
+from datetime import date, timedelta
 import logging
 import os
 import threading
@@ -11,25 +11,26 @@ from typing import Any
 
 from digital_twin.core.cache import SingleFlightCache
 from digital_twin.core.config import get_settings
+from digital_twin.core.time import today_local
 from digital_twin.core.exceptions import ExperimentConfigurationError, InvalidDateRange
+from digital_twin.control import run_default_dt_control
+from digital_twin.control.prescriptions import runtime_prescription_store
 from digital_twin.db.connection import get_connection
 from digital_twin.experiments import (
     load_experiment_snapshot,
     run_daily_anfis_experiment,
     run_daily_fuzzy_dt_experiment,
-    run_daily_irrigation_experiment,
     run_daily_sampling_experiment,
 )
+from digital_twin.services.irrigation_service import IrrigationActuationService
 
 
 logger = logging.getLogger("digital_twin.experiments")
 
 DEFAULT_SCENARIO_SEED = 2026
-DEFAULT_ANFIS_PARALLEL_WORKERS = max(1, min(8, (os.cpu_count() or 2) - 1))
-DEFAULT_ANFIS_PARALLEL_BACKEND = "process"
 DEFAULT_SAMPLING_INTERVAL_DAYS = 3
-DEFAULT_ANFIS_TRAIN_SAMPLES = 500
-DEFAULT_ANFIS_TEST_SAMPLES = 200
+DEFAULT_ANFIS_TRAIN_SAMPLES = 2000
+DEFAULT_ANFIS_TEST_SAMPLES = 800
 DEFAULT_SNAPSHOT_CACHE_TTL_SECONDS = 15 * 60
 
 _experiment_cache = SingleFlightCache()
@@ -56,7 +57,7 @@ def get_default_experiment_range(end: date | None = None) -> tuple[date, date]:
     return _add_months(end, -1), end
 
 
-def run_baseline_experiment(
+def run_default_dt_control_strategy(
     start: date,
     end: date,
     persist: bool = True,
@@ -66,7 +67,8 @@ def run_baseline_experiment(
         cache_key,
         lambda: _baseline_payload(start, end, persist=persist),
     )
-    schedule_related_precompute("baseline", start, end)
+    if persist:
+        _store_runtime_prescription("baseline", start, end, result)
     return result
 
 
@@ -76,18 +78,21 @@ def run_sampling_experiment(
     sample_interval_days: int,
     sample_interval_hours: int | None,
 ) -> dict[str, Any]:
-    cache_key = _sampling_cache_key(start, end, sample_interval_days, sample_interval_hours, True)
-    result = _experiment_cache.get_or_compute(
-        cache_key,
-        lambda: _sampling_payload(start, end, sample_interval_days, sample_interval_hours, persist=True),
-    )
-    schedule_related_precompute(
-        "sampling",
-        start,
-        end,
-        sample_interval_days=sample_interval_days,
-        sample_interval_hours=sample_interval_hours,
-    )
+    # Experiment result caching is temporarily disabled.
+    # cache_key = _sampling_cache_key(start, end, sample_interval_days, sample_interval_hours, True)
+    # result = _experiment_cache.get_or_compute(
+    #     cache_key,
+    #     lambda: _sampling_payload(start, end, sample_interval_days, sample_interval_hours, persist=True),
+    # )
+    result = _sampling_payload(start, end, sample_interval_days, sample_interval_hours, persist=True)
+    result.setdefault("summary", {})["cacheHit"] = False
+    # schedule_related_precompute(
+    #     "sampling",
+    #     start,
+    #     end,
+    #     sample_interval_days=sample_interval_days,
+    #     sample_interval_hours=sample_interval_hours,
+    # )
     return result
 
 
@@ -97,42 +102,44 @@ def run_anfis_experiment(
     train_samples: int,
     test_samples: int,
     seed: int | None,
-    parallel_workers: int,
-    parallel_backend: str,
 ) -> dict[str, Any]:
-    cache_key = _anfis_cache_key(
+    # Experiment result caching is temporarily disabled.
+    # cache_key = _anfis_cache_key(
+    #     start,
+    #     end,
+    #     train_samples,
+    #     test_samples,
+    #     seed,
+    #     True,
+    # )
+    # result = _experiment_cache.get_or_compute(
+    #     cache_key,
+    #     lambda: _anfis_payload(
+    #         start,
+    #         end,
+    #         train_samples,
+    #         test_samples,
+    #         seed,
+    #         persist=True,
+    #     ),
+    # )
+    result = _anfis_payload(
         start,
         end,
         train_samples,
         test_samples,
         seed,
-        parallel_workers,
-        parallel_backend,
-        True,
+        persist=True,
     )
-    result = _experiment_cache.get_or_compute(
-        cache_key,
-        lambda: _anfis_payload(
-            start,
-            end,
-            train_samples,
-            test_samples,
-            seed,
-            parallel_workers,
-            parallel_backend,
-            persist=True,
-        ),
-    )
-    schedule_related_precompute(
-        "anfis",
-        start,
-        end,
-        train_samples=train_samples,
-        test_samples=test_samples,
-        seed=seed,
-        parallel_workers=parallel_workers,
-        parallel_backend=parallel_backend,
-    )
+    result.setdefault("summary", {})["cacheHit"] = False
+    # schedule_related_precompute(
+    #     "anfis",
+    #     start,
+    #     end,
+    #     train_samples=train_samples,
+    #     test_samples=test_samples,
+    #     seed=seed,
+    # )
     return result
 
 
@@ -140,12 +147,15 @@ def run_fuzzy_dt_experiment(
     start: date,
     end: date,
 ) -> dict[str, Any]:
-    cache_key = _fuzzy_dt_cache_key(start, end, True)
-    result = _experiment_cache.get_or_compute(
-        cache_key,
-        lambda: _fuzzy_dt_payload(start, end, persist=True),
-    )
-    schedule_related_precompute("fuzzy_dt", start, end)
+    # Experiment result caching is temporarily disabled.
+    # cache_key = _fuzzy_dt_cache_key(start, end, True)
+    # result = _experiment_cache.get_or_compute(
+    #     cache_key,
+    #     lambda: _fuzzy_dt_payload(start, end, persist=True),
+    # )
+    result = _fuzzy_dt_payload(start, end, persist=True)
+    result.setdefault("summary", {})["cacheHit"] = False
+    # schedule_related_precompute("fuzzy_dt", start, end)
     return result
 
 
@@ -157,8 +167,6 @@ def precompute_experiments(
     train_samples: int = DEFAULT_ANFIS_TRAIN_SAMPLES,
     test_samples: int = DEFAULT_ANFIS_TEST_SAMPLES,
     seed: int | None = DEFAULT_SCENARIO_SEED,
-    parallel_workers: int = DEFAULT_ANFIS_PARALLEL_WORKERS,
-    parallel_backend: str = DEFAULT_ANFIS_PARALLEL_BACKEND,
 ) -> dict[str, Any]:
     if start is None or end is None:
         default_start, default_end = get_default_experiment_range(end)
@@ -173,8 +181,6 @@ def precompute_experiments(
         train_samples=train_samples,
         test_samples=test_samples,
         seed=seed,
-        parallel_workers=parallel_workers,
-        parallel_backend=parallel_backend,
     )
     return {
         "start": start.isoformat(),
@@ -186,7 +192,7 @@ def precompute_experiments(
 
 def get_cached_snapshot(start: date, end: date):
     ttl_seconds = get_settings().experiment_snapshot_cache_ttl_seconds
-    cache_key = ("db-snapshot-v6-sensor-coverage", start, end, _sensor_placement_cache_token())
+    cache_key = ("db-snapshot-v7-baseline-startup", start, end, _sensor_placement_cache_token())
     now = time.time()
     with _snapshot_cache_lock:
         entry = _snapshot_cache.get(cache_key)
@@ -199,6 +205,28 @@ def get_cached_snapshot(start: date, end: date):
         return _snapshot_cache[cache_key]["snapshot"], cache_hit
 
 
+def warm_default_baseline_cache() -> dict[str, Any]:
+    start, end = get_default_experiment_range()
+    cache_key = _baseline_cache_key(start, end, True)
+    status = _start_precompute_task(
+        "baseline",
+        cache_key,
+        {"experiment": "baseline", "start": start, "end": end, "persist": True},
+    )
+    return {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "status": status,
+    }
+
+
+def _shared_baseline_result(start: date, end: date) -> dict[str, Any]:
+    return _experiment_cache.get_or_compute(
+        _baseline_cache_key(start, end, True),
+        lambda: _baseline_payload(start, end, persist=True),
+    )
+
+
 def schedule_related_precompute(
     source_experiment: str,
     start: date,
@@ -208,8 +236,6 @@ def schedule_related_precompute(
     train_samples: int = DEFAULT_ANFIS_TRAIN_SAMPLES,
     test_samples: int = DEFAULT_ANFIS_TEST_SAMPLES,
     seed: int | None = DEFAULT_SCENARIO_SEED,
-    parallel_workers: int = DEFAULT_ANFIS_PARALLEL_WORKERS,
-    parallel_backend: str = DEFAULT_ANFIS_PARALLEL_BACKEND,
 ) -> dict[str, list[str]]:
     status: dict[str, list[str]] = {
         "started": [],
@@ -218,6 +244,10 @@ def schedule_related_precompute(
         "disabled": [],
         "failed": [],
     }
+    # Experiment result caching is temporarily disabled.
+    status["disabled"].append("all")
+    return status
+
     if not _precompute_enabled():
         status["disabled"].append("all")
         return status
@@ -257,8 +287,6 @@ def schedule_related_precompute(
                         train_samples,
                         test_samples,
                         seed,
-                        parallel_workers,
-                        parallel_backend,
                     ),
                     {
                         "experiment": "anfis",
@@ -267,8 +295,6 @@ def schedule_related_precompute(
                         "train_samples": train_samples,
                         "test_samples": test_samples,
                         "seed": seed,
-                        "parallel_workers": parallel_workers,
-                        "parallel_backend": parallel_backend,
                         "persist": True,
                     },
                 )
@@ -293,13 +319,16 @@ def schedule_related_precompute(
 
 def _baseline_payload(start: date, end: date, persist: bool = True) -> dict[str, Any]:
     snapshot, snapshot_cache_hit = get_cached_snapshot(start, end)
-    result = run_daily_irrigation_experiment(
+    result = run_default_dt_control(
         start_date=start,
         end_date=end,
-        persist=persist,
+        persist=False,
         snapshot=snapshot,
     )
-    return _annotate_snapshot_cache(result, snapshot, snapshot_cache_hit)
+    result = _annotate_snapshot_cache(result, snapshot, snapshot_cache_hit)
+    if persist:
+        _store_runtime_prescription("baseline", start, end, result)
+    return result
 
 
 def _sampling_payload(
@@ -310,15 +339,20 @@ def _sampling_payload(
     persist: bool = True,
 ) -> dict[str, Any]:
     snapshot, snapshot_cache_hit = get_cached_snapshot(start, end)
+    baseline = _shared_baseline_result(start, end)
     result = run_daily_sampling_experiment(
         start_date=start,
         end_date=end,
         sample_interval_days=sample_interval_days,
         sample_interval_hours=sample_interval_hours,
-        persist=persist,
+        persist=False,
         snapshot=snapshot,
+        baseline_result=baseline,
     )
-    return _annotate_snapshot_cache(result, snapshot, snapshot_cache_hit)
+    result = _annotate_snapshot_cache(result, snapshot, snapshot_cache_hit)
+    if persist:
+        _store_runtime_prescription("sampling", start, end, result)
+    return result
 
 
 def _anfis_payload(
@@ -327,34 +361,87 @@ def _anfis_payload(
     train_samples: int,
     test_samples: int,
     seed: int | None,
-    parallel_workers: int,
-    parallel_backend: str,
     persist: bool = True,
 ) -> dict[str, Any]:
     snapshot, snapshot_cache_hit = get_cached_snapshot(start, end)
+    baseline = _shared_baseline_result(start, end)
     result = run_daily_anfis_experiment(
         start_date=start,
         end_date=end,
         train_samples=train_samples,
         test_samples=test_samples,
         seed=seed,
-        parallel_workers=parallel_workers,
-        parallel_backend=parallel_backend,
-        persist=persist,
+        persist=False,
         snapshot=snapshot,
+        baseline_result=baseline,
     )
-    return _annotate_snapshot_cache(result, snapshot, snapshot_cache_hit)
+    result = _annotate_snapshot_cache(result, snapshot, snapshot_cache_hit)
+    if persist:
+        _store_runtime_prescription("anfis", start, end, result)
+    return result
 
 
 def _fuzzy_dt_payload(start: date, end: date, persist: bool = True) -> dict[str, Any]:
     snapshot, snapshot_cache_hit = get_cached_snapshot(start, end)
+    baseline = _shared_baseline_result(start, end)
     result = run_daily_fuzzy_dt_experiment(
         start_date=start,
         end_date=end,
-        persist=persist,
+        persist=False,
         snapshot=snapshot,
+        baseline_result=baseline,
     )
-    return _annotate_snapshot_cache(result, snapshot, snapshot_cache_hit)
+    result = _annotate_snapshot_cache(result, snapshot, snapshot_cache_hit)
+    if persist:
+        _store_runtime_prescription("fuzzy_dt", start, end, result)
+    return result
+
+
+def _store_runtime_prescription(
+    experiment_type: str,
+    start: date,
+    end: date,
+    result: dict[str, Any],
+) -> None:
+    runtime_prescription_store.upsert_from_result(experiment_type, start, end, result)
+
+
+def prepare_tomorrow_prescriptions(target: date | None = None) -> dict[str, Any]:
+    target_date = target or (today_local() + timedelta(days=1))
+    prepared = {
+        "baseline": _baseline_payload(target_date, target_date, persist=True),
+        "sampling": _sampling_payload(
+            target_date,
+            target_date,
+            DEFAULT_SAMPLING_INTERVAL_DAYS,
+            None,
+            persist=True,
+        ),
+        "anfis": _anfis_payload(
+            target_date,
+            target_date,
+            DEFAULT_ANFIS_TRAIN_SAMPLES,
+            DEFAULT_ANFIS_TEST_SAMPLES,
+            DEFAULT_SCENARIO_SEED,
+            persist=True,
+        ),
+        "fuzzy_dt": _fuzzy_dt_payload(target_date, target_date, persist=True),
+    }
+    return {
+        "targetDate": target_date.isoformat(),
+        "preparedExperiments": list(prepared),
+        "runtimePrescriptionCount": len(runtime_prescription_store.latest_for_date(target_date)),
+    }
+
+
+def dispatch_tomorrow_prescriptions(target: date | None = None) -> dict[str, Any]:
+    target_date = target or (today_local() + timedelta(days=1))
+    prepared = prepare_tomorrow_prescriptions(target_date)
+    dispatch = IrrigationActuationService().store_prescriptions(target_date=target_date)
+    return {
+        **prepared,
+        "dispatch": dispatch,
+    }
 
 
 def _annotate_snapshot_cache(result: dict[str, Any], snapshot, cache_hit: bool) -> dict[str, Any]:
@@ -362,7 +449,9 @@ def _annotate_snapshot_cache(result: dict[str, Any], snapshot, cache_hit: bool) 
     result["summary"]["dbSnapshotLoadedAt"] = snapshot.loaded_at.isoformat()
     result["summary"]["dbSnapshotWeatherRows"] = len(snapshot.selected_weather_rows)
     result["summary"]["dbSnapshotSensorRows"] = snapshot.sensor_context.get("row_count", 0)
-    result["summary"]["dbSnapshotEstimatedWeatherRows"] = snapshot.estimated_weather_rows
+    result["summary"]["dbSnapshotEstimatedWeatherRows"] = snapshot.estimated_selected_weather_rows
+    result["summary"]["dbSnapshotEstimatedWeatherRowsTotal"] = snapshot.estimated_weather_rows
+    result["summary"]["dbSnapshotEstimatedLookaheadWeatherRows"] = snapshot.estimated_lookahead_weather_rows
     result["summary"]["dbSnapshotInitialStateRows"] = len(snapshot.initial_pot_states)
     return result
 
@@ -431,8 +520,6 @@ def _compute_precompute_payload(task: dict[str, Any]) -> dict[str, Any]:
             task["train_samples"],
             task["test_samples"],
             task["seed"],
-            task["parallel_workers"],
-            task["parallel_backend"],
             persist=task.get("persist", True),
         )
     if experiment == "fuzzy_dt":
@@ -441,7 +528,7 @@ def _compute_precompute_payload(task: dict[str, Any]) -> dict[str, Any]:
 
 
 def _baseline_cache_key(start: date, end: date, persist: bool = True) -> tuple[Any, ...]:
-    return ("baseline-db-v10-weather-popover", start, end, persist, _sensor_placement_cache_token())
+    return ("baseline-db-v16-seasonal-rain-dose-valve-physical-distribution", start, end, persist, _sensor_placement_cache_token())
 
 
 def _sampling_cache_key(
@@ -453,7 +540,7 @@ def _sampling_cache_key(
 ) -> tuple[Any, ...]:
     effective_sample_interval_hours = sample_interval_hours or sample_interval_days * 24
     return (
-        "sampling-db-sensor-weather-v8-weather-popover",
+        "sampling-db-sensor-weather-v13-hourly-raw-weather-popover-valves-physical-distribution",
         start,
         end,
         sample_interval_days,
@@ -469,26 +556,22 @@ def _anfis_cache_key(
     train_samples: int,
     test_samples: int,
     seed: int | None,
-    parallel_workers: int,
-    parallel_backend: str,
     persist: bool = True,
 ) -> tuple[Any, ...]:
     return (
-        "anfis-db-size-flow-pots-v6-weather-popover",
+        "anfis-db-size-flow-pots-v13-hourly-raw-weather-popover-valves-physical-distribution",
         start,
         end,
         train_samples,
         test_samples,
         seed,
-        parallel_workers,
-        parallel_backend,
         persist,
         _sensor_placement_cache_token(),
     )
 
 
 def _fuzzy_dt_cache_key(start: date, end: date, persist: bool = True) -> tuple[Any, ...]:
-    return ("fuzzy-dt-db-v3-persist-slot", start, end, persist, _sensor_placement_cache_token())
+    return ("fuzzy-dt-db-v8-hourly-raw-weather-popover-valves-physical-distribution", start, end, persist, _sensor_placement_cache_token())
 
 
 def _sensor_placement_cache_token() -> tuple[Any, ...]:
@@ -523,10 +606,10 @@ def _add_months(value: date, months: int) -> date:
 class ExperimentService:
     """Coordinates experiment execution and cache orchestration."""
 
-    def run_baseline(self, start: date | None, end: date | None, persist: bool = True) -> dict[str, Any]:
+    def run_default_control(self, start: date | None, end: date | None, persist: bool = True) -> dict[str, Any]:
         start, end = self._resolve_range(start, end)
         self._validate_range(start, end)
-        return run_baseline_experiment(start=start, end=end, persist=persist)
+        return run_default_dt_control_strategy(start=start, end=end, persist=persist)
 
     def run_sampling(
         self,
@@ -551,21 +634,15 @@ class ExperimentService:
         train_samples: int,
         test_samples: int,
         seed: int | None,
-        parallel_workers: int = DEFAULT_ANFIS_PARALLEL_WORKERS,
-        parallel_backend: str = DEFAULT_ANFIS_PARALLEL_BACKEND,
     ) -> dict[str, Any]:
         start, end = self._resolve_range(start, end)
         self._validate_range(start, end)
-        if parallel_backend not in {"process", "thread"}:
-            parallel_backend = DEFAULT_ANFIS_PARALLEL_BACKEND
         return run_anfis_experiment(
             start=start,
             end=end,
             train_samples=train_samples,
             test_samples=test_samples,
             seed=seed,
-            parallel_workers=parallel_workers,
-            parallel_backend=parallel_backend,
         )
 
     def run_fuzzy_dt(self, start: date | None, end: date | None) -> dict[str, Any]:
@@ -582,13 +659,9 @@ class ExperimentService:
         train_samples: int,
         test_samples: int,
         seed: int | None,
-        parallel_workers: int = DEFAULT_ANFIS_PARALLEL_WORKERS,
-        parallel_backend: str = DEFAULT_ANFIS_PARALLEL_BACKEND,
     ) -> dict[str, Any]:
         start, end = self._resolve_range(start, end)
         self._validate_range(start, end)
-        if parallel_backend not in {"process", "thread"}:
-            parallel_backend = DEFAULT_ANFIS_PARALLEL_BACKEND
         return precompute_experiments(
             start=start,
             end=end,
@@ -597,9 +670,13 @@ class ExperimentService:
             train_samples=train_samples,
             test_samples=test_samples,
             seed=seed,
-            parallel_workers=parallel_workers,
-            parallel_backend=parallel_backend,
         )
+
+    def prepare_tomorrow_prescriptions(self, target: date | None = None) -> dict[str, Any]:
+        return prepare_tomorrow_prescriptions(target)
+
+    def dispatch_tomorrow_prescriptions(self, target: date | None = None) -> dict[str, Any]:
+        return dispatch_tomorrow_prescriptions(target)
 
     @staticmethod
     def _validate_range(start: date, end: date) -> None:
@@ -613,9 +690,9 @@ class ExperimentService:
         return start or default_start, resolved_end
 
 __all__ = [
-    "DEFAULT_ANFIS_PARALLEL_BACKEND",
-    "DEFAULT_ANFIS_PARALLEL_WORKERS",
     "DEFAULT_SCENARIO_SEED",
     "ExperimentConfigurationError",
     "ExperimentService",
+    "dispatch_tomorrow_prescriptions",
+    "prepare_tomorrow_prescriptions",
 ]

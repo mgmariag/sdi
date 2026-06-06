@@ -101,27 +101,66 @@ def _schema_is_current(conn) -> bool:
             EXISTS (
                 SELECT 1
                 FROM information_schema.columns
-                WHERE table_name = 'irrigation_decisions'
+                WHERE table_name = 'irrigation_events'
                   AND column_name = 'sensor_id'
-            ) AS has_decision_sensor_id,
-            NOT EXISTS (
-                SELECT 1
-                FROM information_schema.columns
-                WHERE table_name = 'irrigation_decisions'
-                  AND column_name = 'pot_id'
-            ) AS decision_pot_id_removed,
+            ) AS has_event_sensor_id,
             EXISTS (
                 SELECT 1
                 FROM information_schema.columns
                 WHERE table_name = 'irrigation_events'
-                  AND column_name = 'sensor_id'
-            ) AS has_event_sensor_id,
+                  AND column_name = 'valve_number'
+            ) AS has_event_valve_number,
+            EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'irrigation_events'
+                  AND column_name = 'payload'
+            ) AS has_event_payload,
+            EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'irrigation_actuations'
+                  AND column_name = 'valve_number'
+            ) AS has_actuation_valve_number,
+            EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'irrigation_actuations'
+                  AND column_name = 'payload'
+            ) AS has_actuation_payload,
+            NOT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'irrigation_events'
+                  AND column_name = 'decision_id'
+            ) AS event_decision_id_removed,
             NOT EXISTS (
                 SELECT 1
                 FROM information_schema.columns
                 WHERE table_name = 'irrigation_events'
                   AND column_name = 'pot_id'
             ) AS event_pot_id_removed,
+            to_regclass('public.irrigation_decisions') IS NULL AS irrigation_decisions_removed,
+            to_regclass('public.alerts') IS NULL AS alerts_removed,
+            EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'pots'
+                  AND column_name = 'rain_exposure'
+            ) AS has_pot_rain_exposure,
+            NOT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'pots'
+                  AND column_name = 'default_location'
+            ) AS default_location_removed,
+            NOT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'pots'
+                  AND column_name = 'winter_location'
+            ) AS winter_location_removed,
+            to_regclass('public.irrigation_prescriptions') IS NOT NULL AS has_irrigation_prescriptions,
             EXISTS (SELECT 1 FROM pots LIMIT 1) AS has_seeded_pots
         """
     ).fetchone()
@@ -162,9 +201,10 @@ def create_schema(conn) -> None:
             size_class TEXT NOT NULL CHECK (size_class IN ('huge', 'large', 'medium', 'small')),
             small_subtype TEXT,
             plant_type_code TEXT NOT NULL REFERENCES plant_types(code),
-            default_location TEXT NOT NULL CHECK (default_location IN ('outdoor', 'indoor')),
-            winter_location TEXT NOT NULL CHECK (winter_location IN ('outdoor', 'indoor')),
             balcony_zone TEXT NOT NULL,
+            rain_exposure TEXT NOT NULL DEFAULT 'partially_exposed'
+                CONSTRAINT pots_rain_exposure_check
+                CHECK (rain_exposure IN ('covered', 'partially_exposed', 'fully_exposed')),
             sun_exposure TEXT NOT NULL CHECK (sun_exposure IN ('shade', 'partial', 'full', 'reflected_heat')),
             wind_exposure TEXT NOT NULL CHECK (wind_exposure IN ('sheltered', 'moderate', 'gusty')),
             container_material TEXT NOT NULL,
@@ -182,6 +222,9 @@ def create_schema(conn) -> None:
             active BOOLEAN NOT NULL DEFAULT TRUE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+
+        ALTER TABLE pots DROP COLUMN IF EXISTS default_location;
+        ALTER TABLE pots DROP COLUMN IF EXISTS winter_location;
 
         CREATE TABLE IF NOT EXISTS weather_hourly (
             id BIGSERIAL PRIMARY KEY,
@@ -221,6 +264,37 @@ def create_schema(conn) -> None:
             UNIQUE (location_name, source, observed_local_at)
         );
 
+        ALTER TABLE pots
+            ADD COLUMN IF NOT EXISTS rain_exposure TEXT;
+
+        UPDATE pots
+        SET rain_exposure = CASE
+            WHEN balcony_zone = 'north_shelter' THEN 'covered'
+            WHEN balcony_zone IN ('west_wall', 'east_corner') THEN 'partially_exposed'
+            WHEN balcony_zone IN ('south_rail', 'hanging_row') THEN 'fully_exposed'
+            ELSE COALESCE(rain_exposure, 'partially_exposed')
+        END
+        WHERE rain_exposure IS NULL
+           OR rain_exposure NOT IN ('covered', 'partially_exposed', 'fully_exposed');
+
+        ALTER TABLE pots
+            ALTER COLUMN rain_exposure SET DEFAULT 'partially_exposed',
+            ALTER COLUMN rain_exposure SET NOT NULL;
+
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'pots'::regclass
+                  AND conname = 'pots_rain_exposure_check'
+            ) THEN
+                ALTER TABLE pots
+                    ADD CONSTRAINT pots_rain_exposure_check
+                    CHECK (rain_exposure IN ('covered', 'partially_exposed', 'fully_exposed'));
+            END IF;
+        END $$;
+
         CREATE TABLE IF NOT EXISTS sensor_readings (
             sensor_id BIGINT NOT NULL,
             recorded_at TIMESTAMP NOT NULL,
@@ -250,32 +324,17 @@ def create_schema(conn) -> None:
             UNIQUE (pot_id)
         );
 
-        CREATE TABLE IF NOT EXISTS irrigation_decisions (
-            id BIGSERIAL PRIMARY KEY,
-            experiment_type TEXT NOT NULL DEFAULT 'baseline',
-            sensor_id BIGINT NOT NULL,
-            decided_at TIMESTAMPTZ NOT NULL,
-            decision_date DATE NOT NULL,
-            decision_slot TEXT NOT NULL CHECK (decision_slot IN ('morning', 'evening', 'midday_alert', 'winter_check')),
-            should_irrigate BOOLEAN NOT NULL,
-            reason_code TEXT NOT NULL,
-            reason_detail TEXT NOT NULL,
-            current_moisture_pct NUMERIC(5, 2),
-            target_moisture_pct NUMERIC(5, 2),
-            weather_hourly_id BIGINT REFERENCES weather_hourly(id) ON DELETE SET NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            changed_at TIMESTAMPTZ
-        );
-
         CREATE TABLE IF NOT EXISTS irrigation_events (
             id BIGSERIAL PRIMARY KEY,
             experiment_type TEXT NOT NULL DEFAULT 'baseline',
-            decision_id BIGINT REFERENCES irrigation_decisions(id) ON DELETE SET NULL,
             sensor_id BIGINT NOT NULL,
             scheduled_start_at TIMESTAMPTZ NOT NULL,
             scheduled_end_at TIMESTAMPTZ NOT NULL,
             flow_rate_ml_min NUMERIC(8, 2) NOT NULL,
             planned_volume_ml NUMERIC(10, 2) NOT NULL,
+            valve_number INTEGER,
+            valve_zone TEXT,
+            payload JSONB NOT NULL DEFAULT '{}'::jsonb,
             cycle_count INTEGER NOT NULL DEFAULT 1,
             soak_pause_min INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'planned' CHECK (status IN ('planned', 'running', 'completed', 'skipped', 'cancelled')),
@@ -283,19 +342,12 @@ def create_schema(conn) -> None:
             changed_at TIMESTAMPTZ
         );
 
-        CREATE TABLE IF NOT EXISTS alerts (
-            id BIGSERIAL PRIMARY KEY,
-            experiment_type TEXT NOT NULL DEFAULT 'baseline',
-            pot_id BIGINT REFERENCES pots(id) ON DELETE CASCADE,
-            raised_at TIMESTAMPTZ NOT NULL,
-            alert_type TEXT NOT NULL CHECK (alert_type IN ('emergency_dryness', 'too_wet_too_long', 'freeze_risk', 'sensor_stale', 'runoff_risk')),
-            severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'critical')),
-            title TEXT NOT NULL,
-            detail TEXT NOT NULL,
-            resolved_at TIMESTAMPTZ,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            changed_at TIMESTAMPTZ
-        );
+        ALTER TABLE irrigation_events DROP COLUMN IF EXISTS decision_id;
+        ALTER TABLE irrigation_events ADD COLUMN IF NOT EXISTS valve_number INTEGER;
+        ALTER TABLE irrigation_events ADD COLUMN IF NOT EXISTS valve_zone TEXT;
+        ALTER TABLE irrigation_events ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb;
+        DROP TABLE IF EXISTS alerts;
+        DROP TABLE IF EXISTS irrigation_decisions;
 
         CREATE TABLE IF NOT EXISTS irrigation_actuations (
             id BIGSERIAL PRIMARY KEY,
@@ -306,6 +358,9 @@ def create_schema(conn) -> None:
             scheduled_end_at TIMESTAMPTZ NOT NULL,
             flow_rate_ml_min NUMERIC(8, 2) NOT NULL,
             planned_volume_ml NUMERIC(10, 2) NOT NULL,
+            valve_number INTEGER,
+            valve_zone TEXT,
+            payload JSONB NOT NULL DEFAULT '{}'::jsonb,
             cycle_count INTEGER NOT NULL DEFAULT 1,
             soak_pause_min INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'planned' CHECK (status IN ('planned', 'running', 'completed', 'skipped', 'cancelled', 'failed')),
@@ -316,6 +371,25 @@ def create_schema(conn) -> None:
             last_error TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             changed_at TIMESTAMPTZ
+        );
+        ALTER TABLE irrigation_actuations ADD COLUMN IF NOT EXISTS valve_number INTEGER;
+        ALTER TABLE irrigation_actuations ADD COLUMN IF NOT EXISTS valve_zone TEXT;
+        ALTER TABLE irrigation_actuations ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+        CREATE TABLE IF NOT EXISTS irrigation_prescriptions (
+            id BIGSERIAL PRIMARY KEY,
+            experiment_type TEXT NOT NULL,
+            prescription_date DATE NOT NULL,
+            computed_at TIMESTAMPTZ NOT NULL,
+            dispatched_at TIMESTAMPTZ NOT NULL,
+            planned_volume_ml NUMERIC(12, 2) NOT NULL DEFAULT 0,
+            valve_runs INTEGER NOT NULL DEFAULT 0,
+            payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+            status TEXT NOT NULL DEFAULT 'dispatched'
+                CHECK (status IN ('draft', 'dispatched', 'cancelled')),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            changed_at TIMESTAMPTZ,
+            UNIQUE (experiment_type, prescription_date)
         );
 
         CREATE TABLE IF NOT EXISTS weather_refresh_runs (
@@ -339,18 +413,6 @@ def create_schema(conn) -> None:
         BEGIN
             IF EXISTS (
                 SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'irrigation_decisions'
-                  AND column_name = 'pot_id'
-            ) AND NOT EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'irrigation_decisions'
-                  AND column_name = 'sensor_id'
-            ) THEN
-                ALTER TABLE irrigation_decisions RENAME COLUMN pot_id TO sensor_id;
-            END IF;
-
-            IF EXISTS (
-                SELECT 1 FROM information_schema.columns
                 WHERE table_name = 'irrigation_events'
                   AND column_name = 'pot_id'
             ) AND NOT EXISTS (
@@ -359,19 +421,6 @@ def create_schema(conn) -> None:
                   AND column_name = 'sensor_id'
             ) THEN
                 ALTER TABLE irrigation_events RENAME COLUMN pot_id TO sensor_id;
-            END IF;
-
-            IF EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'irrigation_decisions'
-                  AND column_name = 'pot_id'
-            ) AND EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'irrigation_decisions'
-                  AND column_name = 'sensor_id'
-            ) THEN
-                UPDATE irrigation_decisions SET sensor_id = pot_id WHERE sensor_id IS NULL;
-                ALTER TABLE irrigation_decisions DROP COLUMN pot_id;
             END IF;
 
             IF EXISTS (
@@ -391,7 +440,7 @@ def create_schema(conn) -> None:
                 SELECT conrelid::regclass AS table_name, conname
                 FROM pg_constraint
                 WHERE contype = 'f'
-                  AND conrelid IN ('irrigation_decisions'::regclass, 'irrigation_events'::regclass)
+                  AND conrelid = 'irrigation_events'::regclass
             LOOP
                 EXECUTE format('ALTER TABLE %s DROP CONSTRAINT IF EXISTS %I', constraint_record.table_name, constraint_record.conname);
             END LOOP;
@@ -447,35 +496,27 @@ def create_schema(conn) -> None:
         DROP INDEX IF EXISTS uq_irrigation_decisions_experiment_pot_slot;
         DROP INDEX IF EXISTS uq_irrigation_events_experiment_pot_start;
 
-        CREATE INDEX IF NOT EXISTS idx_irrigation_decisions_sensor_date
-            ON irrigation_decisions (sensor_id, decision_date);
-        CREATE INDEX IF NOT EXISTS idx_irrigation_decisions_experiment_date_sensor
-            ON irrigation_decisions (experiment_type, decision_date, sensor_id);
         CREATE INDEX IF NOT EXISTS idx_irrigation_events_sensor_start
             ON irrigation_events (sensor_id, scheduled_start_at);
         CREATE INDEX IF NOT EXISTS idx_irrigation_events_experiment_planned_start
             ON irrigation_events (experiment_type, scheduled_start_at)
             WHERE status = 'planned';
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_irrigation_decisions_experiment_sensor_slot
-            ON irrigation_decisions (experiment_type, sensor_id, decided_at, decision_slot);
         CREATE UNIQUE INDEX IF NOT EXISTS uq_irrigation_events_experiment_sensor_start
             ON irrigation_events (experiment_type, sensor_id, scheduled_start_at);
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_alerts_experiment_pot_type_time
-            ON alerts (experiment_type, pot_id, raised_at, alert_type);
         CREATE UNIQUE INDEX IF NOT EXISTS uq_irrigation_actuations_experiment_pot_start
             ON irrigation_actuations (experiment_type, pot_id, scheduled_start_at);
         CREATE INDEX IF NOT EXISTS idx_irrigation_actuations_due
             ON irrigation_actuations (status, scheduled_start_at);
+        CREATE INDEX IF NOT EXISTS idx_irrigation_actuations_valve_start
+            ON irrigation_actuations (valve_number, scheduled_start_at);
         CREATE INDEX IF NOT EXISTS idx_irrigation_actuations_planned_due
             ON irrigation_actuations (scheduled_start_at, id)
             WHERE status = 'planned';
         CREATE INDEX IF NOT EXISTS idx_irrigation_actuations_experiment_planned_start
             ON irrigation_actuations (experiment_type, scheduled_start_at)
             WHERE status = 'planned';
-        CREATE INDEX IF NOT EXISTS idx_alerts_pot_time
-            ON alerts (pot_id, raised_at);
-        CREATE INDEX IF NOT EXISTS idx_alerts_experiment_time
-            ON alerts (experiment_type, raised_at, pot_id);
+        CREATE INDEX IF NOT EXISTS idx_irrigation_prescriptions_date
+            ON irrigation_prescriptions (prescription_date, experiment_type);
         """
     )
 
@@ -511,7 +552,7 @@ def seed_reference_data(conn) -> None:
             "Ornamentals",
             "medium",
             24,
-            45,
+            35,
             72,
             15,
             False,
@@ -599,16 +640,16 @@ def seed_pots(conn, target_count: int = DEFAULT_POT_COUNT, seed: int = DEFAULT_S
             """
             INSERT INTO pots (
                 pot_code, label, size_class, small_subtype, plant_type_code,
-                default_location, winter_location, balcony_zone, sun_exposure,
-                wind_exposure, container_material, soil_profile, drip_flow_ml_min,
+                balcony_zone, rain_exposure, sun_exposure, wind_exposure,
+                container_material, soil_profile, drip_flow_ml_min,
                 cycle_soak_enabled, morning_window_start, morning_window_end,
                 evening_window_start, evening_window_end, moisture_min_pct,
                 moisture_target_pct, moisture_max_pct, winter_moisture_target_pct
             )
             VALUES (
                 %(pot_code)s, %(label)s, %(size_class)s, %(small_subtype)s,
-                %(plant_type_code)s, %(default_location)s, %(winter_location)s,
-                %(balcony_zone)s, %(sun_exposure)s, %(wind_exposure)s,
+                %(plant_type_code)s, %(balcony_zone)s, %(rain_exposure)s,
+                %(sun_exposure)s, %(wind_exposure)s,
                 %(container_material)s, %(soil_profile)s, %(drip_flow_ml_min)s,
                 %(cycle_soak_enabled)s, %(morning_window_start)s, %(morning_window_end)s,
                 %(evening_window_start)s, %(evening_window_end)s, %(moisture_min_pct)s,
@@ -688,20 +729,11 @@ def get_pot_summary() -> dict[str, Any]:
             ORDER BY p.plant_type_code
             """
         ).fetchall()
-        by_winter_location = conn.execute(
-            """
-            SELECT winter_location, count(*) AS count
-            FROM pots
-            GROUP BY winter_location
-            ORDER BY winter_location
-            """
-        ).fetchall()
         return _json_ready(
             {
                 "total": totals["total"],
                 "by_size": by_size,
                 "by_plant_type": by_plant,
-                "by_winter_location": by_winter_location,
             }
         )
 
@@ -726,9 +758,8 @@ def list_pots(limit: int = 50, offset: int = 0, size_class: str | None = None, p
             p.small_subtype,
             p.plant_type_code,
             pt.label AS plant_type_label,
-            p.default_location,
-            p.winter_location,
             p.balcony_zone,
+            p.rain_exposure,
             p.sun_exposure,
             p.wind_exposure,
             p.container_material,
@@ -804,10 +835,10 @@ def _generate_pot(index: int, rng: random.Random, profiles: dict[str, dict[str, 
     plant_type_code = _weighted_choice(
         rng,
         [
-            ("vegetables", 0.32),
-            ("herbs", 0.28),
-            ("ornamentals", 0.28),
-            ("succulents", 0.12),
+            ("vegetables", 0.24),
+            ("herbs", 0.24),
+            ("ornamentals", 0.42),
+            ("succulents", 0.10),
         ],
     )
     plant_type = plant_types[plant_type_code]
@@ -835,8 +866,16 @@ def _generate_pot(index: int, rng: random.Random, profiles: dict[str, dict[str, 
     if plant_type_code == "succulents":
         cycle_soak = False
 
-    winter_location = "indoor" if index <= 100 else "outdoor"
-    default_location = "outdoor" if rng.random() > 0.08 else "indoor"
+    balcony_zone = _weighted_choice(
+        rng,
+        [
+            ("south_rail", 0.30),
+            ("west_wall", 0.22),
+            ("east_corner", 0.18),
+            ("north_shelter", 0.14),
+            ("hanging_row", 0.16),
+        ],
+    )
 
     return {
         "pot_code": f"POT-{index:03d}",
@@ -844,18 +883,8 @@ def _generate_pot(index: int, rng: random.Random, profiles: dict[str, dict[str, 
         "size_class": size_class,
         "small_subtype": small_subtype,
         "plant_type_code": plant_type_code,
-        "default_location": default_location,
-        "winter_location": winter_location,
-        "balcony_zone": _weighted_choice(
-            rng,
-            [
-                ("south_rail", 0.30),
-                ("west_wall", 0.22),
-                ("east_corner", 0.18),
-                ("north_shelter", 0.14),
-                ("hanging_row", 0.16),
-            ],
-        ),
+        "balcony_zone": balcony_zone,
+        "rain_exposure": _rain_exposure_for_zone(balcony_zone),
         "sun_exposure": sun_exposure,
         "wind_exposure": wind_exposure,
         "container_material": _weighted_choice(
@@ -879,6 +908,16 @@ def _generate_pot(index: int, rng: random.Random, profiles: dict[str, dict[str, 
         "moisture_max_pct": plant_type["moisture_max_pct"],
         "winter_moisture_target_pct": plant_type["winter_moisture_target_pct"],
     }
+
+
+def _rain_exposure_for_zone(zone: str) -> str:
+    if zone == "north_shelter":
+        return "covered"
+    if zone in {"west_wall", "east_corner"}:
+        return "partially_exposed"
+    if zone in {"south_rail", "hanging_row"}:
+        return "fully_exposed"
+    return "partially_exposed"
 
 
 def _weighted_choice(rng: random.Random, options: list[tuple[str, float]]) -> str:

@@ -9,8 +9,6 @@ from digital_twin.simulation.soil_model import (
     local_observed_at as _local_observed_at,
     number as _number,
     season as _season,
-    sun_factor as _sun_factor,
-    wind_factor as _wind_factor,
 )
 
 _FUZZY_OUTPUT_SETS = {
@@ -23,53 +21,77 @@ _FUZZY_OUTPUT_SETS = {
 }
 _DEFUZZ_X_VALUES = tuple(index / 20.0 for index in range(161))
 _DEFUZZ_OUTPUT_MEMBERSHIPS: dict[str, tuple[float, ...]] | None = None
-def _decision_slot(day: date, observed_at: datetime, day_profile: dict[str, Any]) -> str | None:
+
+
+def _baseline_decision_slot(day: date, observed_at: datetime, day_profile: dict[str, Any]) -> str | None:
     hour = observed_at.hour
-    season = day_profile["season"]
-    if season == "summer":
-        if 6 <= hour <= 8:
-            return "morning"
-        if day_profile["heatwave_day"] and 17 <= hour <= 19:
-            return "evening"
-    elif season == "winter":
-        if hour == 10:
-            return "winter_check"
-    elif season == "autumn":
-        if 8 <= hour <= 10:
-            return "morning"
-    else:
-        if day_profile["min_temperature_c"] < 7.0:
-            return "morning" if 9 <= hour <= 10 else None
-        if 8 <= hour <= 10:
-            return "morning"
+    max_temp = _number(day_profile.get("max_temperature_c"), 20.0)
+
+    if _baseline_dormant_period(day):
+        return "winter_check" if hour == 10 else None
+    if hour == 6:
+        return "morning"
+    if max_temp >= 32.0 and hour == 18:
+        return "evening"
     return None
 
 
-def _make_irrigation_decision(state: PotState, pot: dict[str, Any], weather: dict[str, Any], day_profile: dict[str, Any], slot: str) -> dict[str, Any]:
-    target = pot["winter_moisture_target_pct"] if slot == "winter_check" else pot["moisture_target_pct"]
-    threshold = _threshold_for_pot(pot, day_profile, slot)
-    reason_code = "moisture_ok"
-    reason_detail = "Moisture is above the decision threshold."
-    should_irrigate = False
+def _baseline_dormant_period(day: date) -> bool:
+    return day.month in {12, 1, 2, 3}
+
+
+def _make_baseline_irrigation_decision(state: PotState, pot: dict[str, Any], weather: dict[str, Any], day_profile: dict[str, Any], slot: str) -> dict[str, Any]:
     observed_local = _local_observed_at(weather)
+    target = _baseline_target_for_pot(pot, day_profile, slot)
+    threshold = _baseline_threshold_for_pot(pot, day_profile, slot)
+    critical_low = _baseline_critically_low(state, pot, slot)
+    rain_policy = _baseline_rain_policy(pot, observed_local.date(), day_profile)
+    cadence_days = _baseline_cadence_days(day_profile)
+    cadence_ok = _baseline_cadence_allows(pot, observed_local.date(), cadence_days)
+    dose_factor = min(_baseline_temperature_dose_factor(day_profile), rain_policy["dose_factor"])
+    reason_code = "moisture_ok"
+    reason_detail = "Moisture is above the baseline decision threshold."
+    should_irrigate = False
 
     if day_profile["freeze_risk"]:
         reason_code = "freeze_risk"
         reason_detail = "Skipped because freezing temperatures are present or forecast."
-    elif slot == "winter_check" and not _winter_irrigation_allowed(state, day_profile):
+    elif slot == "winter_check" and not _baseline_winter_irrigation_allowed(state, day_profile):
         reason_code = "winter_conditions_not_met"
-        reason_detail = "Winter watering requires temperature above 10C, dry soil, and no recent rain."
-    elif slot == "evening" and not _second_watering_allowed(state, pot, day_profile):
+        reason_detail = "Winter watering requires very dry soil, 14 days above 5C, and no meaningful precipitation."
+    elif slot == "evening" and not _baseline_second_watering_allowed(state, pot, day_profile):
         reason_code = "second_watering_not_needed"
-        reason_detail = "Evening watering is reserved for heatwave/dry wind stress and eligible pots."
-    elif _is_outdoor(pot, observed_local.date()) and day_profile["precipitation_mm"] >= 2.0 and state.moisture > threshold * 0.85:
+        reason_detail = "Evening baseline watering is reserved for hot/extreme days and eligible or still-low pots."
+    elif rain_policy["skip"] and not critical_low:
         reason_code = "rain_sufficient"
-        reason_detail = "Skipped because stored weather has enough daily precipitation."
-    elif state.moisture < threshold:
+        reason_detail = (
+            f"Skipped because effective rain is {rain_policy['effective_rain_mm']:.1f} mm "
+            f"at {rain_policy['rain_probability_pct']:.0f}% probability."
+        )
+    elif _baseline_covered_rain_day(rain_policy, day_profile) and state.moisture < target:
         should_irrigate = True
-        reason_code = "below_moisture_threshold"
-        reason_detail = f"Moisture {state.moisture:.1f}% is below threshold {threshold:.1f}%."
+        reason_code = "covered_rain_day"
+        reason_detail = (
+            f"Rain is present but this pot is not exposed; moisture {state.moisture:.1f}% "
+            f"is below target {target:.1f}%, so baseline waters 25% less."
+        )
+    elif state.moisture < threshold or critical_low:
+        should_irrigate = True
+        if rain_policy["skip"] and critical_low:
+            dose_factor = min(_baseline_temperature_dose_factor(day_profile), 0.5)
+        reason_code = "baseline_moisture_temperature_rule"
+        reason_detail = (
+            f"Moisture {state.moisture:.1f}% is below threshold {threshold:.1f}%; "
+            f"max temp {day_profile['max_temperature_c']:.1f}C, effective rain {rain_policy['effective_rain_mm']:.1f} mm."
+        )
+    elif not cadence_ok:
+        reason_code = "cool_period_cadence"
+        reason_detail = (
+            f"Cool-season cadence allows irrigation every {cadence_days} days; "
+            f"moisture {state.moisture:.1f}% is still above threshold {threshold:.1f}%."
+        )
 
+    dose_factor = _baseline_allowed_dose_factor(dose_factor)
     return {
         "pot_id": pot["id"],
         "pot_code": pot["pot_code"],
@@ -80,39 +102,49 @@ def _make_irrigation_decision(state: PotState, pot: dict[str, Any], weather: dic
         "reason_code": reason_code,
         "reason_detail": reason_detail,
         "current_moisture_pct": round(state.moisture, 2),
+        "threshold_pct": round(threshold, 2),
         "target_moisture_pct": round(target, 2),
         "weather_hourly_id": weather["id"],
+        "dose_factor": round(dose_factor, 3),
+        "effective_rain_mm": round(rain_policy["effective_rain_mm"], 2),
+        "rain_exposure_factor": round(rain_policy["rain_exposure_factor"], 2),
+        "rain_reduction_pct": round((1.0 - rain_policy["dose_factor"]) * 100.0, 1),
+        "baseline_cadence_days": cadence_days,
     }
 
 
 def _make_fuzzy_dt_decision(state: PotState, pot: dict[str, Any], weather: dict[str, Any], day_profile: dict[str, Any]) -> dict[str, Any]:
     observed_local = _local_observed_at(weather)
-    dap = _days_after_planting(observed_local.date(), pot)
-    etc_mm = _crop_evapotranspiration_mm(day_profile, pot, dap)
-    prescription_mm = _fuzzy_irrigation_prescription_mm(
+    temperature_c = _number(weather.get("temperature_c"), day_profile["avg_temperature_c"])
+    rain_mm = _number(day_profile.get("precipitation_mm"), 0.0)
+    skip_reason = _three_input_irrigation_skip_reason(state.moisture, temperature_c, rain_mm)
+    trigger_threshold = _fuzzy_trigger_threshold_for_pot(pot, day_profile)
+    prescription_mm = 0.0 if skip_reason else _fuzzy_irrigation_prescription_mm(
         soil_moisture_pct=state.moisture,
-        target_moisture_pct=pot["moisture_target_pct"],
-        max_moisture_pct=pot["moisture_max_pct"],
-        etc_mm=etc_mm,
-        dap=dap,
-        rain_forecast_mm=day_profile["precipitation_mm"],
-        rain_probability_pct=day_profile["max_precipitation_probability_pct"],
-        freeze_risk=day_profile["freeze_risk"],
+        temperature_c=temperature_c,
+        rain_mm=rain_mm,
     )
     planned_volume_ml = _fuzzy_prescribed_volume_ml(state, pot, prescription_mm)
-    should_irrigate = prescription_mm >= 0.25 and planned_volume_ml >= 10.0
+    should_irrigate = state.moisture < trigger_threshold and prescription_mm >= 0.25 and planned_volume_ml >= 10.0
 
-    if day_profile["freeze_risk"]:
-        reason_code = "fuzzy_freeze_risk"
-        reason_detail = "FIS prescription suppressed because freezing temperatures are present or forecast."
+    if skip_reason:
+        reason_code = f"fuzzy_{skip_reason['code']}"
+        reason_detail = skip_reason["detail"]
+    elif state.moisture >= trigger_threshold and prescription_mm > 0.0:
+        reason_code = "fuzzy_soft_zone_need"
+        reason_detail = (
+            f"Soil moisture {state.moisture:.1f}% is above the fuzzy trigger threshold "
+            f"{trigger_threshold:.1f}%, but this pot keeps a {prescription_mm:.2f} mm "
+            "soft prescription if another pot opens the valve zone."
+        )
     elif not should_irrigate:
         reason_code = "fuzzy_no_irrigation"
         reason_detail = f"FIS prescription {prescription_mm:.2f} mm does not require irrigation."
     else:
         reason_code = "fuzzy_prescription"
         reason_detail = (
-            f"FIS prescription {prescription_mm:.2f} mm from ETc {etc_mm:.2f} mm, "
-            f"moisture {state.moisture:.1f}%, DAP {dap}, rain forecast {day_profile['precipitation_mm']:.2f} mm."
+            f"FIS prescription {prescription_mm:.2f} mm from moisture {state.moisture:.1f}%, "
+            f"temperature {temperature_c:.1f}C, rain {rain_mm:.2f} mm."
         )
 
     return {
@@ -128,100 +160,84 @@ def _make_fuzzy_dt_decision(state: PotState, pot: dict[str, Any], weather: dict[
         "target_moisture_pct": round(pot["moisture_target_pct"], 2),
         "weather_hourly_id": weather["id"],
         "prescription_mm": round(prescription_mm, 2),
-        "etc_mm": round(etc_mm, 2),
-        "days_after_planting": dap,
-        "rain_forecast_mm": round(day_profile["precipitation_mm"], 2),
-        "rain_probability_pct": round(day_profile["max_precipitation_probability_pct"], 2),
+        "temperature_c": round(temperature_c, 2),
+        "rain_forecast_mm": round(rain_mm, 2),
         "planned_volume_ml": round(planned_volume_ml, 2),
-    }
-
-
-def _make_fao_pm_decision(state: PotState, pot: dict[str, Any], weather: dict[str, Any], day_profile: dict[str, Any]) -> dict[str, Any]:
-    observed_local = _local_observed_at(weather)
-    dap = _days_after_planting(observed_local.date(), pot)
-    etc_mm = _crop_evapotranspiration_mm(day_profile, pot, dap)
-    prescription_mm = 0.0 if day_profile["freeze_risk"] else etc_mm
-    planned_volume_ml = _fuzzy_prescribed_volume_ml(state, pot, prescription_mm)
-    should_irrigate = prescription_mm >= 0.25 and planned_volume_ml >= 10.0
-
-    if day_profile["freeze_risk"]:
-        reason_code = "fao_freeze_risk"
-        reason_detail = "FAO/PM prescription suppressed because freezing temperatures are present or forecast."
-    elif not should_irrigate:
-        reason_code = "fao_no_irrigation"
-        reason_detail = f"FAO/PM prescription {prescription_mm:.2f} mm does not require irrigation."
-    else:
-        reason_code = "fao_pm_prescription"
-        reason_detail = f"FAO/PM prescription {prescription_mm:.2f} mm from ETc {etc_mm:.2f} mm."
-
-    return {
-        "pot_id": pot["id"],
-        "pot_code": pot["pot_code"],
-        "decided_at": observed_local.isoformat(),
-        "date": observed_local.date().isoformat(),
-        "slot": "morning",
-        "should_irrigate": should_irrigate,
-        "reason_code": reason_code,
-        "reason_detail": reason_detail,
-        "current_moisture_pct": round(state.moisture, 2),
-        "target_moisture_pct": round(pot["moisture_target_pct"], 2),
-        "weather_hourly_id": weather["id"],
-        "prescription_mm": round(prescription_mm, 2),
-        "etc_mm": round(etc_mm, 2),
-        "days_after_planting": dap,
-        "rain_forecast_mm": round(day_profile["precipitation_mm"], 2),
-        "rain_probability_pct": round(day_profile["max_precipitation_probability_pct"], 2),
-        "planned_volume_ml": round(planned_volume_ml, 2),
+        "fuzzy_trigger_threshold_pct": round(trigger_threshold, 2),
     }
 
 
 def _fuzzy_irrigation_prescription_mm(
     soil_moisture_pct: float,
-    target_moisture_pct: float,
-    max_moisture_pct: float,
-    etc_mm: float,
-    dap: int,
-    rain_forecast_mm: float,
-    rain_probability_pct: float,
-    freeze_risk: bool,
+    temperature_c: float,
+    rain_mm: float,
 ) -> float:
-    if freeze_risk:
-        return 0.0
+    very_dry = _left_shoulder(soil_moisture_pct, 28.0, 42.0)
+    dry = _triangular(soil_moisture_pct, 30.0, 45.0, 60.0)
+    adequate = _triangular(soil_moisture_pct, 52.0, 66.0, 78.0)
+    wet = _right_shoulder(soil_moisture_pct, 72.0, 86.0)
 
-    deficit_pct = max(0.0, target_moisture_pct - soil_moisture_pct)
-    surplus_pct = max(0.0, soil_moisture_pct - target_moisture_pct)
-    dry = _triangular(deficit_pct, 4.0, 11.0, 20.0)
-    very_dry = _right_shoulder(deficit_pct, 14.0, 26.0)
-    slight_deficit = _triangular(deficit_pct, 0.0, 5.0, 12.0)
-    adequate = _triangular(surplus_pct, 0.0, 2.0, 8.0)
-    wet = max(_right_shoulder(soil_moisture_pct, target_moisture_pct + 6.0, max_moisture_pct), _right_shoulder(surplus_pct, 8.0, 16.0))
+    cold = _left_shoulder(temperature_c, 8.0, 14.0)
+    mild = _triangular(temperature_c, 10.0, 22.0, 30.0)
+    hot = _right_shoulder(temperature_c, 27.0, 34.0)
 
-    et_low = _left_shoulder(etc_mm, 0.8, 1.8)
-    et_medium = _triangular(etc_mm, 1.2, 3.0, 4.8)
-    et_high = _right_shoulder(etc_mm, 3.8, 6.2)
-
-    stage_initial = _left_shoulder(float(dap), 18.0, 42.0)
-    stage_development = _triangular(float(dap), 25.0, 70.0, 115.0)
-    stage_mid = _right_shoulder(float(dap), 80.0, 130.0)
-    active_stage = max(stage_development, stage_mid * 0.95)
-
-    rain_none = _left_shoulder(rain_forecast_mm, 0.2, 1.0)
-    rain_moderate = _triangular(rain_forecast_mm, 0.5, 2.5, 5.5)
-    rain_heavy = _right_shoulder(rain_forecast_mm, 4.0, 8.0)
-
-    prob_low = _left_shoulder(rain_probability_pct, 25.0, 55.0)
-    prob_medium = _triangular(rain_probability_pct, 35.0, 60.0, 85.0)
-    prob_high = _right_shoulder(rain_probability_pct, 70.0, 90.0)
+    rain_none = _left_shoulder(rain_mm, 0.2, 1.0)
+    rain_moderate = _triangular(rain_mm, 0.5, 2.5, 5.5)
+    rain_heavy = _right_shoulder(rain_mm, 4.0, 8.0)
 
     rules = {
-        "none": max(wet, rain_heavy, min(rain_moderate, prob_high), min(adequate, et_low)),
-        "very_low": max(min(adequate, et_medium), min(slight_deficit, et_low), min(stage_initial, prob_medium)),
-        "low": max(min(slight_deficit, et_medium, rain_none), min(dry, et_low), min(dry, rain_moderate)),
-        "medium": max(min(dry, et_medium, rain_none), min(slight_deficit, et_high, prob_low), min(dry, active_stage, prob_medium)),
-        "high": max(min(dry, et_high, prob_low), min(very_dry, et_medium, rain_none), min(very_dry, active_stage)),
-        "very_high": min(very_dry, et_high, active_stage, rain_none, prob_low),
+        "none": max(wet, cold, rain_heavy, min(adequate, rain_moderate)),
+        "very_low": max(min(adequate, mild, rain_none), min(dry, rain_moderate), min(very_dry, rain_heavy)),
+        "low": max(min(dry, mild, rain_none), min(adequate, hot, rain_none), min(very_dry, rain_moderate)),
+        "medium": max(min(dry, hot, rain_none), min(very_dry, mild, rain_none)),
+        "high": min(very_dry, hot, rain_none),
+        "very_high": min(very_dry, hot, rain_none, _left_shoulder(rain_mm, 0.0, 0.4)),
     }
     return _defuzzify_irrigation_mm(rules)
+
+
+def _three_input_irrigation_skip_reason(
+    soil_moisture_pct: float,
+    temperature_c: float,
+    rain_mm: float,
+) -> dict[str, str] | None:
+    if temperature_c <= 3.0:
+        return {
+            "code": "cold_skip",
+            "detail": "Skipped because temperature is too low for irrigation.",
+        }
+    if soil_moisture_pct >= 62.0:
+        return {
+            "code": "moisture_sufficient",
+            "detail": f"Skipped because soil moisture {soil_moisture_pct:.1f}% is already sufficient.",
+        }
+    if rain_mm >= 4.0 and soil_moisture_pct > 28.0:
+        return {
+            "code": "rain_sufficient",
+            "detail": f"Skipped because rain {rain_mm:.1f} mm is sufficient for the current moisture level.",
+        }
+    if rain_mm >= 1.0 and soil_moisture_pct >= 42.0:
+        return {
+            "code": "rain_and_moisture_sufficient",
+            "detail": f"Skipped because rain {rain_mm:.1f} mm and moisture {soil_moisture_pct:.1f}% are sufficient.",
+        }
+    if temperature_c <= 10.0 and soil_moisture_pct >= 35.0:
+        return {
+            "code": "cool_day_moisture_sufficient",
+            "detail": (
+                f"Skipped because temperature {temperature_c:.1f}C is cool and "
+                f"soil moisture {soil_moisture_pct:.1f}% is sufficient."
+            ),
+        }
+    return None
+
+
+def _fuzzy_trigger_threshold_for_pot(pot: dict[str, Any], day_profile: dict[str, Any]) -> float:
+    threshold = _threshold_for_pot(pot, day_profile, "morning")
+    max_temp = _number(day_profile.get("max_temperature_c"), 20.0)
+    if max_temp >= 32.0 and _baseline_heat_priority_pot(pot):
+        threshold += 1.0
+    return _clamp(threshold, 5.0, float(pot["moisture_target_pct"]) - 2.0)
 
 
 def _defuzzify_irrigation_mm(rule_strengths: dict[str, float]) -> float:
@@ -268,7 +284,8 @@ def _triangular(value: float, left: float, center: float, right: float) -> float
         return (value - left) / max(center - left, 1e-9)
     return (right - value) / max(right - center, 1e-9)
 
-
+# The fuzzy prescription uses the same three inputs as ANFIS:
+# soil moisture, temperature, and rain.
 def _left_shoulder(value: float, full_until: float, zero_at: float) -> float:
     value = float(value)
     if value <= full_until:
@@ -285,49 +302,6 @@ def _right_shoulder(value: float, zero_until: float, full_at: float) -> float:
     if value >= full_at:
         return 1.0
     return (value - zero_until) / max(full_at - zero_until, 1e-9)
-
-
-def _days_after_planting(day: date, pot: dict[str, Any]) -> int:
-    start_month_day = {
-        "vegetables": (4, 1),
-        "herbs": (4, 15),
-        "flowering": (4, 1),
-        "shrubs": (3, 1),
-        "succulents": (3, 15),
-    }.get(pot["plant_type_code"], (4, 1))
-    season_start = date(day.year, start_month_day[0], start_month_day[1])
-    if day < season_start:
-        season_start = date(day.year - 1, start_month_day[0], start_month_day[1])
-    return max(1, min((day - season_start).days + 1, 240))
-
-
-def _crop_evapotranspiration_mm(day_profile: dict[str, Any], pot: dict[str, Any], dap: int) -> float:
-    reference_et = max(0.0, _number(day_profile.get("reference_evapotranspiration_mm"), 0.0))
-    base_crop = {
-        "vegetables": 1.08,
-        "herbs": 0.92,
-        "flowering": 0.95,
-        "shrubs": 0.78,
-        "succulents": 0.38,
-    }.get(pot["plant_type_code"], 0.9)
-    if dap <= 35:
-        stage = 0.62
-    elif dap <= 85:
-        stage = 0.88
-    elif dap <= 150:
-        stage = 1.08
-    else:
-        stage = 0.82
-    sun_factor = pot.get("_sun_factor")
-    if sun_factor is None:
-        sun_factor = _sun_factor(pot)
-    wind_factor = pot.get("_wind_factor")
-    if wind_factor is None:
-        wind_factor = _wind_factor(pot)
-    exposure = 0.85 + (sun_factor - 1.0) * 0.45 + (wind_factor - 1.0) * 0.3
-    return round(reference_et * base_crop * stage * max(0.45, exposure), 2)
-
-
 
 
 def _size_flow_rate_multiplier(pot: dict[str, Any]) -> float:
@@ -352,15 +326,13 @@ def _fuzzy_prescribed_volume_ml(state: PotState, pot: dict[str, Any], prescripti
     return max(0.0, prescription_mm) * _pot_surface_area_m2(pot) * 1000.0
 
 
-def _apply_fuzzy_prescribed_event(state: PotState, pot: dict[str, Any], weather: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
+def _fuzzy_prescribed_request(pot: dict[str, Any], weather: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
     planned_volume_ml = max(0.0, _number(decision.get("planned_volume_ml"), 0.0))
     flow_rate = max(pot["drip_flow_ml_min"] * _size_flow_rate_multiplier(pot), 1.0)
     duration_min = planned_volume_ml / flow_rate if flow_rate > 0 else 0.0
     cycle_count = 2 if pot["cycle_soak_enabled"] and duration_min >= 10 else 1
     soak_pause_min = 10 if cycle_count == 2 else 0
 
-    _apply_planned_volume(state, pot, planned_volume_ml)
-
     scheduled_start = _local_observed_at(weather)
     scheduled_end = scheduled_start + timedelta(minutes=duration_min + soak_pause_min)
     return {
@@ -372,26 +344,33 @@ def _apply_fuzzy_prescribed_event(state: PotState, pot: dict[str, Any], weather:
         "scheduled_end_at": scheduled_end.isoformat(),
         "flow_rate_ml_min": round(flow_rate, 2),
         "planned_volume_ml": round(planned_volume_ml, 2),
+        "requested_volume_ml": round(planned_volume_ml, 2),
+        "duration_min": round(duration_min, 3),
         "cycle_count": cycle_count,
         "soak_pause_min": soak_pause_min,
         "prescription_mm": decision.get("prescription_mm", 0.0),
     }
 
 
-def _apply_irrigation_event(state: PotState, pot: dict[str, Any], weather: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
-    target = decision["target_moisture_pct"]
-    need_pct = max(0.0, target - state.moisture)
+def _apply_fuzzy_prescribed_event(state: PotState, pot: dict[str, Any], weather: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
+    event = _fuzzy_prescribed_request(pot, weather, decision)
+    return _apply_event_delivery(state, pot, event, event["requested_volume_ml"], event.get("duration_min"))
+
+
+def _baseline_irrigation_request(pot: dict[str, Any], weather: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
+    target = _number(decision.get("target_moisture_pct"), pot["moisture_target_pct"])
+    start_moisture = _baseline_full_dose_start_moisture(pot, decision, target)
+    need_pct = max(0.0, target - start_moisture)
+    dose_factor = _baseline_allowed_dose_factor(_number(decision.get("dose_factor"), 1.0))
     volume_l = pot["volume_l"]
     retention = max(pot["retention_factor"], 0.1)
     flow_rate = max(pot["drip_flow_ml_min"] * _size_flow_rate_multiplier(pot), 1.0)
-    planned_volume_ml = max(0.0, need_pct * volume_l * 10.0 / retention)
     max_minutes = {"huge": 90, "large": 60, "medium": 35, "small": 20}[pot["size_class"]]
-    planned_volume_ml = min(planned_volume_ml, flow_rate * max_minutes)
+    full_dose_volume_ml = min(max(0.0, need_pct * volume_l * 10.0 / retention), flow_rate * max_minutes)
+    planned_volume_ml = full_dose_volume_ml * dose_factor
     duration_min = planned_volume_ml / flow_rate
     cycle_count = 2 if pot["cycle_soak_enabled"] and duration_min >= 10 else 1
     soak_pause_min = 10 if cycle_count == 2 else 0
-
-    _apply_planned_volume(state, pot, planned_volume_ml)
 
     scheduled_start = _local_observed_at(weather)
     scheduled_end = scheduled_start + timedelta(minutes=duration_min + soak_pause_min)
@@ -404,9 +383,66 @@ def _apply_irrigation_event(state: PotState, pot: dict[str, Any], weather: dict[
         "scheduled_end_at": scheduled_end.isoformat(),
         "flow_rate_ml_min": round(flow_rate, 2),
         "planned_volume_ml": round(planned_volume_ml, 2),
+        "requested_volume_ml": round(planned_volume_ml, 2),
+        "duration_min": round(duration_min, 3),
         "cycle_count": cycle_count,
         "soak_pause_min": soak_pause_min,
+        "full_dose_volume_ml": round(full_dose_volume_ml, 2),
+        "dose_factor": round(dose_factor, 3),
+        "dose_reduction_pct": round((1.0 - dose_factor) * 100.0, 1),
     }
+
+
+def _apply_baseline_irrigation_event(state: PotState, pot: dict[str, Any], weather: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
+    event = _baseline_irrigation_request(pot, weather, decision)
+    return _apply_event_delivery(state, pot, event, event["requested_volume_ml"], event.get("duration_min"))
+
+
+def _apply_event_delivery(
+    state: PotState,
+    pot: dict[str, Any],
+    event: dict[str, Any],
+    delivered_volume_ml: float,
+    duration_min: float | None = None,
+) -> dict[str, Any]:
+    delivered_volume_ml = max(0.0, float(delivered_volume_ml or 0.0))
+    requested_volume_ml = max(0.0, _number(event.get("requested_volume_ml"), event.get("planned_volume_ml", 0.0)))
+    flow_rate = max(_number(event.get("flow_rate_ml_min"), pot["drip_flow_ml_min"]), 1.0)
+    runtime_min = max(0.0, _number(duration_min, delivered_volume_ml / flow_rate if flow_rate > 0 else 0.0))
+    cycle_count = 2 if pot["cycle_soak_enabled"] and runtime_min >= 10 else 1
+    soak_pause_min = 10 if cycle_count == 2 else 0
+
+    _apply_planned_volume(state, pot, delivered_volume_ml)
+
+    scheduled_start = datetime.fromisoformat(str(event["scheduled_start_at"]))
+    scheduled_end = scheduled_start + timedelta(minutes=runtime_min + soak_pause_min)
+    output = dict(event)
+    output.update(
+        {
+            "scheduled_end_at": scheduled_end.isoformat(),
+            "duration_min": round(runtime_min, 3),
+            "valve_runtime_min": round(runtime_min, 3),
+            "cycle_count": cycle_count,
+            "soak_pause_min": soak_pause_min,
+            "requested_volume_ml": round(requested_volume_ml, 2),
+            "delivered_volume_ml": round(delivered_volume_ml, 2),
+            "planned_volume_ml": round(delivered_volume_ml, 2),
+            "delivery_error_ml": round(delivered_volume_ml - requested_volume_ml, 2),
+            "delivery_ratio": round(delivered_volume_ml / requested_volume_ml, 4) if requested_volume_ml > 0 else None,
+            "physical_distribution_policy": "valve_runtime_x_pot_drip_flow",
+        }
+    )
+    return output
+
+
+def _baseline_full_dose_start_moisture(pot: dict[str, Any], decision: dict[str, Any], target: float) -> float:
+    if decision.get("full_dose_start_moisture_pct") is not None:
+        return _clamp(_number(decision.get("full_dose_start_moisture_pct"), target), 0.0, target)
+    if decision.get("current_moisture_pct") is not None:
+        return _clamp(_number(decision.get("current_moisture_pct"), target), 0.0, target)
+    if decision.get("slot") == "winter_check":
+        return max(7.0, min(target - 5.0, 12.0))
+    return _number(pot.get("moisture_min_pct"), target)
 
 
 def _apply_planned_volume(state: PotState, pot: dict[str, Any], planned_volume_ml: float) -> None:
@@ -416,6 +452,218 @@ def _apply_planned_volume(state: PotState, pot: dict[str, Any], planned_volume_m
     state.moisture = _clamp(state.moisture + moisture_gain, 0.0, 100.0)
 
 
+
+
+def _baseline_target_for_pot(pot: dict[str, Any], day_profile: dict[str, Any], slot: str) -> float:
+    if slot == "winter_check":
+        return float(pot["winter_moisture_target_pct"])
+
+    target = float(pot["moisture_target_pct"])
+    max_temp = _number(day_profile.get("max_temperature_c"), 20.0)
+    boost = 0.0
+    if 28.0 <= max_temp < 32.0 and (_baseline_high_need_pot(pot) or pot.get("sun_exposure") in {"full", "reflected_heat"}):
+        boost = 2.0
+    elif 32.0 <= max_temp < 35.0:
+        boost = 2.0
+    elif max_temp >= 35.0 and _baseline_heat_priority_pot(pot):
+        boost = 3.0
+    if slot == "evening":
+        boost = min(boost, 1.5)
+    return min(float(pot["moisture_max_pct"]) - 2.0, target + boost)
+
+
+def _baseline_threshold_for_pot(pot: dict[str, Any], day_profile: dict[str, Any], slot: str) -> float:
+    min_moisture = float(pot["moisture_min_pct"])
+    target = float(pot["moisture_target_pct"])
+    max_temp = _number(day_profile.get("max_temperature_c"), 20.0)
+    avg_temp = _number(day_profile.get("avg_temperature_c"), max_temp)
+
+    if slot == "winter_check":
+        return max(7.0, min(float(pot["winter_moisture_target_pct"]) - 5.0, 12.0))
+    if max_temp < 15.0:
+        threshold = max(7.0, min_moisture - 5.0)
+    elif avg_temp < 18.0:
+        threshold = min_moisture - 1.5
+    elif avg_temp < 22.0:
+        threshold = min_moisture
+    elif max_temp < 28.0:
+        threshold = min_moisture + (1.0 if _baseline_high_need_pot(pot) else 0.0)
+    elif max_temp < 32.0:
+        threshold = min_moisture + 3.0
+    elif max_temp < 35.0:
+        threshold = min_moisture + 5.0
+    else:
+        threshold = min_moisture + (7.0 if _baseline_heat_priority_pot(pot) else 5.0)
+
+    if day_profile.get("dry_windy_day") and pot["size_class"] == "small":
+        threshold += 2.0
+    if (
+        int(day_profile.get("dry_streak_days") or 0) >= 2
+        and _number(day_profile.get("precipitation_mm"), 0.0) < 0.5
+        and max_temp >= 24.0
+    ):
+        if pot["size_class"] == "small":
+            threshold += 4.0
+        elif _baseline_high_need_pot(pot) and pot.get("sun_exposure") in {"full", "reflected_heat"}:
+            threshold += 2.0
+    if slot == "evening":
+        threshold = max(threshold, min_moisture + (4.0 if max_temp >= 35.0 else 2.0))
+    return _clamp(threshold, 5.0, target - 1.0)
+
+
+def _baseline_temperature_dose_factor(day_profile: dict[str, Any]) -> float:
+    min_temp = _number(day_profile.get("min_temperature_c"), 20.0)
+    max_temp = _number(day_profile.get("max_temperature_c"), 20.0)
+    avg_temp = _number(day_profile.get("avg_temperature_c"), max_temp)
+    if max_temp <= 15.0 and 5.0 <= min_temp <= 12.0:
+        return 0.5
+    if avg_temp < 15.0:
+        return 0.5
+    return 1.0
+
+
+def _baseline_allowed_dose_factor(value: float) -> float:
+    number_value = _clamp(_number(value, 1.0), 0.5, 1.0)
+    if number_value <= 0.625:
+        return 0.5
+    if number_value <= 0.875:
+        return 0.75
+    return 1.0
+
+
+def _baseline_rain_policy(pot: dict[str, Any], day: date, day_profile: dict[str, Any]) -> dict[str, Any]:
+    exposure = _rain_exposure_factor(pot, day)
+    rain_mm = _number(day_profile.get("precipitation_mm"), 0.0)
+    probability = _number(day_profile.get("max_precipitation_probability_pct"), 0.0)
+    if probability <= 0.0 and rain_mm >= 1.0:
+        probability = 100.0
+    effective_rain = rain_mm * exposure
+    reduction = 0.0
+    skip = False
+
+    if probability > 80.0 and effective_rain > 10.0:
+        reduction = 0.5
+        skip = True
+    elif probability > 75.0 and effective_rain > 6.0:
+        reduction = 0.5
+        skip = True
+    elif probability >= 60.0 and effective_rain >= 3.0:
+        reduction = 0.5
+    elif probability >= 40.0 and effective_rain >= 1.0:
+        reduction = 0.25
+
+    if exposure <= 0.0:
+        skip = False
+        if probability >= 40.0 and rain_mm >= 1.0:
+            reduction = 0.25
+        else:
+            reduction = min(reduction, 0.25)
+
+    return {
+        "rain_exposure_factor": exposure,
+        "effective_rain_mm": effective_rain,
+        "rain_probability_pct": probability,
+        "dose_factor": _baseline_allowed_dose_factor(1.0 - reduction),
+        "skip": skip,
+    }
+
+
+def _baseline_covered_rain_day(rain_policy: dict[str, Any], day_profile: dict[str, Any]) -> bool:
+    return (
+        _number(day_profile.get("precipitation_mm"), 0.0) >= 1.0
+        and _number(rain_policy.get("rain_probability_pct"), 0.0) >= 40.0
+        and _number(rain_policy.get("rain_exposure_factor"), 0.0) <= 0.0
+    )
+
+
+def _rain_exposure_factor(pot: dict[str, Any], day: date) -> float:
+    if not _is_outdoor(pot, day):
+        return 0.0
+    rain_exposure = str(pot.get("rain_exposure") or "")
+    if rain_exposure:
+        return {
+            "covered": 0.0,
+            "partially_exposed": 0.5,
+            "fully_exposed": 1.0,
+        }.get(rain_exposure, 0.5)
+
+    zone = str(pot.get("balcony_zone") or "")
+    if zone in {"north_shelter"}:
+        return 0.0
+    if zone in {"west_wall", "east_corner"}:
+        return 0.5
+    if zone in {"south_rail", "hanging_row"}:
+        return 1.0
+    if str(pot.get("sun_exposure") or "") in {"full", "reflected_heat"}:
+        return 1.0
+    return 0.5
+
+
+def _baseline_cadence_days(day_profile: dict[str, Any]) -> int:
+    avg_temp = _number(day_profile.get("avg_temperature_c"), 20.0)
+    max_temp = _number(day_profile.get("max_temperature_c"), avg_temp)
+    rain_mm = _number(day_profile.get("precipitation_mm"), 0.0)
+    rain_probability = _number(day_profile.get("max_precipitation_probability_pct"), 0.0)
+
+    if day_profile.get("dormant_period") or max_temp < 12.0:
+        return 7
+    if max_temp < 15.0:
+        return 4
+    if avg_temp < 18.0:
+        return 3 if rain_mm < 3.0 and rain_probability < 60.0 else 5
+    if max_temp >= 22.0:
+        return 1
+    if avg_temp < 25.0:
+        return 2
+    return 1
+
+
+def _baseline_cadence_allows(pot: dict[str, Any], day: date, cadence_days: int) -> bool:
+    if cadence_days <= 1:
+        return True
+    return (day.toordinal() + int(pot["id"])) % cadence_days == 0
+
+
+def _baseline_critically_low(state: PotState, pot: dict[str, Any], slot: str) -> bool:
+    if slot == "winter_check":
+        return state.moisture <= max(7.0, float(pot["winter_moisture_target_pct"]) - 6.0)
+    return state.moisture <= max(8.0, float(pot["moisture_min_pct"]) - 8.0)
+
+
+def _baseline_winter_irrigation_allowed(state: PotState, day_profile: dict[str, Any]) -> bool:
+    return (
+        state.moisture < 10.0
+        and day_profile.get("min_temperature_next_14_days_c", day_profile["min_temperature_c"]) > 5.0
+        and day_profile.get("precipitation_next_14_days_mm", day_profile["precipitation_mm"]) < 1.0
+        and day_profile.get("max_precipitation_probability_next_14_days_pct", 0.0) < 40.0
+    )
+
+
+def _baseline_second_watering_allowed(state: PotState, pot: dict[str, Any], day_profile: dict[str, Any]) -> bool:
+    max_temp = _number(day_profile.get("max_temperature_c"), 20.0)
+    if max_temp < 32.0:
+        return False
+    eligible = _baseline_heat_priority_pot(pot) or pot["allows_second_watering"]
+    if max_temp >= 35.0:
+        return eligible and state.moisture < pot["moisture_target_pct"]
+    return eligible and state.moisture < max(pot["moisture_min_pct"] + 2.0, pot["moisture_target_pct"] - 6.0)
+
+
+def _baseline_high_need_pot(pot: dict[str, Any]) -> bool:
+    return (
+        pot.get("water_need_level") == "high"
+        or pot.get("heat_sensitive")
+        or pot.get("plant_type_code") in {"vegetables", "herbs", "tomatoes", "cucumbers", "flowering"}
+    )
+
+
+def _baseline_heat_priority_pot(pot: dict[str, Any]) -> bool:
+    return (
+        _baseline_high_need_pot(pot)
+        or pot.get("size_class") == "small"
+        or pot.get("small_subtype") == "hanging"
+        or pot.get("balcony_zone") == "hanging_row"
+    )
 
 
 def _threshold_for_pot(pot: dict[str, Any], day_profile: dict[str, Any], slot: str) -> float:
@@ -464,12 +712,11 @@ def _alert_row(pot: dict[str, Any], weather: dict[str, Any], alert_type: str, se
 
 
 def _is_outdoor(pot: dict[str, Any], day: date) -> bool:
-    outdoor_by_season = pot.get("_outdoor_by_season")
-    if outdoor_by_season is not None:
-        return bool(outdoor_by_season.get(_season(day)))
-    if _season(day) == "winter":
-        return pot["winter_location"] == "outdoor"
-    return pot["default_location"] == "outdoor"
+    return True
+
+
+def _cold_month(day: date) -> bool:
+    return day.month in {11, 12, 1, 2, 3}
 
 
 def _upcoming_freeze(day: date, weather_by_day: dict[date, list[dict[str, Any]]], days: int = 3) -> bool:
@@ -486,4 +733,3 @@ def _precipitation_last_days(day: date, weather_by_day: dict[date, list[dict[str
         rows = weather_by_day.get(day - timedelta(days=offset), [])
         total += sum(_number(row["precipitation_mm"], 0.0) for row in rows)
     return total
-

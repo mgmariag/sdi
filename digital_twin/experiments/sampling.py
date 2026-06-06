@@ -3,11 +3,14 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
+from digital_twin.experiments.base import EngineBackedExperiment
 from digital_twin.simulation.dto import ExperimentSnapshot
 
 
-class SamplingIrrigationExperiment:
+class SamplingIrrigationExperiment(EngineBackedExperiment):
     """Compares full-data irrigation decisions with sparse sampling."""
+
+    engine_runner_name = "run_daily_sampling_experiment"
 
     def __init__(
         self,
@@ -17,23 +20,15 @@ class SamplingIrrigationExperiment:
         sample_interval_hours: int | None = None,
         persist: bool = False,
         snapshot: ExperimentSnapshot | None = None,
+        baseline_result: dict[str, Any] | None = None,
     ) -> None:
-        self.start_date = start_date
-        self.end_date = end_date
+        super().__init__(start_date, end_date, persist, snapshot, baseline_result)
         self.sample_interval_days = sample_interval_days
         self.sample_interval_hours = sample_interval_hours
-        self.persist = persist
-        self.snapshot = snapshot
 
-    def run(self) -> dict[str, Any]:
-        from digital_twin.simulation.engine import run_daily_sampling_experiment
-
-        return run_daily_sampling_experiment(
-            start_date=self.start_date,
-            end_date=self.end_date,
-            sample_interval_days=self.sample_interval_days,
-            sample_interval_hours=self.sample_interval_hours,
-            persist=self.persist,
-            snapshot=self.snapshot,
-        )
+    def engine_parameters(self) -> dict[str, Any]:
+        return {
+            "sample_interval_days": self.sample_interval_days,
+            "sample_interval_hours": self.sample_interval_hours,
+        }
 

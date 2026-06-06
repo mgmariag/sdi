@@ -14,6 +14,8 @@
 
     const { fetchJson, getApiUrl } = ApiClient;
     const { prepareChartResult } = ChartBuilder;
+    const ANFIS_TRAIN_SAMPLES = 2000;
+    const ANFIS_TEST_SAMPLES = 800;
     const {
         addDays,
         defaultOverview,
@@ -30,6 +32,7 @@
         defaultSamplingSummary,
         experimentRange,
         formatWeatherRange,
+        RECOMMENDED_SAMPLING_INTERVAL_HOURS,
         weatherRangeKey
     } = ExperimentMapper;
 
@@ -41,21 +44,24 @@
             this._chartOverlayObservers = {};
             this._chartOverlayListenerCleanups = {};
             this._appliedChartWindowSignatures = {};
+            this._overviewRefreshTimer = null;
+            this._overviewRefreshHandler = null;
             this._sensorPlacementDialog = null;
             this._weatherUnavailableByRange = {};
             this._precomputeStartedByRange = {};
-            this._experimentResultCache = {};
+            // Experiment result caching is temporarily disabled.
+            // this._experimentResultCache = {};
             this._registerChartFormatters();
             const defaultRange = defaultExperimentRange();
 
             const initialData = {
-                helloMessage: "Welcome! Attempting to connect to DT service...",
+                helloMessage: "Welcome! Attempting to connect to irrigation service...",
                 experimentSettings: {
                     start_date: defaultRange.start,
                     end_date: defaultRange.end
                 },
                 samplingSettings: {
-                    sample_interval_hours: 72
+                    sample_interval_hours: RECOMMENDED_SAMPLING_INTERVAL_HOURS
                 },
                 sensorSettings: {
                     sensor_count: null
@@ -68,11 +74,17 @@
                 weatherAvailability: {
                     maxWeatherDate: null
                 },
+                chartVisibility: {
+                    baseline: true,
+                    weather: true
+                },
                 experimentFooter: defaultExperimentFooter(),
-                experimentSummaryCardsHtml: "",
                 sensorPlacements: [],
                 sensorPlacementSummary: {
                     sensor_count: null,
+                    minimum_sensor_count: 5,
+                    valve_count: 5,
+                    has_all_valve_zones: false,
                     stored_sensor_count: 0,
                     sensor_reading_pot_count: 0,
                     active_pot_count: 0,
@@ -80,15 +92,18 @@
                     loaded: false
                 },
                 samplingEntries: [],
+                samplingChartAllEntries: [],
                 samplingChartEntries: [],
                 samplingPots: [],
                 anfisEntries: [],
+                anfisChartAllEntries: [],
                 anfisChartEntries: [],
                 anfisPots: [],
                 fuzzyEntries: [],
+                fuzzyChartAllEntries: [],
                 fuzzyChartEntries: [],
                 fuzzyPots: [],
-                samplingSummary: defaultSamplingSummary(72),
+                samplingSummary: defaultSamplingSummary(RECOMMENDED_SAMPLING_INTERVAL_HOURS),
                 anfisSummary: defaultAnfisSummary(),
                 fuzzySummary: defaultFuzzySummary(),
                 activeExperiment: null,
@@ -103,6 +118,7 @@
             this._sensorPlacementReady = this._loadSensorPlacements(oModel);
             this._loadWeatherAvailability(oModel);
             this._loadOverview(oModel);
+            this._startOverviewRefresh(oModel);
 
             fetch(getApiUrl("/api/hello").toString())
                 .then((response) => response.json())
@@ -110,18 +126,51 @@
                     if (result && result.message) {
                         oModel.setProperty("/helloMessage", result.message);
                     } else {
-                        oModel.setProperty("/helloMessage", "DT service connected but returned unexpected response");
+                        oModel.setProperty("/helloMessage", "Irrigation service connected but returned unexpected response");
                     }
                 })
                 .catch(() => {
-                    oModel.setProperty("/helloMessage", "DT service connection failed");
+                    oModel.setProperty("/helloMessage", "Irrigation service connection failed");
                 });
         },
 
+        onExit() {
+            if (this._overviewRefreshTimer) {
+                clearInterval(this._overviewRefreshTimer);
+                this._overviewRefreshTimer = null;
+            }
+            if (this._overviewRefreshHandler) {
+                document.removeEventListener("visibilitychange", this._overviewRefreshHandler);
+                this._overviewRefreshHandler = null;
+            }
+        },
+
+        _startOverviewRefresh(model) {
+            this._overviewRefreshHandler = () => {
+                if (!document.hidden) {
+                    this._refreshOverviewIfVisible(model);
+                }
+            };
+            document.addEventListener("visibilitychange", this._overviewRefreshHandler);
+            this._overviewRefreshTimer = setInterval(() => {
+                this._refreshOverviewIfVisible(model);
+            }, 30000);
+        },
+
+        _refreshOverviewIfVisible(model) {
+            if (!model || model.getProperty("/activeExperiment")) {
+                return undefined;
+            }
+            return this._loadOverview(model);
+        },
+
         _loadOverview(model) {
-            return fetchJson(getApiUrl("/api/overview").toString())
+            const url = getApiUrl("/api/overview");
+            url.searchParams.set("_", String(Date.now()));
+            return fetchJson(url.toString(), { cache: "no-store" })
                 .then((result) => {
                     model.setProperty("/overview", prepareOverview(result));
+                    this._updateExperimentFooter(model);
                 })
                 .catch(() => {
                     model.setProperty("/overview/loaded", false);
@@ -142,10 +191,11 @@
                     }, null);
                     if (maxDate) {
                         const endDate = formatLocalDate(maxDate);
-                        const settings = model.getProperty("/experimentSettings") || {};
+                        // const settings = model.getProperty("/experimentSettings") || {};
                         model.setProperty("/weatherAvailability/maxWeatherDate", endDate);
-                        const range = experimentRange(settings);
-                        this._precomputeExperiments(model, range.start, range.end);
+                        // const range = experimentRange(settings);
+                        // Experiment cache precompute is temporarily disabled.
+                        // this._precomputeExperiments(model, range.start, range.end);
                     }
                 })
                 .catch(() => {
@@ -163,7 +213,7 @@
                 .then(() => {
                     const sampling = model.getProperty("/samplingSettings") || {};
                     const settings = model.getProperty("/experimentSettings") || {};
-                    const sampleIntervalHours = Math.min(336, Math.max(1, Math.floor(Number(sampling.sample_interval_hours) || 72)));
+                    const sampleIntervalHours = Math.min(336, Math.max(1, Math.floor(Number(sampling.sample_interval_hours) || RECOMMENDED_SAMPLING_INTERVAL_HOURS)));
                     const sensorCount = this._normalizedSensorCount(model);
                     const cacheKey = `${startDate}|${endDate}|${sampleIntervalHours}|${sensorCount}`;
                     if (this._precomputeStartedByRange[cacheKey]) {
@@ -177,8 +227,8 @@
                     url.searchParams.set("start", startDate);
                     url.searchParams.set("end", endDate);
                     url.searchParams.set("sample_interval_hours", sampleIntervalHours);
-                    url.searchParams.set("train_samples", 500);
-                    url.searchParams.set("test_samples", 200);
+                    url.searchParams.set("train_samples", ANFIS_TRAIN_SAMPLES);
+                    url.searchParams.set("test_samples", ANFIS_TEST_SAMPLES);
                     url.searchParams.set("seed", settings.scenario_seed || 2026);
                     return fetchJson(url.toString(), { method: "POST" })
                         .catch((error) => {
@@ -213,6 +263,23 @@
 
         _updateExperimentFooter(model, loadedFromCache) {
             SummaryCards.updateExperimentFooter(model, loadedFromCache);
+            this._ensureExperimentContext(model);
+        },
+
+        _ensureExperimentContext(model) {
+            if (
+                !model
+                || !model.getProperty("/activeExperiment")
+                || model.getProperty("/overview/experimentSideRailHtml")
+                || this._experimentOverviewLoadPending
+            ) {
+                return;
+            }
+
+            this._experimentOverviewLoadPending = true;
+            this._loadOverview(model).finally(() => {
+                this._experimentOverviewLoadPending = false;
+            });
         },
 
         _getSensorPlacementDialog() {
@@ -329,23 +396,32 @@
             const placementKey = Array.isArray(items)
                 ? items.map((item) => item.pot_id || item.sensor_id || item.id).join(",")
                 : "";
-            return [experiment, range.start, range.end, placementKey, extraKey || ""].join("|");
+            return [experiment, "weather-popover-v5-valves", range.start, range.end, placementKey, extraKey || ""].join("|");
         },
 
         _storeExperimentResult(cacheKey, result) {
-            if (result && result.entries && result.summary) {
-                this._experimentResultCache[cacheKey] = result;
+            if (!cacheKey || !result) {
+                return;
             }
+            // Experiment result caching is temporarily disabled.
+            // if (result && result.entries && result.summary) {
+            //     this._experimentResultCache[cacheKey] = result;
+            // }
         },
 
         _loadExperimentResultFromCache(model, cacheKey, applyResult) {
-            const cached = this._experimentResultCache[cacheKey];
-            if (!cached) {
+            if (!model || !cacheKey || !applyResult) {
                 return false;
             }
-            applyResult(cached, true);
-            model.refresh(true);
-            return true;
+            // Experiment result caching is temporarily disabled.
+            // const cached = this._experimentResultCache[cacheKey];
+            // if (!cached) {
+            //     return false;
+            // }
+            // applyResult(cached, true);
+            // model.refresh(true);
+            // return true;
+            return false;
         },
 
         _applySamplingResult(model, result, clientCacheHit) {
@@ -354,7 +430,8 @@
                 { sourceKey: "sparse_water_usage_l", targetKey: "sparse_water_usage_chart" }
             ]);
             model.setProperty("/samplingEntries", preparedResult.tableEntries);
-            model.setProperty("/samplingChartEntries", preparedResult.chartEntries);
+            model.setProperty("/samplingChartAllEntries", preparedResult.chartEntries);
+            this._applyExperimentChartData("sampling");
             model.setProperty("/samplingPots", preparedResult.pots);
             model.setProperty("/samplingSummary", preparedResult.summary);
             this._setRangeDataAlertFromSummary(model, preparedResult.summary);
@@ -363,7 +440,7 @@
                 "/helloMessage",
                 clientCacheHit || preparedResult.summary.cacheHit ? "Loaded cached sampling experiment" : `Database sampling experiment completed (${preparedResult.entries.length} days loaded)`
             );
-            this._refreshChart("samplingChart");
+            this._refreshExperimentCharts("sampling");
         },
 
         _applyAnfisResult(model, result, clientCacheHit) {
@@ -372,7 +449,8 @@
                 { sourceKey: "anfis_water_usage_l", targetKey: "anfis_water_usage_chart" }
             ]);
             model.setProperty("/anfisEntries", preparedResult.tableEntries);
-            model.setProperty("/anfisChartEntries", preparedResult.chartEntries);
+            model.setProperty("/anfisChartAllEntries", preparedResult.chartEntries);
+            this._applyExperimentChartData("anfis");
             model.setProperty("/anfisPots", preparedResult.pots);
             model.setProperty("/anfisSummary", preparedResult.summary);
             this._setRangeDataAlertFromSummary(model, preparedResult.summary);
@@ -381,7 +459,7 @@
                 "/helloMessage",
                 clientCacheHit || preparedResult.summary.cacheHit ? "Loaded cached ANFIS experiment" : `Database ANFIS experiment completed (${preparedResult.entries.length} days loaded)`
             );
-            this._refreshChart("anfisChart");
+            this._refreshExperimentCharts("anfis");
         },
 
         _applyFuzzyResult(model, result, clientCacheHit) {
@@ -390,24 +468,27 @@
                 { sourceKey: "fuzzy_water_usage_l", targetKey: "fuzzy_water_usage_chart" }
             ]);
             model.setProperty("/fuzzyEntries", preparedResult.tableEntries);
-            model.setProperty("/fuzzyChartEntries", preparedResult.chartEntries);
+            model.setProperty("/fuzzyChartAllEntries", preparedResult.chartEntries);
+            this._applyExperimentChartData("fuzzy");
             model.setProperty("/fuzzyPots", preparedResult.pots);
             model.setProperty("/fuzzySummary", preparedResult.summary);
             this._setRangeDataAlertFromSummary(model, preparedResult.summary);
             this._updateExperimentFooter(model, Boolean(clientCacheHit || preparedResult.summary.cacheHit));
             model.setProperty(
                 "/helloMessage",
-                clientCacheHit || preparedResult.summary.cacheHit ? "Loaded cached Fuzzy DT experiment" : `Fuzzy DT experiment completed (${preparedResult.entries.length} days loaded)`
+                clientCacheHit || preparedResult.summary.cacheHit ? "Loaded cached fuzzy control experiment" : `Fuzzy control experiment completed (${preparedResult.entries.length} days loaded)`
             );
-            this._refreshChart("fuzzyChart");
+            this._refreshExperimentCharts("fuzzy");
         },
 
         onDateChange() {
             const model = this.getView().getModel();
             const settings = model.getProperty("/experimentSettings") || {};
-            const range = experimentRange(settings);
+            // const range = experimentRange(settings);
             this._setRangeDataAlertForSettings(model, settings);
-            this._precomputeExperiments(model, range.start, range.end);
+            this._updateExperimentFooter(model);
+            // Experiment cache precompute is temporarily disabled.
+            // this._precomputeExperiments(model, range.start, range.end);
         },
 
         onRunBaseline() {
@@ -418,7 +499,7 @@
             const model = this.getView().getModel();
             const settings = model.getProperty("/experimentSettings") || {};
             const sampling = model.getProperty("/samplingSettings") || {};
-            const sampleIntervalHours = Math.min(336, Math.max(1, Math.floor(Number(sampling.sample_interval_hours) || 72)));
+            const sampleIntervalHours = Math.min(336, Math.max(1, Math.floor(Number(sampling.sample_interval_hours) || RECOMMENDED_SAMPLING_INTERVAL_HOURS)));
             model.setProperty("/samplingSettings/sample_interval_hours", sampleIntervalHours);
 
             model.setProperty("/activeExperiment", "sampling");
@@ -433,6 +514,7 @@
             }
 
             model.setProperty("/samplingEntries", []);
+            model.setProperty("/samplingChartAllEntries", []);
             model.setProperty("/samplingChartEntries", []);
             model.setProperty("/samplingPots", []);
             model.setProperty("/samplingSummary", defaultSamplingSummary(sampleIntervalHours));
@@ -472,6 +554,7 @@
         onRunAnfis() {
             const model = this.getView().getModel();
             const settings = model.getProperty("/experimentSettings") || {};
+            const scenarioSeed = settings.scenario_seed || 2026;
 
             model.setProperty("/activeExperiment", "anfis");
             this._setRangeDataAlertForSettings(model, settings);
@@ -479,12 +562,17 @@
                 return;
             }
 
-            const cacheKey = this._experimentClientCacheKey(model, "anfis", `500|200|${settings.scenario_seed || 2026}`);
+            const cacheKey = this._experimentClientCacheKey(
+                model,
+                "anfis",
+                `${ANFIS_TRAIN_SAMPLES}|${ANFIS_TEST_SAMPLES}|${scenarioSeed}`
+            );
             if (this._loadExperimentResultFromCache(model, cacheKey, (result, clientCacheHit) => this._applyAnfisResult(model, result, clientCacheHit))) {
                 return;
             }
 
             model.setProperty("/anfisEntries", []);
+            model.setProperty("/anfisChartAllEntries", []);
             model.setProperty("/anfisChartEntries", []);
             model.setProperty("/anfisPots", []);
             model.setProperty("/anfisSummary", defaultAnfisSummary());
@@ -499,14 +587,14 @@
                     const range = experimentRange(settings);
                     url.searchParams.set("start", range.start);
                     url.searchParams.set("end", range.end);
-                    url.searchParams.set("train_samples", 500);
-                    url.searchParams.set("test_samples", 200);
-                    url.searchParams.set("seed", settings.scenario_seed || 2026);
+                    url.searchParams.set("train_samples", ANFIS_TRAIN_SAMPLES);
+                    url.searchParams.set("test_samples", ANFIS_TEST_SAMPLES);
+                    url.searchParams.set("seed", scenarioSeed);
                     return fetchJson(url.toString());
                 })
                 .then((result) => {
                     if (result && result.entries && result.summary) {
-                        this._storeExperimentResult(this._experimentClientCacheKey(model, "anfis", `500|200|${settings.scenario_seed || 2026}`), result);
+                        this._storeExperimentResult(cacheKey, result);
                         this._applyAnfisResult(model, result, false);
                         model.refresh(true);
                     }
@@ -529,7 +617,7 @@
 
             model.setProperty("/activeExperiment", "fuzzy");
             this._setRangeDataAlertForSettings(model, settings);
-            if (this._showKnownWeatherUnavailable(model, settings, "Fuzzy DT experiment failed")) {
+            if (this._showKnownWeatherUnavailable(model, settings, "Fuzzy control experiment failed")) {
                 return;
             }
 
@@ -539,16 +627,17 @@
             }
 
             model.setProperty("/fuzzyEntries", []);
+            model.setProperty("/fuzzyChartAllEntries", []);
             model.setProperty("/fuzzyChartEntries", []);
             model.setProperty("/fuzzyPots", []);
             model.setProperty("/fuzzySummary", defaultFuzzySummary());
             this._updateExperimentFooter(model);
-            model.setProperty("/helloMessage", "Preparing Fuzzy DT experiment...");
+            model.setProperty("/helloMessage", "Preparing fuzzy control experiment...");
             model.setProperty("/isFuzzyLoading", true);
 
             this._ensureSensorPlacements(model)
                 .then(() => {
-                    model.setProperty("/helloMessage", "Running Fuzzy DT experiment...");
+                    model.setProperty("/helloMessage", "Running fuzzy control experiment...");
                     const url = getApiUrl("/api/experiment/fuzzy");
                     const range = experimentRange(settings);
                     url.searchParams.set("start", range.start);
@@ -563,7 +652,7 @@
                     }
                 })
                 .catch((error) => {
-                    this._handleExperimentError(model, "Fuzzy DT experiment failed", error, settings);
+                    this._handleExperimentError(model, "Fuzzy control experiment failed", error, settings);
                 })
                 .finally(() => {
                     model.setProperty("/isFuzzyLoading", false);
@@ -576,5 +665,3 @@
 
     }));
 });
-
-

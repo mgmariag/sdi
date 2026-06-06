@@ -6,14 +6,16 @@ sap.ui.define([
     const { addDays, formatLocalDate } = Formatter;
 
     const REAL_FORECAST_HORIZON_DAYS = 15;
+    const RECOMMENDED_SAMPLING_INTERVAL_HOURS = 48;
 
     function defaultSamplingSummary(sampleIntervalHours) {
+        const intervalHours = sampleIntervalHours || RECOMMENDED_SAMPLING_INTERVAL_HOURS;
         return {
             totalEntries: 0,
             daysAnalyzed: 0,
             potsAnalyzed: 0,
-            sample_interval_days: 3,
-            sample_interval_hours: sampleIntervalHours || 72,
+            sample_interval_days: Math.max(1, Math.round(intervalHours / 24)),
+            sample_interval_hours: intervalHours,
             accuracy_percent: 0,
             mismatch_days: 0,
             baseline_total_water_usage_l: 0,
@@ -24,6 +26,25 @@ sap.ui.define([
             sparse_valve_run_count: 0,
             baseline_irrigation_decisions: 0,
             sparse_irrigation_decisions: 0,
+            baseline_only_irrigation_days: 0,
+            sparse_only_irrigation_days: 0,
+            baseline_only_valve_runs: 0,
+            baseline_only_water_usage_l: 0,
+            missed_valve_run_delta: 0,
+            sparse_extra_valve_run_delta: 0,
+            sensorLocationCount: 0,
+            sensorAssociatedPotCount: 0,
+            sampledSensorRows: 0,
+            sampledSensorMoments: 0,
+            sampling_moisture_mae_pct: 0,
+            sampling_moisture_bias_pct: 0,
+            sampling_moisture_max_error_pct: 0,
+            sampling_estimation_points: 0,
+            sampling_sensor_refreshes: 0,
+            sampling_direct_refreshes: 0,
+            sampling_associated_refreshes: 0,
+            sampling_missing_refreshes: 0,
+            sampling_average_association_distance: 0,
             execution_time_seconds: 0
         };
     }
@@ -56,22 +77,17 @@ sap.ui.define([
             totalEntries: 0,
             daysAnalyzed: 0,
             potsAnalyzed: 0,
-            fao_irrigation_days: 0,
             baseline_irrigation_days: 0,
             fuzzy_irrigation_days: 0,
-            fao_total_water_usage_l: 0,
             baseline_total_water_usage_l: 0,
             fuzzy_total_water_usage_l: 0,
             water_savings_l: 0,
             water_savings_percent: 0,
-            fao_irrigation_event_count: 0,
             baseline_irrigation_event_count: 0,
             fuzzy_irrigation_event_count: 0,
-            fao_valve_run_count: 0,
             baseline_valve_run_count: 0,
             fuzzy_valve_run_count: 0,
             average_prescription_mm: 0,
-            average_etc_mm: 0,
             execution_time_seconds: 0
         };
     }
@@ -89,7 +105,7 @@ sap.ui.define([
         return {
             sampling: "Sampling",
             anfis: "ANFIS-GA",
-            fuzzy: "Fuzzy DT"
+            fuzzy: "Fuzzy Control"
         }[experiment] || "No experiment selected";
     }
 
@@ -123,6 +139,7 @@ sap.ui.define([
 
     return {
         REAL_FORECAST_HORIZON_DAYS,
+        RECOMMENDED_SAMPLING_INTERVAL_HOURS,
         defaultAnfisSummary,
         defaultExperimentFooter,
         defaultExperimentRange,

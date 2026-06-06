@@ -25,6 +25,7 @@ server:
       configuration:
         flp:
           theme: sap_horizon
+          init: /model/flpUser
     - name: fiori-tools-proxy
       afterMiddleware: compression
       configuration:

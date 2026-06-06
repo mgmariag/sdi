@@ -28,6 +28,8 @@ DAILY_RESOLUTION = "daily"
 RAW_RETENTION_HOURS = 24
 HOURLY_RETENTION_DAYS = 7
 DAILY_RETENTION_DAYS = 366
+DAILY_READING_TIMES = (time(1, 0), time(5, 30), time(14, 0), time(17, 30))
+DAILY_READING_SLOTS_PER_DAY = len(DAILY_READING_TIMES)
 
 
 def seed_historical_sensor_readings(
@@ -322,7 +324,9 @@ def generate_sensor_readings_at(
         "upserted_readings": upserted,
     }
 
-
+# This method generates sensor readings for a specific timestamp, 
+# applying any necessary state changes based on the elapsed time since the last reading.   
+# Usage: generate_sensor_readings_at(datetime(2025, 5, 22, 12, 0), source="simulated_sensor")    
 def generate_due_sensor_readings(
     now: datetime | None = None,
     source: str = DEFAULT_SENSOR_SOURCE,
@@ -397,6 +401,9 @@ def run_sensor_service() -> None:
         summary = ensure_tiered_sensor_readings(source=source, cleanup=settings.sensor_cleanup_enabled)
         print(f"Tiered sensor history ready: {summary}", flush=True)
 
+    # Fill missing scheduled readings that are already due today.
+    # Cleanup runs during startup history seeding, or once here when seeding is disabled. 
+    # Cleanup runs during startup history seeding, or once here when seeding is disabled. 
     due = generate_due_sensor_readings(source=source)
     if due:
         print(f"Generated due sensor readings: {due}", flush=True)
@@ -482,6 +489,7 @@ def get_sensor_reading_summary(source: str | None = None) -> dict[str, Any]:
                 "raw_hours": RAW_RETENTION_HOURS,
                 "hourly_days": HOURLY_RETENTION_DAYS,
                 "daily_days": DAILY_RETENTION_DAYS,
+                "daily_reading_times": [slot.strftime("%H:%M") for slot in DAILY_READING_TIMES],
                 "reading_interval_minutes": _reading_interval_minutes(),
             },
         }
@@ -506,6 +514,7 @@ def aggregate_and_cleanup_sensor_readings(
         "actual_source": ACTUAL_SENSOR_SOURCE,
         "default_source": DEFAULT_SENSOR_SOURCE,
         "output_source": source or DEFAULT_SENSOR_SOURCE,
+        "daily_slot_offsets_minutes": _daily_slot_offsets_minutes(),
     }
     source_filter = ""
     if source:
@@ -563,21 +572,23 @@ def aggregate_and_cleanup_sensor_readings(
                 SELECT
                     sensor_id,
                     recorded_at::date AS bucket_date,
-                    round(avg(soil_moisture_pct), 2) AS soil_moisture_pct,
-                    round(avg(air_temperature_c), 2) AS air_temperature_c,
-                    round(avg(air_humidity_pct), 2) AS air_humidity_pct,
-                    round(avg(substrate_temperature_c), 2) AS substrate_temperature_c,
-                    count(*)::int AS sample_count,
+                    (EXTRACT(HOUR FROM recorded_at)::int * 60 + EXTRACT(MINUTE FROM recorded_at)::int) AS bucket_slot_offset_minutes,
+                    soil_moisture_pct,
+                    air_temperature_c,
+                    air_humidity_pct,
+                    substrate_temperature_c,
+                    sample_count,
                     CASE
-                        WHEN bool_or(source = %(actual_source)s) THEN %(actual_source)s
+                        WHEN source = %(actual_source)s THEN %(actual_source)s
                         ELSE %(output_source)s
                     END AS source
                 FROM sensor_readings
                 WHERE reading_resolution = %(raw_resolution)s
                   AND recorded_at < %(hourly_start)s
                   AND recorded_at::date >= %(daily_start_date)s
+                  AND (EXTRACT(HOUR FROM recorded_at)::int * 60 + EXTRACT(MINUTE FROM recorded_at)::int)
+                        = ANY(%(daily_slot_offsets_minutes)s::int[])
                   {source_filter}
-                GROUP BY sensor_id, bucket_date
             )
             INSERT INTO sensor_readings (
                 sensor_id, recorded_at, soil_moisture_pct, air_temperature_c,
@@ -586,7 +597,7 @@ def aggregate_and_cleanup_sensor_readings(
             )
             SELECT
                 sensor_id,
-                bucket_date + time '12:00',
+                bucket_date + make_interval(mins => bucket_slot_offset_minutes),
                 soil_moisture_pct,
                 air_temperature_c,
                 air_humidity_pct,
@@ -609,25 +620,39 @@ def aggregate_and_cleanup_sensor_readings(
         ).rowcount
         daily_from_hourly = conn.execute(
             f"""
-            WITH daily AS (
+            WITH ranked AS (
                 SELECT
-                    sensor_id,
-                    recorded_at::date AS bucket_date,
-                    round(avg(soil_moisture_pct), 2) AS soil_moisture_pct,
-                    round(avg(air_temperature_c), 2) AS air_temperature_c,
-                    round(avg(air_humidity_pct), 2) AS air_humidity_pct,
-                    round(avg(substrate_temperature_c), 2) AS substrate_temperature_c,
-                    sum(sample_count)::int AS sample_count,
+                    sr.sensor_id,
+                    sr.recorded_at::date AS bucket_date,
+                    slot.slot_offset_minutes AS bucket_slot_offset_minutes,
+                    sr.soil_moisture_pct,
+                    sr.air_temperature_c,
+                    sr.air_humidity_pct,
+                    sr.substrate_temperature_c,
+                    sr.sample_count,
                     CASE
-                        WHEN bool_or(source = %(actual_source)s) THEN %(actual_source)s
+                        WHEN sr.source = %(actual_source)s THEN %(actual_source)s
                         ELSE %(output_source)s
-                    END AS source
-                FROM sensor_readings
+                    END AS source,
+                    row_number() OVER (
+                        PARTITION BY sr.sensor_id, sr.recorded_at::date, slot.slot_offset_minutes
+                        ORDER BY
+                            abs(EXTRACT(EPOCH FROM (
+                                sr.recorded_at - (sr.recorded_at::date + make_interval(mins => slot.slot_offset_minutes))
+                            ))),
+                            sr.recorded_at DESC
+                    ) AS slot_rank
+                FROM sensor_readings sr
+                CROSS JOIN unnest(%(daily_slot_offsets_minutes)s::int[]) AS slot(slot_offset_minutes)
                 WHERE reading_resolution = %(hourly_resolution)s
                   AND recorded_at < %(hourly_start)s
                   AND recorded_at::date >= %(daily_start_date)s
                   {source_filter}
-                GROUP BY sensor_id, bucket_date
+            ),
+            daily AS (
+                SELECT *
+                FROM ranked
+                WHERE slot_rank = 1
             )
             INSERT INTO sensor_readings (
                 sensor_id, recorded_at, soil_moisture_pct, air_temperature_c,
@@ -636,7 +661,7 @@ def aggregate_and_cleanup_sensor_readings(
             )
             SELECT
                 sensor_id,
-                bucket_date + time '12:00',
+                bucket_date + make_interval(mins => bucket_slot_offset_minutes),
                 soil_moisture_pct,
                 air_temperature_c,
                 air_humidity_pct,
@@ -789,6 +814,7 @@ def _complete_sensor_dates_for_range(
               AND recorded_at::date <= %(end_date)s
             GROUP BY recorded_at::date
             HAVING count(DISTINCT sensor_id) >= %(sensor_count)s
+               AND count(*) >= %(sensor_count)s * %(daily_slots_per_day)s
             """,
             {
                 "sources": _query_sources(source),
@@ -797,6 +823,7 @@ def _complete_sensor_dates_for_range(
                 "start_date": start_date,
                 "end_date": end_date,
                 "sensor_count": len(sensor_ids),
+                "daily_slots_per_day": DAILY_READING_SLOTS_PER_DAY,
             },
         ).fetchall()
     return {row["local_date"] for row in rows}
@@ -841,7 +868,8 @@ def get_tiered_sensor_coverage(
     sensor_count = len(sensor_ids)
     raw_slots = _slot_count(period["raw_start"], end_at, minutes=15)
     hourly_slots = _slot_count(period["hourly_start"], period["raw_start"] - timedelta(hours=1), minutes=60)
-    daily_slots = max(0, (period["hourly_start"].date() - period["daily_start"].date()).days)
+    daily_days = max(0, (period["hourly_start"].date() - period["daily_start"].date()).days)
+    daily_slots = daily_days * DAILY_READING_SLOTS_PER_DAY
     expected = {
         RAW_RESOLUTION: raw_slots * sensor_count,
         HOURLY_RESOLUTION: hourly_slots * sensor_count,
@@ -990,7 +1018,7 @@ def load_sensor_readings_for_experiment(
                     SELECT
                         sensor_id,
                         recorded_at::date AS local_date,
-                        EXTRACT(HOUR FROM recorded_at)::int AS local_hour,
+                        recorded_at::time AS local_time,
                         max(recorded_at) AS recorded_at,
                         round(avg(soil_moisture_pct), 2) AS soil_moisture_pct,
                         round(avg(air_temperature_c), 2) AS air_temperature_c,
@@ -1009,12 +1037,12 @@ def load_sensor_readings_for_experiment(
                       AND reading_resolution = %(raw_resolution)s
                       AND recorded_at::date = ANY(%(sensor_dates)s)
                       AND recorded_at <= %(now)s
-                    GROUP BY sensor_id, local_date, local_hour
+                    GROUP BY sensor_id, local_date, local_time
                     UNION ALL
                     SELECT
                         sensor_id,
                         recorded_at::date AS local_date,
-                        EXTRACT(HOUR FROM recorded_at)::int AS local_hour,
+                        recorded_at::time AS local_time,
                         recorded_at,
                         soil_moisture_pct,
                         air_temperature_c,
@@ -1034,7 +1062,7 @@ def load_sensor_readings_for_experiment(
                     SELECT
                         sensor_id,
                         recorded_at::date AS local_date,
-                        EXTRACT(HOUR FROM recorded_at)::int AS local_hour,
+                        recorded_at::time AS local_time,
                         recorded_at,
                         soil_moisture_pct,
                         air_temperature_c,
@@ -1051,10 +1079,10 @@ def load_sensor_readings_for_experiment(
                       AND recorded_at::date = ANY(%(sensor_dates)s)
                       AND recorded_at <= %(now)s
                 )
-                SELECT DISTINCT ON (sensor_id, local_date, local_hour)
+                SELECT DISTINCT ON (sensor_id, local_date, local_time)
                     sensor_id,
                     local_date,
-                    local_hour,
+                    local_time,
                     recorded_at,
                     soil_moisture_pct,
                     air_temperature_c,
@@ -1064,7 +1092,7 @@ def load_sensor_readings_for_experiment(
                     resolution,
                     sample_count
                 FROM tiered
-                ORDER BY sensor_id, local_date, local_hour, tier_priority, recorded_at DESC
+                ORDER BY sensor_id, local_date, local_time, tier_priority, recorded_at DESC
                 """,
                 {
                     "timezone": LOCAL_TZ.key,
@@ -1117,14 +1145,14 @@ def load_sensor_readings_for_experiment(
         ).fetchall()
 
     rows_by_sensor_key = {
-        (row["local_date"], int(row["local_hour"]), row["sensor_id"]): row
+        (row["local_date"], _time_key(row["local_time"]), row["sensor_id"]): row
         for row in rows
     }
     lookup = {}
     for experiment_date, sensor_date in mapped_dates.items():
         for row in rows:
             if row["local_date"] == sensor_date:
-                lookup[(experiment_date, int(row["local_hour"]), row["sensor_id"])] = row
+                _put_sensor_lookup_row(lookup, experiment_date, row)
 
     return {
         "available": True,
@@ -1374,7 +1402,7 @@ def _tiered_resolution_for_time(recorded_at: datetime, period: dict[str, datetim
     if period["hourly_start"] <= recorded_at < period["raw_start"]:
         return HOURLY_RESOLUTION if recorded_at.minute == 0 else None
     if period["daily_start"] <= recorded_at < period["hourly_start"]:
-        return DAILY_RESOLUTION if recorded_at.hour == 12 and recorded_at.minute == 0 else None
+        return DAILY_RESOLUTION if recorded_at.time().replace(second=0, microsecond=0) in DAILY_READING_TIMES else None
     return None
 
 
@@ -1388,8 +1416,47 @@ def _sample_count_for_resolution(resolution: str) -> int:
     if resolution == HOURLY_RESOLUTION:
         return 4
     if resolution == DAILY_RESOLUTION:
-        return 96
+        return 1
     return 1
+
+
+def _daily_slot_offsets_minutes() -> list[int]:
+    return [slot.hour * 60 + slot.minute for slot in DAILY_READING_TIMES]
+
+
+def _time_key(value: time | str) -> time:
+    if isinstance(value, str):
+        value = time.fromisoformat(value)
+    return value.replace(second=0, microsecond=0)
+
+
+def _put_sensor_lookup_row(
+    lookup: dict[tuple[Any, ...], dict[str, Any]],
+    experiment_date: date,
+    row: dict[str, Any],
+) -> None:
+    sensor_id = row["sensor_id"]
+    local_time = _time_key(row["local_time"])
+    exact_key = (experiment_date, local_time, sensor_id)
+    lookup[exact_key] = row
+
+    bucket_hour = _hour_bucket_for_time(local_time)
+    hour_key = (experiment_date, bucket_hour, sensor_id)
+    current = lookup.get(hour_key)
+    if current is None:
+        lookup[hour_key] = row
+        return
+
+    current_time = _time_key(current["local_time"])
+    hour_start_minutes = bucket_hour * 60
+    current_distance = abs(current_time.hour * 60 + current_time.minute - hour_start_minutes)
+    incoming_distance = abs(local_time.hour * 60 + local_time.minute - hour_start_minutes)
+    if incoming_distance < current_distance:
+        lookup[hour_key] = row
+
+
+def _hour_bucket_for_time(value: time) -> int:
+    return min(23, (value.hour * 60 + value.minute + 30) // 60)
 
 
 def _initial_sensor_states(pots: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
@@ -1426,13 +1493,31 @@ def _apply_hourly_environment(
             loss *= 1.12
         elif pot["plant_type_code"] == "succulents":
             loss *= 0.48
+        loss *= _low_retention_drydown_multiplier(pot)
 
         rain_gain = min(8.0, _number(weather.get("precipitation_mm"), 0.0) * 0.85 * hours)
         state["moisture"] += rain_gain - loss
     else:
-        state["moisture"] -= (0.018 if pot["plant_type_code"] != "succulents" else 0.006) * hours
+        state["moisture"] -= _indoor_hourly_moisture_loss(pot, local_day) * hours
 
-    state["moisture"] = _clamp(state["moisture"], 0.0, 100.0)
+    state["moisture"] = _clamp(state["moisture"], _minimum_realistic_moisture(pot, local_day), 100.0)
+
+
+def _low_retention_drydown_multiplier(pot: dict[str, Any]) -> float:
+    retention = _clamp(_number(pot.get("retention_factor"), 1.0), 0.1, 2.0)
+    return 1.0 + max(0.0, 1.0 - retention) * 0.65
+
+
+def _indoor_hourly_moisture_loss(pot: dict[str, Any], local_day: date) -> float:
+    if local_day.month in {11, 12, 1, 2, 3}:
+        return 0.003 if pot["plant_type_code"] != "succulents" else 0.001
+    return 0.018 if pot["plant_type_code"] != "succulents" else 0.006
+
+
+def _minimum_realistic_moisture(pot: dict[str, Any], local_day: date) -> float:
+    if local_day.month in {11, 12, 1, 2, 3}:
+        return max(8.0, float(pot["winter_moisture_target_pct"]) - 6.0)
+    return max(7.0, float(pot["moisture_min_pct"]) - 8.0)
 
 
 def _apply_virtual_irrigation_if_due(state: dict[str, Any], pot: dict[str, Any], weather: dict[str, Any], recorded_at: datetime) -> None:
@@ -1482,7 +1567,11 @@ def _sensor_row(
     air_temperature = _microclimate_temperature(pot, weather, recorded_at)
     air_humidity = _clamp(_number(weather.get("relative_humidity_pct"), 60.0) + rng.uniform(-4.0, 4.0), 20.0, 100.0)
     substrate_temperature = air_temperature + _substrate_delta(pot, recorded_at)
-    moisture = _clamp(state["moisture"] + rng.uniform(-1.2, 1.2), 0.0, 100.0)
+    moisture = _clamp(
+        state["moisture"] + rng.uniform(-1.2, 1.2),
+        _minimum_realistic_moisture(pot, recorded_at.date()),
+        100.0,
+    )
     return {
         "sensor_id": pot["id"],
         "recorded_at": _db_timestamp(recorded_at),
@@ -1592,14 +1681,7 @@ def _query_sources(source: str | None) -> list[str]:
 
 
 def _scheduled_datetimes(day: date) -> list[datetime]:
-    interval_minutes = _reading_interval_minutes()
-    current = datetime.combine(day, time(0, 0), tzinfo=LOCAL_TZ)
-    end = current + timedelta(days=1)
-    scheduled = []
-    while current < end:
-        scheduled.append(current)
-        current += timedelta(minutes=interval_minutes)
-    return scheduled
+    return [datetime.combine(day, slot, tzinfo=LOCAL_TZ) for slot in DAILY_READING_TIMES]
 
 
 def _next_scheduled_datetime(now: datetime) -> datetime:
@@ -1676,9 +1758,7 @@ def _same_month_day(year: int, source_date: date) -> date:
 
 
 def _is_outdoor(pot: dict[str, Any], day: date) -> bool:
-    if day.month in {12, 1, 2}:
-        return pot["winter_location"] == "outdoor"
-    return pot["default_location"] == "outdoor"
+    return True
 
 
 def _sun_factor(pot: dict[str, Any]) -> float:

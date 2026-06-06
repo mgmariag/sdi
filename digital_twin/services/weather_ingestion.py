@@ -31,8 +31,11 @@ FORECAST_SOURCE = "open-meteo-forecast"
 
 ARCHIVE_START = date(1940, 1, 1)
 ARCHIVE_DELAY_DAYS = 5
-# Open-Meteo forecast supports 16 calendar days including today.
-FORECAST_MAX_DAYS = 15
+# Open-Meteo forecast supports 16 future calendar days including today and up to 92 past days.
+FORECAST_DAYS = 16
+FORECAST_MAX_DAYS = FORECAST_DAYS - 1
+FORECAST_PAST_DAYS_MAX = 92
+WEATHER_REFRESH_LOOKBACK_DAYS = 7
 
 HOURLY_VARIABLES = [
     "temperature_2m",
@@ -161,21 +164,28 @@ def cache_open_meteo_archive(start: date, end: date) -> int:
     )
 
 
-def cache_open_meteo_forecast(start: date, end: date) -> int:
-    return _cache_hourly_chunks(
-        url=OPEN_METEO_FORECAST_URL,
-        source=FORECAST_SOURCE,
-        is_forecast=True,
+def cache_open_meteo_archive_with_stats(start: date, end: date) -> dict[str, Any]:
+    return _cache_hourly_chunks_with_stats(
+        url=OPEN_METEO_ARCHIVE_URL,
+        source=ARCHIVE_SOURCE,
+        is_forecast=False,
         start=start,
         end=end,
+        skip_existing_observed=False,
     )
 
 
+def cache_open_meteo_forecast(start: date, end: date) -> int:
+    stats = _cache_forecast_range_with_stats(
+        start=start,
+        end=end,
+        skip_existing_observed=True,
+    )
+    return stats["inserted"] + stats["updated"] + stats["unchanged"]
+
+
 def cache_open_meteo_forecast_with_stats(start: date, end: date) -> dict[str, Any]:
-    return _cache_hourly_chunks_with_stats(
-        url=OPEN_METEO_FORECAST_URL,
-        source=FORECAST_SOURCE,
-        is_forecast=True,
+    return _cache_forecast_range_with_stats(
         start=start,
         end=end,
         skip_existing_observed=True,
@@ -185,6 +195,12 @@ def cache_open_meteo_forecast_with_stats(start: date, end: date) -> dict[str, An
 def refresh_forecast_once_per_day(force: bool = False) -> dict[str, Any]:
     initialize_database()
     refresh_date = _today_local()
+    refresh_start = _latest_weather_refresh_start()
+    forecast_end = refresh_date + timedelta(days=FORECAST_MAX_DAYS)
+    archive_end = min(refresh_date - timedelta(days=ARCHIVE_DELAY_DAYS), forecast_end)
+    archive_stats = _empty_import_stats()
+    forecast_stats = _empty_import_stats()
+
     with get_connection(row_factory=dict_row) as conn:
         existing = conn.execute(
             """
@@ -214,10 +230,10 @@ def refresh_forecast_once_per_day(force: bool = False) -> dict[str, Any]:
         conn.commit()
 
     try:
-        stats = cache_open_meteo_forecast_with_stats(
-            start=refresh_date,
-            end=refresh_date + timedelta(days=FORECAST_MAX_DAYS),
-        )
+        if refresh_start <= archive_end:
+            archive_stats = cache_open_meteo_archive_with_stats(refresh_start, archive_end)
+        forecast_stats = cache_open_meteo_forecast_with_stats(refresh_start, forecast_end)
+        stats = _combined_import_stats(archive_stats, forecast_stats)
     except Exception as exc:
         with get_connection() as conn:
             conn.execute(
@@ -259,7 +275,67 @@ def refresh_forecast_once_per_day(force: bool = False) -> dict[str, Any]:
             },
         ).fetchone()
         conn.commit()
-        return _json_ready({"already_refreshed": False, **refreshed})
+        return _json_ready(
+            {
+                "already_refreshed": False,
+                "refresh_start": refresh_start,
+                "archive_end": archive_end if refresh_start <= archive_end else None,
+                "forecast_end": forecast_end,
+                "archive": archive_stats,
+                "forecast": forecast_stats,
+                **refreshed,
+            }
+        )
+
+
+def _latest_weather_refresh_start() -> date:
+    with get_connection(row_factory=dict_row) as conn:
+        latest = conn.execute(
+            """
+            SELECT max(COALESCE(changed_at, created_at)) AS latest_change
+            FROM weather_hourly
+            WHERE location_name = %(location)s
+            """,
+            {"location": CLUJ_NAPOCA["location_name"]},
+        ).fetchone()
+    return _refresh_start_from_latest_change(latest["latest_change"] if latest else None)
+
+
+def _refresh_start_from_latest_change(latest_change: datetime | None) -> date:
+    latest_date = _today_local()
+    if latest_change is not None:
+        latest_date = _local_date_from_datetime(latest_change)
+    return latest_date - timedelta(days=WEATHER_REFRESH_LOOKBACK_DAYS)
+
+
+def _combined_import_stats(*items: dict[str, int]) -> dict[str, int]:
+    stats = _empty_import_stats()
+    for item in items:
+        _merge_stats(stats, item)
+    return stats
+
+
+def _local_date_from_datetime(value: datetime) -> date:
+    if value.tzinfo is None:
+        return value.date()
+    return value.astimezone(ZoneInfo(CLUJ_NAPOCA["timezone"])).date()
+
+
+def _cache_forecast_range_with_stats(
+    start: date,
+    end: date,
+    skip_existing_observed: bool,
+) -> dict[str, int]:
+    if end < start:
+        return _empty_import_stats()
+    payload = _fetch_json(
+        url=OPEN_METEO_FORECAST_URL,
+        params=_forecast_request_params(start, end),
+    )
+    rows = _hourly_rows(payload, source=FORECAST_SOURCE, is_forecast=True)
+    rows = _filter_weather_rows_by_date(rows, start, end)
+    rows = _fill_missing_local_weather_hours(rows)
+    return _upsert_weather_hourly_with_stats(rows, skip_existing_observed=skip_existing_observed)
 
 
 def import_open_meteo_csv(csv_path: str | Path, skip_existing_observed: bool = True) -> dict[str, Any]:
@@ -460,6 +536,24 @@ def _hourly_request_params(start: date, end: date) -> dict[str, Any]:
     }
 
 
+def _forecast_request_params(start: date, end: date) -> dict[str, Any]:
+    today = _today_local()
+    past_days = max(0, min((today - start).days, FORECAST_PAST_DAYS_MAX))
+    forecast_days = max(1, min((end - today).days + 1, FORECAST_DAYS))
+    return {
+        "latitude": CLUJ_NAPOCA["latitude"],
+        "longitude": CLUJ_NAPOCA["longitude"],
+        "past_days": past_days,
+        "forecast_days": forecast_days,
+        "hourly": ",".join(HOURLY_VARIABLES),
+        "timezone": CLUJ_NAPOCA["timezone"],
+    }
+
+
+def _filter_weather_rows_by_date(rows: list[dict[str, Any]], start: date, end: date) -> list[dict[str, Any]]:
+    return [row for row in rows if start <= row["observed_date"] <= end]
+
+
 def _fetch_json(url: str, params: dict[str, Any]) -> dict[str, Any]:
     request_url = f"{url}?{urlencode(params)}"
     with urlopen(request_url, timeout=60) as response:
@@ -629,6 +723,7 @@ def _has_existing_observed_row(cur, row: dict[str, Any]) -> bool:
         WHERE location_name = %(location_name)s
           AND observed_at = %(observed_at)s
           AND observed_local_at = %(observed_local_at)s
+          AND source <> %(source)s
           AND observed_at <= now()
         LIMIT 1
         """,
