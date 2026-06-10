@@ -31,7 +31,7 @@
                             </VBox>
                             <Button text="Sampling" press="onRunSampling" type="Emphasized" class="experimentButton samplingButton" />
                             <Button text="ANFIS-GA" press="onRunAnfis" type="Accept" class="experimentButton anfisButton" />
-                            <Button text="Fuzzy Rules" press="onRunFuzzyDt" type="Accept" class="experimentButton fuzzyButton" />
+                            <Button text="Fuzzy DT" press="onRunFuzzyDt" type="Accept" class="experimentButton fuzzyButton" />
                         </HBox>
                     </HBox>
                 </VBox>
@@ -49,7 +49,7 @@
                     <VBox id="samplingChartColumn" class="chartMainColumn">
                         <VBox id="samplingChartStack" class="experimentChartStack">
                             <VBox id="samplingMoistureChartBlock" class="experimentChartBlock">
-                                <Text id="samplingMoistureChartTitle" text="A. Soil Moisture Estimation" class="experimentChartTitle" />
+                                <Text id="samplingMoistureChartTitle" text="A. Soil Moisture Evolution" class="experimentChartTitle" />
                                 <viz:VizFrame id="samplingMoistureChart" uiConfig="{applicationSet:'fiori'}" vizType="combination" height="330px" width="100%" class="samplingSingleAxisAlignedChart" renderComplete=".onChartRenderComplete">
                                     <viz:dataset>
                                         <viz.data:FlattenedDataset data="{/samplingChartEntries}">
@@ -70,7 +70,7 @@
                             </VBox>
                             <VBox id="samplingContextChartBlock" class="experimentChartBlock">
                                 <Text id="samplingContextChartTitle" text="B. Irrigation Volume &amp; Weather Context" class="experimentChartTitle" />
-                                <viz:VizFrame id="samplingContextChart" uiConfig="{applicationSet:'fiori'}" vizType="dual_combination" height="290px" width="100%" renderComplete=".onChartRenderComplete">
+                                <viz:VizFrame id="samplingContextChart" uiConfig="{applicationSet:'fiori'}" vizType="dual_combination" height="310px" width="100%" renderComplete=".onChartRenderComplete">
                                     <viz:dataset>
                                         <viz.data:FlattenedDataset data="{/samplingChartEntries}">
                                             <viz.data:dimensions>
@@ -80,17 +80,40 @@
                                                 <viz.data:MeasureDefinition name="Baseline Irrigation (L)" value="{baseline_water_usage_l}" />
                                                 <viz.data:MeasureDefinition name="Sparse-Sensing Irrigation (L)" value="{sparse_water_usage_l}" />
                                                 <viz.data:MeasureDefinition name="Rain (mm)" value="{rain_amount}" />
-                                                <viz.data:MeasureDefinition name="Max Temperature (C)" value="{max_temperature}" />
+                                                <viz.data:MeasureDefinition name="Max Temperature (°C)" value="{max_temperature}" />
                                             </viz.data:measures>
                                         </viz.data:FlattenedDataset>
                                     </viz:dataset>
                                     <viz:feeds>
                                         <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Baseline Irrigation (L),Sparse-Sensing Irrigation (L)" />
-                                        <viz.feeds:FeedItem uid="valueAxis2" type="Measure" values="Rain (mm),Max Temperature (C)" />
+                                        <viz.feeds:FeedItem uid="valueAxis2" type="Measure" values="Rain (mm),Max Temperature (°C)" />
                                         <viz.feeds:FeedItem uid="categoryAxis" type="Dimension" values="Date/Time" />
                                     </viz:feeds>
                                 </viz:VizFrame>
                             </VBox>
+                            <!-- <VBox id="samplingBaselineWeatherChartBlock" class="experimentChartBlock">
+                                <Text id="samplingBaselineWeatherChartTitle" text="Baseline Moisture, Water Usage &amp; Weather" class="experimentChartTitle" />
+                                <viz:VizFrame id="samplingBaselineWeatherChart" uiConfig="{applicationSet:'fiori'}" vizType="dual_combination" height="400px" width="100%" renderComplete=".onChartRenderComplete">
+                                    <viz:dataset>
+                                        <viz.data:FlattenedDataset data="{/samplingChartEntries}">
+                                            <viz.data:dimensions>
+                                                <viz.data:DimensionDefinition name="Date/Time" value="{chart_label}" />
+                                            </viz.data:dimensions>
+                                            <viz.data:measures>
+                                                <viz.data:MeasureDefinition name="Baseline Moisture" value="{baseline_moisture}" />
+                                                <viz.data:MeasureDefinition name="Baseline Water Usage (L)" value="{baseline_water_usage_l}" />
+                                                <viz.data:MeasureDefinition name="Rain (mm)" value="{rain_amount}" />
+                                                <viz.data:MeasureDefinition name="Max Temperature (°C)" value="{max_temperature}" />
+                                            </viz.data:measures>
+                                        </viz.data:FlattenedDataset>
+                                    </viz:dataset>
+                                    <viz:feeds>
+                                        <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Baseline Moisture,Rain (mm),Max Temperature (°C)" />
+                                        <viz.feeds:FeedItem uid="valueAxis2" type="Measure" values="Baseline Water Usage (L)" />
+                                        <viz.feeds:FeedItem uid="categoryAxis" type="Dimension" values="Date/Time" />
+                                    </viz:feeds>
+                                </viz:VizFrame>
+                            </VBox> -->
                         </VBox>
                         <viz:VizFrame id="samplingChart" visible="false" uiConfig="{applicationSet:'fiori'}" vizType="combination" height="0px" width="100%" renderComplete=".onChartRenderComplete">
                             <viz:dataset>
@@ -103,13 +126,13 @@
                                         <viz.data:MeasureDefinition name="Baseline Water Usage (L)" value="{baseline_water_usage_chart}" />
                                         <viz.data:MeasureDefinition name="Sparse Moisture" value="{sparse_moisture}" />
                                         <viz.data:MeasureDefinition name="Sparse Water Usage (L)" value="{sparse_water_usage_chart}" />
-                                        <viz.data:MeasureDefinition name="Max Temp (C)" value="{max_temperature}" />
-                                        <viz.data:MeasureDefinition name="Rain (L/m²)" value="{rain_amount}" />
+                                        <viz.data:MeasureDefinition name="Max Temp (°C)" value="{max_temperature}" />
+                                        <viz.data:MeasureDefinition name="Rain (mm)" value="{rain_amount}" />
                                     </viz.data:measures>
                                 </viz.data:FlattenedDataset>
                             </viz:dataset>
                             <viz:feeds>
-                                <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Baseline Moisture,Baseline Water Usage (L),Sparse Moisture,Sparse Water Usage (L),Max Temp (C),Rain (L/m²)" />
+                                <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Baseline Moisture,Baseline Water Usage (L),Sparse Moisture,Sparse Water Usage (L),Max Temp (°C),Rain (mm)" />
                                 <viz.feeds:FeedItem uid="categoryAxis" type="Dimension" values="Date/Time" />
                             </viz:feeds>
                         </viz:VizFrame>
@@ -132,7 +155,7 @@
                         <Column id="samplingStepCol"><Text id="samplingStepHeader" text="Date" /></Column>
                         <Column id="samplingBaselineMoistureCol"><Text id="samplingBaselineMoistureHeader" text="Baseline Moisture (%)" /></Column>
                         <Column id="samplingSparseMoistureCol"><Text id="samplingSparseMoistureHeader" text="Sparse Moisture (%)" /></Column>
-                        <Column id="samplingRainCol"><Text id="samplingRainHeader" text="Rain (L/m²)" /></Column>
+                        <Column id="samplingRainCol"><Text id="samplingRainHeader" text="Rain (mm)" /></Column>
                         <Column id="samplingBaselineIrrigationCol"><Text id="samplingBaselineIrrigationHeader" text="Baseline Valves" /></Column>
                         <Column id="samplingSparseIrrigationCol"><Text id="samplingSparseIrrigationHeader" text="Sparse Valves" /></Column>
                         <Column id="samplingSparseWaterCol"><Text id="samplingSparseWaterHeader" text="Sparse Water (L)" /></Column>
@@ -200,20 +223,20 @@
                                             <viz.data:measures>
                                                 <viz.data:MeasureDefinition name="Baseline Moisture" value="{baseline_moisture}" />
                                                 <viz.data:MeasureDefinition name="ANFIS Moisture" value="{anfis_moisture}" />
-                                                <viz.data:MeasureDefinition name="ANFIS-GA irrigation score (%)" value="{predicted_probability_percent}" />
+                                                <viz.data:MeasureDefinition name="ANFIS zone signal (%)" value="{predicted_probability_percent}" />
                                             </viz.data:measures>
                                         </viz.data:FlattenedDataset>
                                     </viz:dataset>
                                     <viz:feeds>
                                         <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Baseline Moisture,ANFIS Moisture" />
-                                        <viz.feeds:FeedItem uid="valueAxis2" type="Measure" values="ANFIS-GA irrigation score (%)" />
+                                        <viz.feeds:FeedItem uid="valueAxis2" type="Measure" values="ANFIS zone signal (%)" />
                                         <viz.feeds:FeedItem uid="categoryAxis" type="Dimension" values="Date/Time" />
                                     </viz:feeds>
                                 </viz:VizFrame>
                             </VBox>
                             <VBox id="anfisContextChartBlock" class="experimentChartBlock">
                                 <Text id="anfisContextChartTitle" text="B. Irrigation Volume &amp; Weather Context" class="experimentChartTitle" />
-                                <viz:VizFrame id="anfisContextChart" uiConfig="{applicationSet:'fiori'}" vizType="dual_combination" height="290px" width="100%" renderComplete=".onChartRenderComplete">
+                                <viz:VizFrame id="anfisContextChart" uiConfig="{applicationSet:'fiori'}" vizType="dual_combination" height="310px" width="100%" renderComplete=".onChartRenderComplete">
                                     <viz:dataset>
                                         <viz.data:FlattenedDataset data="{/anfisChartEntries}">
                                             <viz.data:dimensions>
@@ -223,13 +246,13 @@
                                                 <viz.data:MeasureDefinition name="Baseline Irrigation (L)" value="{baseline_water_usage_l}" />
                                                 <viz.data:MeasureDefinition name="ANFIS Water Usage (L)" value="{anfis_water_usage_l}" />
                                                 <viz.data:MeasureDefinition name="Rain (mm)" value="{rain_amount}" />
-                                                <viz.data:MeasureDefinition name="Max Temperature (C)" value="{max_temperature}" />
+                                                <viz.data:MeasureDefinition name="Max Temperature (°C)" value="{max_temperature}" />
                                             </viz.data:measures>
                                         </viz.data:FlattenedDataset>
                                     </viz:dataset>
                                     <viz:feeds>
                                         <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Baseline Irrigation (L),ANFIS Water Usage (L)" />
-                                        <viz.feeds:FeedItem uid="valueAxis2" type="Measure" values="Rain (mm),Max Temperature (C)" />
+                                        <viz.feeds:FeedItem uid="valueAxis2" type="Measure" values="Rain (mm),Max Temperature (°C)" />
                                         <viz.feeds:FeedItem uid="categoryAxis" type="Dimension" values="Date/Time" />
                                     </viz:feeds>
                                 </viz:VizFrame>
@@ -246,14 +269,14 @@
                                         <viz.data:MeasureDefinition name="Baseline Water Usage (L)" value="{baseline_water_usage_chart}" />
                                         <viz.data:MeasureDefinition name="ANFIS Moisture" value="{anfis_moisture}" />
                                         <viz.data:MeasureDefinition name="ANFIS Water Usage (L)" value="{anfis_water_usage_chart}" />
-                                        <viz.data:MeasureDefinition name="ANFIS-GA irrigation score (%)" value="{predicted_probability_percent}" />
-                                        <viz.data:MeasureDefinition name="Max Temp (C)" value="{max_temperature}" />
-                                        <viz.data:MeasureDefinition name="Rain (L/m²)" value="{rain_amount}" />
+                                        <viz.data:MeasureDefinition name="ANFIS zone signal (%)" value="{predicted_probability_percent}" />
+                                        <viz.data:MeasureDefinition name="Max Temp (°C)" value="{max_temperature}" />
+                                        <viz.data:MeasureDefinition name="Rain (mm)" value="{rain_amount}" />
                                     </viz.data:measures>
                                 </viz.data:FlattenedDataset>
                             </viz:dataset>
                             <viz:feeds>
-                                <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Baseline Moisture,Baseline Water Usage (L),ANFIS Moisture,ANFIS Water Usage (L),ANFIS-GA irrigation score (%),Max Temp (C),Rain (L/m²)" />
+                                <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Baseline Moisture,Baseline Water Usage (L),ANFIS Moisture,ANFIS Water Usage (L),ANFIS zone signal (%),Max Temp (°C),Rain (mm)" />
                                 <viz.feeds:FeedItem uid="categoryAxis" type="Dimension" values="Date/Time" />
                             </viz:feeds>
                         </viz:VizFrame>
@@ -332,7 +355,7 @@
                         <VBox id="fuzzyChartStack" class="experimentChartStack">
                             <VBox id="fuzzyMoistureChartBlock" class="experimentChartBlock">
                                 <Text id="fuzzyMoistureChartTitle" text="A. Soil Moisture Estimation &amp; Fuzzy Recommendation" class="experimentChartTitle" />
-                                <viz:VizFrame id="fuzzyMoistureChart" uiConfig="{applicationSet:'fiori'}" vizType="combination" height="330px" width="100%" renderComplete=".onChartRenderComplete">
+                                <viz:VizFrame id="fuzzyMoistureChart" uiConfig="{applicationSet:'fiori'}" vizType="dual_combination" height="330px" width="100%" renderComplete=".onChartRenderComplete">
                                     <viz:dataset>
                                         <viz.data:FlattenedDataset data="{/fuzzyChartEntries}">
                                             <viz.data:dimensions>
@@ -346,14 +369,15 @@
                                         </viz.data:FlattenedDataset>
                                     </viz:dataset>
                                     <viz:feeds>
-                                        <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Baseline Moisture,Fuzzy Moisture,Fuzzy irrigation score (%)" />
+                                        <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Baseline Moisture,Fuzzy Moisture" />
+                                        <viz.feeds:FeedItem uid="valueAxis2" type="Measure" values="Fuzzy irrigation score (%)" />
                                         <viz.feeds:FeedItem uid="categoryAxis" type="Dimension" values="Date/Time" />
                                     </viz:feeds>
                                 </viz:VizFrame>
                             </VBox>
                             <VBox id="fuzzyContextChartBlock" class="experimentChartBlock">
                                 <Text id="fuzzyContextChartTitle" text="B. Irrigation Volume &amp; Weather Context" class="experimentChartTitle" />
-                                <viz:VizFrame id="fuzzyContextChart" uiConfig="{applicationSet:'fiori'}" vizType="dual_combination" height="290px" width="100%" renderComplete=".onChartRenderComplete">
+                                <viz:VizFrame id="fuzzyContextChart" uiConfig="{applicationSet:'fiori'}" vizType="dual_combination" height="310px" width="100%" renderComplete=".onChartRenderComplete">
                                     <viz:dataset>
                                         <viz.data:FlattenedDataset data="{/fuzzyChartEntries}">
                                             <viz.data:dimensions>
@@ -363,13 +387,13 @@
                                                 <viz.data:MeasureDefinition name="Baseline Irrigation (L)" value="{baseline_water_usage_l}" />
                                                 <viz.data:MeasureDefinition name="Fuzzy Water Usage (L)" value="{fuzzy_water_usage_l}" />
                                                 <viz.data:MeasureDefinition name="Rain (mm)" value="{rain_amount}" />
-                                                <viz.data:MeasureDefinition name="Max Temperature (C)" value="{max_temperature}" />
+                                                <viz.data:MeasureDefinition name="Max Temperature (°C)" value="{max_temperature}" />
                                             </viz.data:measures>
                                         </viz.data:FlattenedDataset>
                                     </viz:dataset>
                                     <viz:feeds>
                                         <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Baseline Irrigation (L),Fuzzy Water Usage (L)" />
-                                        <viz.feeds:FeedItem uid="valueAxis2" type="Measure" values="Rain (mm),Max Temperature (C)" />
+                                        <viz.feeds:FeedItem uid="valueAxis2" type="Measure" values="Rain (mm),Max Temperature (°C)" />
                                         <viz.feeds:FeedItem uid="categoryAxis" type="Dimension" values="Date/Time" />
                                     </viz:feeds>
                                 </viz:VizFrame>
@@ -387,13 +411,13 @@
                                         <viz.data:MeasureDefinition name="Fuzzy Moisture" value="{fuzzy_moisture}" />
                                         <viz.data:MeasureDefinition name="Fuzzy irrigation score (%)" value="{fuzzy_prescription_score_pct}" />
                                         <viz.data:MeasureDefinition name="Fuzzy Water Usage (L)" value="{fuzzy_water_usage_chart}" />
-                                        <viz.data:MeasureDefinition name="Max Temp (C)" value="{max_temperature}" />
-                                        <viz.data:MeasureDefinition name="Rain (L/m²)" value="{rain_amount}" />
+                                        <viz.data:MeasureDefinition name="Max Temp (°C)" value="{max_temperature}" />
+                                        <viz.data:MeasureDefinition name="Rain (mm)" value="{rain_amount}" />
                                     </viz.data:measures>
                                 </viz.data:FlattenedDataset>
                             </viz:dataset>
                             <viz:feeds>
-                                <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Baseline Moisture,Baseline Water Usage (L),Fuzzy Moisture,Fuzzy irrigation score (%),Fuzzy Water Usage (L),Max Temp (C),Rain (L/m²)" />
+                                <viz.feeds:FeedItem uid="valueAxis" type="Measure" values="Baseline Moisture,Baseline Water Usage (L),Fuzzy Moisture,Fuzzy irrigation score (%),Fuzzy Water Usage (L),Max Temp (°C),Rain (mm)" />
                                 <viz.feeds:FeedItem uid="categoryAxis" type="Dimension" values="Date/Time" />
                             </viz:feeds>
                         </viz:VizFrame>
@@ -415,7 +439,7 @@
                                     <Column id="fuzzyMoistureCol"><Text id="fuzzyMoistureHeader" text="Fuzzy Moisture (%)" /></Column>
                                     <Column id="fuzzyEtcCol"><Text id="fuzzyEtcHeader" text="Temperature (C)" /></Column>
                                     <Column id="fuzzyPrescriptionCol"><Text id="fuzzyPrescriptionHeader" text="Fuzzy Score (%)" /></Column>
-                                    <Column id="fuzzyRainCol"><Text id="fuzzyRainHeader" text="Rain (L/m²)" /></Column>
+                                    <Column id="fuzzyRainCol"><Text id="fuzzyRainHeader" text="Rain (mm)" /></Column>
                                     <Column id="fuzzyEventsCol"><Text id="fuzzyEventsHeader" text="Fuzzy Valves" /></Column>
                                     <Column id="fuzzyWaterCol"><Text id="fuzzyWaterHeader" text="Fuzzy Water (L)" /></Column>
                                 </columns>

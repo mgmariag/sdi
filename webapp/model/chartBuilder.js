@@ -4,7 +4,7 @@ sap.ui.define([], () => {
     const WATER_BAR_MAX_CHART_VALUE = 20;
     const MOISTURE_THRESHOLD_PCT = 37;
     const MOISTURE_THRESHOLD_COLOR = "#43bfd2";
-    const ANFIS_SCORE_MEASURE = "ANFIS-GA irrigation score (%)";
+    const ANFIS_SCORE_MEASURE = "ANFIS zone signal (%)";
     const FUZZY_SCORE_MEASURE = "Fuzzy irrigation score (%)";
     const FUZZY_PRESCRIPTION_SCORE_MAX_MM = 8;
 
@@ -85,6 +85,7 @@ sap.ui.define([], () => {
     const EXPERIMENT_CHART_IDS = [
         "samplingMoistureChart",
         "samplingContextChart",
+        "samplingBaselineWeatherChart",
         "anfisMoistureChart",
         "anfisContextChart",
         "fuzzyMoistureChart",
@@ -94,6 +95,7 @@ sap.ui.define([], () => {
     const CHART_DATA_PATHS = {
         samplingMoistureChart: "/samplingChartEntries",
         samplingContextChart: "/samplingChartEntries",
+        samplingBaselineWeatherChart: "/samplingChartEntries",
         anfisMoistureChart: "/anfisChartEntries",
         anfisContextChart: "/anfisChartEntries",
         fuzzyMoistureChart: "/fuzzyChartEntries",
@@ -103,20 +105,29 @@ sap.ui.define([], () => {
     const CHART_SOURCE_DATA_PATHS = {
         samplingMoistureChart: "/samplingChartAllEntries",
         samplingContextChart: "/samplingChartAllEntries",
+        samplingBaselineWeatherChart: "/samplingChartAllEntries",
         anfisMoistureChart: "/anfisChartAllEntries",
         anfisContextChart: "/anfisChartAllEntries",
         fuzzyMoistureChart: "/fuzzyChartAllEntries",
         fuzzyContextChart: "/fuzzyChartAllEntries"
     };
 
+    /* eslint-disable @sap-ux/fiori-tools/sap-no-hardcoded-color -- VizFrame series palettes require explicit colors. */
     const CHART_PALETTES = {
         samplingMoistureChart: ["#2FC2CC ", "#7FCF45"],
-        samplingContextChart: ["#2FC2CC ", "#7FCF45", "#b7d8ff", "#F4B740"],
+        samplingContextChart: ["#2FC2CC ", "#7FCF45", "#b7d8ff", "#FFC107"],
         anfisMoistureChart: ["#2FC2CC ", "#2b8cbe", "#7FCF45"],
-        anfisContextChart: ["#2FC2CC ", "#2b8cbe", "#b7d8ff", "#F4B740"],
+        anfisContextChart: ["#2FC2CC ", "#2b8cbe", "#b7d8ff", "#FFC107"],
         fuzzyMoistureChart: ["#2FC2CC", "#ACA8F2", "#7FCF45"],
-        fuzzyContextChart: ["#2FC2CC", "#ACA8F2", "#b7d8ff", "#F4B740"]
+        fuzzyContextChart: ["#2FC2CC", "#ACA8F2", "#b7d8ff", "#FFC107"]
     };
+    /* eslint-enable @sap-ux/fiori-tools/sap-no-hardcoded-color */
+    CHART_PALETTES.samplingBaselineWeatherChart = [
+        CHART_PALETTES.samplingMoistureChart[0],
+        CHART_PALETTES.samplingContextChart[0],
+        CHART_PALETTES.samplingContextChart[2],
+        CHART_PALETTES.samplingContextChart[3]
+    ];
 
     const CHART_FORMATS = {
         samplingMoistureChart: {
@@ -127,7 +138,13 @@ sap.ui.define([], () => {
             "Baseline Irrigation (L)": "DT_NUMBER",
             "Sparse-Sensing Irrigation (L)": "DT_NUMBER",
             "Rain (mm)": "DT_MM",
-            "Max Temperature (C)": "DT_CELSIUS"
+            "Max Temperature (°C)": "DT_CELSIUS"
+        },
+        samplingBaselineWeatherChart: {
+            "Baseline Moisture": "DT_PERCENT",
+            "Baseline Water Usage (L)": "DT_NUMBER",
+            "Rain (mm)": "DT_MM",
+            "Max Temperature (°C)": "DT_CELSIUS"
         },
         anfisMoistureChart: {
             "Baseline Moisture": "DT_PERCENT",
@@ -138,7 +155,7 @@ sap.ui.define([], () => {
             "Baseline Irrigation (L)": "DT_NUMBER",
             "ANFIS Water Usage (L)": "DT_NUMBER",
             "Rain (mm)": "DT_MM",
-            "Max Temperature (C)": "DT_CELSIUS"
+            "Max Temperature (°C)": "DT_CELSIUS"
         },
         fuzzyMoistureChart: {
             "Baseline Moisture": "DT_PERCENT",
@@ -149,14 +166,14 @@ sap.ui.define([], () => {
             "Baseline Irrigation (L)": "DT_NUMBER",
             "Fuzzy Water Usage (L)": "DT_NUMBER",
             "Rain (mm)": "DT_MM",
-            "Max Temperature (C)": "DT_CELSIUS"
+            "Max Temperature (°C)": "DT_CELSIUS"
         },
         samplingChart: {
             "Baseline Moisture": "DT_PERCENT",
             "Baseline Water Usage (L)": "DT_NUMBER",
             "Sparse Moisture": "DT_PERCENT",
             "Sparse Water Usage (L)": "DT_NUMBER",
-            "Max Temp (C)": "DT_CELSIUS",
+            "Max Temp (°C)": "DT_CELSIUS",
             "Rain (mm)": "DT_MM"
         },
         anfisChart: {
@@ -165,7 +182,7 @@ sap.ui.define([], () => {
             "ANFIS Moisture": "DT_PERCENT",
             "ANFIS Water Usage (L)": "DT_NUMBER",
             [ANFIS_SCORE_MEASURE]: "DT_PERCENT",
-            "Max Temp (C)": "DT_CELSIUS",
+            "Max Temp (°C)": "DT_CELSIUS",
             "Rain (mm)": "DT_MM"
         },
         fuzzyChart: {
@@ -174,7 +191,7 @@ sap.ui.define([], () => {
             "Fuzzy Moisture": "DT_PERCENT",
             [FUZZY_SCORE_MEASURE]: "DT_PERCENT",
             "Fuzzy Water Usage (L)": "DT_NUMBER",
-            "Max Temp (C)": "DT_CELSIUS",
+            "Max Temp (°C)": "DT_CELSIUS",
             "Rain (mm)": "DT_MM"
         }
     };
@@ -182,6 +199,7 @@ sap.ui.define([], () => {
     const CHART_DATA_SHAPES = {
         samplingMoistureChart: ["line", "line"],
         samplingContextChart: ["bar", "bar", "bar", "line"],
+        samplingBaselineWeatherChart: ["line", "bar", "bar", "line"],
         anfisMoistureChart: ["line", "line", "line"],
         anfisContextChart: ["bar", "bar", "bar", "line"],
         fuzzyMoistureChart: ["line", "line", "line"],
@@ -198,8 +216,8 @@ sap.ui.define([], () => {
     ]);
 
     const CHART_WEATHER_MEASURES = new Set([
-        "Max Temp (C)",
-        "Max Temperature (C)",
+        "Max Temp (°C)",
+        "Max Temperature (°C)",
         "Rain (mm)"
     ]);
 
@@ -220,8 +238,12 @@ sap.ui.define([], () => {
         "fuzzyContextChart"
     ]);
 
+    const BASELINE_WEATHER_WATER_AXIS_MEASURES = new Set([
+        "Baseline Water Usage (L)"
+    ]);
+
     const SECONDARY_AXIS_MEASURES = new Set([
-        "Max Temperature (C)",
+        "Max Temperature (°C)",
         "Rain (mm)"
     ]);
 
@@ -234,7 +256,13 @@ sap.ui.define([], () => {
             "Baseline Irrigation (L)",
             "Sparse-Sensing Irrigation (L)",
             "Rain (mm)",
-            "Max Temperature (C)"
+            "Max Temperature (°C)"
+        ],
+        samplingBaselineWeatherChart: [
+            "Baseline Moisture",
+            "Baseline Water Usage (L)",
+            "Rain (mm)",
+            "Max Temperature (°C)"
         ],
         anfisMoistureChart: [
             "Baseline Moisture",
@@ -245,7 +273,7 @@ sap.ui.define([], () => {
             "Baseline Irrigation (L)",
             "ANFIS Water Usage (L)",
             "Rain (mm)",
-            "Max Temperature (C)"
+            "Max Temperature (°C)"
         ],
         fuzzyMoistureChart: [
             "Baseline Moisture",
@@ -256,14 +284,14 @@ sap.ui.define([], () => {
             "Baseline Irrigation (L)",
             "Fuzzy Water Usage (L)",
             "Rain (mm)",
-            "Max Temperature (C)"
+            "Max Temperature (°C)"
         ],
         samplingChart: [
             "Baseline Moisture",
             "Baseline Water Usage (L)",
             "Sparse Moisture",
             "Sparse Water Usage (L)",
-            "Max Temp (C)",
+            "Max Temp (°C)",
             "Rain (mm)"
         ],
         anfisChart: [
@@ -272,7 +300,7 @@ sap.ui.define([], () => {
             "ANFIS Moisture",
             "ANFIS Water Usage (L)",
             ANFIS_SCORE_MEASURE,
-            "Max Temp (C)",
+            "Max Temp (°C)",
             "Rain (mm)"
         ],
         fuzzyChart: [
@@ -281,7 +309,7 @@ sap.ui.define([], () => {
             "Fuzzy Moisture",
             FUZZY_SCORE_MEASURE,
             "Fuzzy Water Usage (L)",
-            "Max Temp (C)",
+            "Max Temp (°C)",
             "Rain (mm)"
         ]
     };
@@ -333,8 +361,12 @@ sap.ui.define([], () => {
     }
 
     function isSecondaryAxisMeasure(chartId, measure) {
+        if (chartId === "samplingBaselineWeatherChart") {
+            return BASELINE_WEATHER_WATER_AXIS_MEASURES.has(measure);
+        }
         return (CONTEXT_CHART_IDS.has(chartId) && SECONDARY_AXIS_MEASURES.has(measure))
-            || (chartId === "anfisMoistureChart" && measure === ANFIS_SCORE_MEASURE);
+            || (chartId === "anfisMoistureChart" && measure === ANFIS_SCORE_MEASURE)
+            || (chartId === "fuzzyMoistureChart" && measure === FUZZY_SCORE_MEASURE);
     }
 
     function visibleChartMeasuresByAxis(chartId, visibility) {
@@ -400,6 +432,7 @@ sap.ui.define([], () => {
         INITIAL_VISIBLE_CHART_DAYS,
         MOISTURE_THRESHOLD_COLOR,
         MOISTURE_THRESHOLD_PCT,
+        WATER_BAR_MAX_CHART_VALUE,
         chartMeasureColor,
         entryTimestamp,
         prepareChartResult,

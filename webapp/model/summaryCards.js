@@ -6,10 +6,20 @@ sap.ui.define([
 
     const {
         compactIrrigationWindowHtml,
+        experimentPlannedValveRunsHtml,
         experimentSideRailHtml,
-        formatChartGranularity
+        formatChartGranularity,
+        irrigationWindowValveLabelHtml
     } = Formatter;
     const { experimentDisplayName } = ExperimentMapper;
+    const CONFIGURED_VALVE_NUMBERS = [1, 2, 3, 4, 5];
+    const VALVE_ZONE_BY_NUMBER = {
+        1: "west wall",
+        2: "south rail",
+        3: "east corner",
+        4: "north shelter",
+        5: "hanging row"
+    };
 
     function activeSummary(model) {
         const active = model.getProperty("/activeExperiment");
@@ -92,6 +102,84 @@ sap.ui.define([
             anfis: "anfis",
             fuzzy: "fuzzy"
         }[active] || "";
+    }
+
+    function uniqueValveNumbers(numbers) {
+        return Array.from(new Set((numbers || [])
+            .map((number) => Number(number))
+            .filter((number) => Number.isFinite(number) && number > 0)))
+            .sort((left, right) => left - right);
+    }
+
+    function parseActivatedValveLabel(label) {
+        const value = String(label || "").trim();
+        const lowerValue = value.toLowerCase();
+        if (!value || lowerValue === "none") {
+            return [];
+        }
+        if (lowerValue === "all") {
+            return CONFIGURED_VALVE_NUMBERS.slice();
+        }
+
+        const numbers = [];
+        value.split(",").forEach((token) => {
+            const rangeMatch = token.match(/V?\s*(\d+)\s*[-\u2013]\s*V?\s*(\d+)/i);
+            if (rangeMatch) {
+                const start = Number(rangeMatch[1]);
+                const end = Number(rangeMatch[2]);
+                const step = start <= end ? 1 : -1;
+                for (let number = start; number !== end + step; number += step) {
+                    numbers.push(number);
+                }
+                return;
+            }
+
+            Array.from(token.matchAll(/V?\s*(\d+)/gi)).forEach((match) => {
+                numbers.push(Number(match[1]));
+            });
+        });
+        return uniqueValveNumbers(numbers);
+    }
+
+    function rowValveNumbers(row, prefix) {
+        const directNumbers = row && row[`${prefix}_activated_valve_numbers`];
+        if (Array.isArray(directNumbers)) {
+            return uniqueValveNumbers(directNumbers);
+        }
+        return parseActivatedValveLabel((row && row[`${prefix}_activated_valves`]) || directNumbers);
+    }
+
+    function rowPlannedVolumeL(row, prefix) {
+        const plannedVolume = Number(row && row[`${prefix}_planned_volume_l`]);
+        if (Number.isFinite(plannedVolume) && plannedVolume > 0) {
+            return plannedVolume;
+        }
+        return numberValue(row && row[`${prefix}_water_usage_l`]);
+    }
+
+    function normalizedValveDetails(row, prefix, totalVolumeL) {
+        const valveDetails = Array.isArray(row && row[`${prefix}_valves`])
+            ? row[`${prefix}_valves`]
+            : [];
+        const normalizedDetails = valveDetails
+            .map((valve) => ({
+                valve_number: Number(valve && valve.valve_number),
+                valve_zone: valve && valve.valve_zone,
+                valve_name: valve && valve.valve_name,
+                planned_volume_l: numberValue(valve && valve.planned_volume_l)
+            }))
+            .filter((valve) => Number.isFinite(valve.valve_number) && valve.valve_number > 0);
+        if (normalizedDetails.length) {
+            return normalizedDetails;
+        }
+
+        const numbers = rowValveNumbers(row, prefix);
+        const volumePerValve = numbers.length ? totalVolumeL / numbers.length : 0;
+        return numbers.map((number) => ({
+            valve_number: number,
+            valve_zone: VALVE_ZONE_BY_NUMBER[number] || "",
+            planned_volume_l: roundedTotal(volumePerValve)
+        }));
     }
 
     function parseDateTime(value) {
@@ -179,6 +267,47 @@ sap.ui.define([
         return window;
     }
 
+    function activeExperimentValveRunsWindow(model, active) {
+        const prefix = activeExperimentPrefix(active);
+        if (!prefix) {
+            return null;
+        }
+        const candidates = activeRows(model, active)
+            .filter((row) => rowIrrigated(row, prefix))
+            .map((row) => {
+                const start = rowWindowStart(row, prefix);
+                return {
+                    row,
+                    start,
+                    end: rowWindowEnd(row, prefix, start)
+                };
+            })
+            .filter((candidate) => candidate.start)
+            .sort((left, right) => left.start - right.start);
+
+        if (!candidates.length) {
+            return null;
+        }
+
+        const now = new Date();
+        const selected = candidates.find((candidate) => candidate.start >= now)
+            || candidates[candidates.length - 1];
+        const totalVolumeL = rowPlannedVolumeL(selected.row, prefix);
+        const label = selected.end
+            ? `${dateTimeLabel(selected.start)} - ${timeLabel(selected.end)}`
+            : dateTimeLabel(selected.start);
+        return {
+            label,
+            start_at: selected.start.toISOString(),
+            end_at: selected.end ? selected.end.toISOString() : null,
+            item_count: sumIntegerRows([selected.row], `${prefix}_valve_runs`),
+            activated_valves: selected.row && selected.row[`${prefix}_activated_valves`],
+            planned_volume_l: roundedTotal(totalVolumeL),
+            source: active,
+            valves: normalizedValveDetails(selected.row, prefix, totalVolumeL)
+        };
+    }
+
     function updateExperimentContextRail(model) {
         const active = model.getProperty("/activeExperiment");
         const overview = model.getProperty("/overview") || {};
@@ -194,13 +323,14 @@ sap.ui.define([
             state.irrigationActivityLabel = "Next planned irrigation";
             state.irrigationActivityValue = nextWindow.label;
             state.compactIrrigationActivityHtml = compactIrrigationWindowHtml(nextWindow);
+            state.plannedValvesHtml = irrigationWindowValveLabelHtml(nextWindow);
         }
 
         model.setProperty(
             "/overview/experimentSideRailHtml",
             experimentSideRailHtml(
                 state,
-                overview.plantOverviewHtml || "",
+                experimentPlannedValveRunsHtml(activeExperimentValveRunsWindow(model, active)),
                 overview.weatherImpactHtml || "",
                 active,
                 activeDisplaySummary(model)
@@ -268,6 +398,7 @@ sap.ui.define([
             return summary;
         }
 
+        const mismatches = rows.filter((row) => rowIrrigated(row, "baseline") !== rowIrrigated(row, "fuzzy"));
         const baselineWater = sumRows(rows, "baseline_water_usage_l");
         const fuzzyWater = sumRows(rows, "fuzzy_water_usage_l");
         const waterSavings = roundedTotal(baselineWater - fuzzyWater);
@@ -278,6 +409,8 @@ sap.ui.define([
         setSummaryValue(output, "fuzzy_total_water_usage_l", fuzzyWater);
         setSummaryValue(output, "water_savings_l", waterSavings);
         setSummaryValue(output, "water_savings_percent", baselineWater > 0 ? roundedTotal(waterSavings / baselineWater * 100) : 0);
+        setSummaryValue(output, "accuracy_percent", rows.length ? roundedTotal((rows.length - mismatches.length) / rows.length * 100) : numberValue(summary.accuracy_percent));
+        setSummaryValue(output, "mismatch_days", mismatches.length);
         setSummaryValue(output, "baseline_irrigation_event_count", sumIntegerRows(rows, "baseline_irrigation_events"));
         setSummaryValue(output, "fuzzy_irrigation_event_count", sumIntegerRows(rows, "fuzzy_irrigation_events"));
         setSummaryValue(output, "baseline_valve_run_count", sumIntegerRows(rows, "baseline_valve_runs"));

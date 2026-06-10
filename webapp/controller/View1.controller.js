@@ -14,12 +14,11 @@
 
     const { fetchJson, getApiUrl } = ApiClient;
     const { prepareChartResult } = ChartBuilder;
-    const ANFIS_TRAIN_SAMPLES = 2000;
-    const ANFIS_TEST_SAMPLES = 800;
     const {
         addDays,
         defaultOverview,
         formatLocalDate,
+        overviewUnavailable,
         parseLocalDate,
         prepareOverview
     } = Formatter;
@@ -172,8 +171,8 @@
                     model.setProperty("/overview", prepareOverview(result));
                     this._updateExperimentFooter(model);
                 })
-                .catch(() => {
-                    model.setProperty("/overview/loaded", false);
+                .catch((error) => {
+                    model.setProperty("/overview", overviewUnavailable(error));
                 });
         },
 
@@ -227,8 +226,6 @@
                     url.searchParams.set("start", startDate);
                     url.searchParams.set("end", endDate);
                     url.searchParams.set("sample_interval_hours", sampleIntervalHours);
-                    url.searchParams.set("train_samples", ANFIS_TRAIN_SAMPLES);
-                    url.searchParams.set("test_samples", ANFIS_TEST_SAMPLES);
                     url.searchParams.set("seed", settings.scenario_seed || 2026);
                     return fetchJson(url.toString(), { method: "POST" })
                         .catch((error) => {
@@ -565,7 +562,7 @@
             const cacheKey = this._experimentClientCacheKey(
                 model,
                 "anfis",
-                `${ANFIS_TRAIN_SAMPLES}|${ANFIS_TEST_SAMPLES}|${scenarioSeed}`
+                `all_available|${scenarioSeed}`
             );
             if (this._loadExperimentResultFromCache(model, cacheKey, (result, clientCacheHit) => this._applyAnfisResult(model, result, clientCacheHit))) {
                 return;
@@ -587,8 +584,6 @@
                     const range = experimentRange(settings);
                     url.searchParams.set("start", range.start);
                     url.searchParams.set("end", range.end);
-                    url.searchParams.set("train_samples", ANFIS_TRAIN_SAMPLES);
-                    url.searchParams.set("test_samples", ANFIS_TEST_SAMPLES);
                     url.searchParams.set("seed", scenarioSeed);
                     return fetchJson(url.toString());
                 })

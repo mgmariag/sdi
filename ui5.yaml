@@ -27,3 +27,4 @@ server:
         flp:
           theme: sap_horizon
           init: /model/flpUser
+          enhancedHomePage: true

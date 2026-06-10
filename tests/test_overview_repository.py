@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime, time
 
 from digital_twin.db.repositories.sensor_repository import (
+    _activity_window,
     _irrigation_activity,
     _next_prescription_irrigation,
     _next_recommendation_ready_at,
@@ -61,7 +62,7 @@ class OverviewRepositoryTests(unittest.TestCase):
 
         self.assertEqual(window["label"], "2026-06-05 17:00 - 19:00")
 
-    def test_next_prescription_irrigation_reads_dispatched_future_events(self) -> None:
+    def test_next_prescription_irrigation_reads_baseline_future_events(self) -> None:
         conn = _FakePrescriptionConnection()
 
         window = _next_prescription_irrigation(conn, datetime(2026, 6, 5, 20, 0))
@@ -70,10 +71,41 @@ class OverviewRepositoryTests(unittest.TestCase):
         self.assertEqual(window["source"], "prescription")
         self.assertEqual(window["mode"], "next_planned")
         self.assertEqual(window["display_label"], "Next planned irrigation")
-        self.assertEqual(window["label"], "2026-06-06 05:30 - 05:55")
-        self.assertEqual(window["item_count"], 2)
-        self.assertEqual(window["planned_volume_l"], 0.7)
-        self.assertEqual(window["activated_valves"], "V1-V2")
+        self.assertEqual(window["label"], "2026-06-06 05:30 - 05:45")
+        self.assertEqual(window["item_count"], 1)
+        self.assertEqual(window["planned_volume_l"], 0.5)
+        self.assertEqual(window["activated_valves"], "V1")
+
+    def test_activity_window_reports_valve_water_details(self) -> None:
+        window = _activity_window(
+            [
+                {
+                    "experiment_type": "baseline",
+                    "start_at": datetime(2026, 6, 6, 6, 0),
+                    "end_at": datetime(2026, 6, 6, 6, 12),
+                    "planned_volume_ml": 12000,
+                    "valve_number": 1,
+                    "valve_zone": "west_wall",
+                },
+                {
+                    "experiment_type": "baseline",
+                    "start_at": datetime(2026, 6, 6, 6, 0),
+                    "end_at": datetime(2026, 6, 6, 6, 18),
+                    "planned_volume_ml": 18500,
+                    "valve_number": 2,
+                    "valve_zone": "south_rail",
+                },
+            ],
+            source="actuation_history",
+            mode="most_recent",
+            display_label="Most recent irrigation",
+        )
+
+        self.assertEqual(window["planned_volume_l"], 30.5)
+        self.assertEqual(window["valves"][0]["valve_name"], "west wall")
+        self.assertEqual(window["valves"][0]["planned_volume_l"], 12.0)
+        self.assertEqual(window["valves"][1]["valve_name"], "south rail")
+        self.assertEqual(window["valves"][1]["planned_volume_l"], 18.5)
 
     def test_next_prescription_irrigation_ignores_current_day_leftovers(self) -> None:
         conn = _FakePrescriptionConnection(
@@ -187,7 +219,13 @@ class _FakePrescriptionConnection:
         if "FROM irrigation_prescriptions" not in query:
             raise AssertionError(f"Unexpected query: {query}")
         today = params["today"]
-        return _FakeResult([row for row in self.rows if row["prescription_date"] > today.isoformat()])
+        experiment_type = params.get("experiment_type")
+        return _FakeResult([
+            row
+            for row in self.rows
+            if row["prescription_date"] > today.isoformat()
+            and (experiment_type is None or row["experiment_type"] == experiment_type)
+        ])
 
 
 class _FakeResult:

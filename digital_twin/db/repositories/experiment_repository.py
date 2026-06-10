@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal
 from typing import Any
 
 from psycopg.rows import dict_row
@@ -8,6 +9,8 @@ from psycopg.types.json import Jsonb
 
 from digital_twin.core.time import local_timezone, now_local
 from digital_twin.db.connection import get_connection
+
+PHYSICAL_ACTUATION_EXPERIMENT_TYPE = "baseline"
 
 
 def _today_window(current: datetime | None = None) -> tuple[datetime, datetime, datetime]:
@@ -52,6 +55,35 @@ def _representative_pot_id(event: dict[str, Any]) -> int | None:
     )
 
 
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    return value
+
+
+def _experiment_run_row(
+    experiment_type: str,
+    start_date: date,
+    end_date: date,
+    parameters: dict[str, Any] | None,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "experiment_type": experiment_type,
+        "start_date": start_date,
+        "end_date": end_date,
+        "parameters": Jsonb(_json_ready(parameters or {})),
+        "summary": Jsonb(_json_ready(result.get("summary") or {})),
+        "payload": Jsonb(_json_ready(result)),
+    }
+
+
 def _prescription_event_row(prescription: dict[str, Any], event: dict[str, Any]) -> dict[str, Any] | None:
     start_raw = event.get("scheduled_start_at")
     if not start_raw:
@@ -94,6 +126,77 @@ def _prescription_event_row(prescription: dict[str, Any], event: dict[str, Any])
         "valve_number": event.get("valve_number"),
         "payload": Jsonb(event),
     }
+
+
+class ExperimentRunRepository:
+    """Persistence boundary for reproducible experiment result snapshots."""
+
+    def create(
+        self,
+        *,
+        experiment_type: str,
+        start_date: date,
+        end_date: date,
+        parameters: dict[str, Any] | None,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        row = _experiment_run_row(experiment_type, start_date, end_date, parameters, result)
+        with get_connection(row_factory=dict_row) as conn:
+            saved = conn.execute(
+                """
+                INSERT INTO experiment_runs (
+                    experiment_type, start_date, end_date, parameters, summary, payload
+                )
+                VALUES (
+                    %(experiment_type)s, %(start_date)s, %(end_date)s,
+                    %(parameters)s, %(summary)s, %(payload)s
+                )
+                RETURNING id, experiment_type, start_date, end_date, computed_at, parameters, summary, created_at
+                """,
+                row,
+            ).fetchone()
+            conn.commit()
+            return saved
+
+    def latest(
+        self,
+        *,
+        experiment_type: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 100))
+        with get_connection(row_factory=dict_row) as conn:
+            if experiment_type:
+                return conn.execute(
+                    """
+                    SELECT id, experiment_type, start_date, end_date, computed_at, parameters, summary, created_at
+                    FROM experiment_runs
+                    WHERE experiment_type = %(experiment_type)s
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %(limit)s
+                    """,
+                    {"experiment_type": experiment_type, "limit": limit},
+                ).fetchall()
+            return conn.execute(
+                """
+                SELECT id, experiment_type, start_date, end_date, computed_at, parameters, summary, created_at
+                FROM experiment_runs
+                ORDER BY created_at DESC, id DESC
+                LIMIT %(limit)s
+                """,
+                {"limit": limit},
+            ).fetchall()
+
+    def get(self, run_id: int) -> dict[str, Any] | None:
+        with get_connection(row_factory=dict_row) as conn:
+            return conn.execute(
+                """
+                SELECT *
+                FROM experiment_runs
+                WHERE id = %(id)s
+                """,
+                {"id": int(run_id)},
+            ).fetchone()
 
 
 class ActuationRepository:
@@ -154,9 +257,13 @@ class ActuationRepository:
                 FROM irrigation_prescriptions
                 WHERE status = 'dispatched'
                   AND prescription_date = %(today)s
+                  AND experiment_type = %(experiment_type)s
                 ORDER BY experiment_type
                 """,
-                {"today": today_start.date()},
+                {
+                    "today": today_start.date(),
+                    "experiment_type": PHYSICAL_ACTUATION_EXPERIMENT_TYPE,
+                },
             ).fetchall()
 
             materialized = []
@@ -273,15 +380,17 @@ class ActuationRepository:
                 FROM irrigation_actuations ia
                 JOIN pots p ON p.id = ia.pot_id
                 WHERE ia.status = 'planned'
+                  AND ia.experiment_type = %(experiment_type)s
                   AND ia.scheduled_start_at >= %(today_start)s
                   AND ia.scheduled_start_at < %(today_end)s
-                  AND ia.scheduled_start_at <= %(now)s
+                  AND ia.scheduled_end_at <= %(now)s
                 ORDER BY ia.scheduled_start_at, ia.id
                 LIMIT %(limit)s
                 """,
                 {
                     "limit": limit,
                     "now": now,
+                    "experiment_type": PHYSICAL_ACTUATION_EXPERIMENT_TYPE,
                     "today_start": today_start,
                     "today_end": today_end,
                 },
@@ -305,7 +414,7 @@ class ActuationRepository:
                   AND status = 'planned'
                   AND scheduled_start_at >= %(today_start)s
                   AND scheduled_start_at < %(today_end)s
-                  AND scheduled_start_at <= %(now)s
+                  AND scheduled_end_at <= %(now)s
                 RETURNING *
                 """,
                 {
@@ -356,10 +465,15 @@ class ActuationRepository:
                 FROM irrigation_actuations
                 WHERE scheduled_start_at >= %(today_start)s
                   AND scheduled_start_at < %(today_end)s
+                  AND experiment_type = %(experiment_type)s
                 GROUP BY status
                 ORDER BY status
                 """,
-                {"today_start": today_start, "today_end": today_end},
+                {
+                    "today_start": today_start,
+                    "today_end": today_end,
+                    "experiment_type": PHYSICAL_ACTUATION_EXPERIMENT_TYPE,
+                },
             ).fetchall()
             prescriptions = conn.execute(
                 """

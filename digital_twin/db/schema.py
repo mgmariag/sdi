@@ -64,7 +64,9 @@ def _schema_is_current(conn) -> bool:
             to_regclass('public.pots') IS NOT NULL AS has_pots,
             to_regclass('public.sensor_readings') IS NOT NULL AS has_sensor_readings,
             to_regclass('public.weather_hourly') IS NOT NULL AS has_weather_hourly,
-            to_regclass('public.sensor_location_recommendations') IS NOT NULL AS has_sensor_locations
+            to_regclass('public.sensor_location_recommendations') IS NOT NULL AS has_sensor_locations,
+            to_regclass('public.anfis_models') IS NOT NULL AS has_anfis_models,
+            to_regclass('public.experiment_runs') IS NOT NULL AS has_experiment_runs
         """
     ).fetchone()
     if not row or not all(row):
@@ -161,6 +163,12 @@ def _schema_is_current(conn) -> bool:
                   AND column_name = 'winter_location'
             ) AS winter_location_removed,
             to_regclass('public.irrigation_prescriptions') IS NOT NULL AS has_irrigation_prescriptions,
+            EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'experiment_runs'
+                  AND column_name = 'payload'
+            ) AS has_experiment_run_payload,
             EXISTS (SELECT 1 FROM pots LIMIT 1) AS has_seeded_pots
         """
     ).fetchone()
@@ -310,6 +318,29 @@ def create_schema(conn) -> None:
             PRIMARY KEY (sensor_id, recorded_at)
         );
 
+        CREATE TABLE IF NOT EXISTS anfis_models (
+            id BIGSERIAL PRIMARY KEY,
+            model_key TEXT NOT NULL UNIQUE,
+            trained_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            training_start_date DATE,
+            training_end_date DATE,
+            train_samples INTEGER NOT NULL DEFAULT 0,
+            test_samples INTEGER NOT NULL DEFAULT 0,
+            fit_samples INTEGER NOT NULL DEFAULT 0,
+            calibration_samples INTEGER NOT NULL DEFAULT 0,
+            weighted_fit_samples INTEGER NOT NULL DEFAULT 0,
+            seed INTEGER,
+            generations INTEGER NOT NULL DEFAULT 0,
+            population INTEGER NOT NULL DEFAULT 0,
+            sensor_source TEXT NOT NULL DEFAULT 'simulated_sensor',
+            sensor_reading_count BIGINT NOT NULL DEFAULT 0,
+            sensor_readings_max_recorded_at TIMESTAMP,
+            model_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+            metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            changed_at TIMESTAMPTZ
+        );
+
         CREATE TABLE IF NOT EXISTS sensor_location_recommendations (
             id BIGSERIAL PRIMARY KEY,
             sensor_id BIGINT NOT NULL,
@@ -392,6 +423,18 @@ def create_schema(conn) -> None:
             UNIQUE (experiment_type, prescription_date)
         );
 
+        CREATE TABLE IF NOT EXISTS experiment_runs (
+            id BIGSERIAL PRIMARY KEY,
+            experiment_type TEXT NOT NULL,
+            start_date DATE NOT NULL,
+            end_date DATE NOT NULL,
+            computed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            parameters JSONB NOT NULL DEFAULT '{}'::jsonb,
+            summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+            payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+
         CREATE TABLE IF NOT EXISTS weather_refresh_runs (
             id BIGSERIAL PRIMARY KEY,
             refresh_date DATE NOT NULL,
@@ -470,6 +513,8 @@ def create_schema(conn) -> None:
         CREATE INDEX IF NOT EXISTS idx_sensor_readings_source_sensor_resolution_recorded_desc
             ON sensor_readings (source, sensor_id, reading_resolution, recorded_at DESC)
             INCLUDE (soil_moisture_pct, air_temperature_c, air_humidity_pct, substrate_temperature_c, sample_count);
+        CREATE INDEX IF NOT EXISTS idx_anfis_models_key_trained
+            ON anfis_models (model_key, trained_at DESC);
         CREATE INDEX IF NOT EXISTS idx_sensor_location_recommendations_rank
             ON sensor_location_recommendations (rank);
         CREATE INDEX IF NOT EXISTS idx_sensor_location_recommendations_pot
@@ -517,6 +562,10 @@ def create_schema(conn) -> None:
             WHERE status = 'planned';
         CREATE INDEX IF NOT EXISTS idx_irrigation_prescriptions_date
             ON irrigation_prescriptions (prescription_date, experiment_type);
+        CREATE INDEX IF NOT EXISTS idx_experiment_runs_type_range_created
+            ON experiment_runs (experiment_type, start_date, end_date, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_experiment_runs_created
+            ON experiment_runs (created_at DESC);
         """
     )
 
@@ -978,4 +1027,3 @@ def _json_ready(value):
     if hasattr(value, "isoformat"):
         return value.isoformat()
     return value
-

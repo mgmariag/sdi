@@ -465,27 +465,27 @@ class AnfisIrrigationExperiment(EngineBackedExperiment):
         self,
         start_date: date,
         end_date: date,
-        train_samples: int = 2000,
-        test_samples: int = 800,
         seed: int | None = 2026,
         generations: int = 35,
         population: int = 24,
         persist: bool = False,
         snapshot: ExperimentSnapshot | None = None,
         baseline_result: dict[str, Any] | None = None,
+        trained_model: Any | None = None,
+        training_metadata: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(start_date, end_date, persist, snapshot, baseline_result)
-        self.train_samples = train_samples
-        self.test_samples = test_samples
         self.seed = seed
         self.generations = generations
         self.population = population
+        self.trained_model = trained_model
+        self.training_metadata = training_metadata
 
     def engine_parameters(self) -> dict[str, Any]:
         return {
-            "train_samples": self.train_samples,
-            "test_samples": self.test_samples,
             "seed": self.seed,
             "generations": self.generations,
             "population": self.population,
+            "trained_model": self.trained_model,
+            "training_metadata": self.training_metadata,
         }

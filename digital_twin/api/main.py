@@ -32,12 +32,7 @@ def initialize_api() -> None:
     settings = get_settings()
     if settings.weather_refresh_on_startup:
         _refresh_weather_on_startup()
-    if settings.sensor_cleanup_enabled:
-        try:
-            SensorService().cleanup(source=settings.sensor_source)
-            logger.info("Sensor aggregate cleanup completed")
-        except Exception as exc:
-            logger.warning("Sensor aggregate cleanup skipped: %s", exc)
+    _prepare_sensors_on_startup()
     if settings.prescription_scheduler_enabled:
         _start_prescription_scheduler()
     if settings.actuation_scheduler_enabled:
@@ -53,6 +48,33 @@ def initialize_api() -> None:
         )
     except Exception as exc:
         logger.warning("Baseline experiment cache warm-up skipped: %s", exc)
+
+
+def _prepare_sensors_on_startup() -> None:
+    settings = get_settings()
+    service = SensorService()
+    if settings.sensor_seed_history_on_startup:
+        try:
+            result = service.ensure_tiered_history(
+                source=settings.sensor_source,
+                cleanup=settings.sensor_cleanup_enabled,
+            )
+            logger.info(
+                "Sensor tiered history ready: coverage=%s seed=%s cleanup=%s",
+                result.get("coverage"),
+                bool(result.get("seed")),
+                bool(result.get("cleanup")),
+            )
+        except Exception as exc:
+            logger.warning("Sensor tiered history seeding skipped: %s", exc)
+        return
+
+    if settings.sensor_cleanup_enabled:
+        try:
+            service.cleanup(source=settings.sensor_source)
+            logger.info("Sensor aggregate cleanup completed")
+        except Exception as exc:
+            logger.warning("Sensor aggregate cleanup skipped: %s", exc)
 
 
 def _refresh_weather_on_startup() -> None:

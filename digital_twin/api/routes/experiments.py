@@ -2,12 +2,10 @@ from __future__ import annotations
 
 from datetime import date
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from digital_twin.api.errors import http_error
 from digital_twin.services.experiment_service import (
-    DEFAULT_ANFIS_TEST_SAMPLES,
-    DEFAULT_ANFIS_TRAIN_SAMPLES,
     DEFAULT_SCENARIO_SEED,
     ExperimentService,
 )
@@ -55,16 +53,12 @@ def run_dt_sampling_experiment(
 def run_dt_anfis_experiment(
     start: date | None = Query(None),
     end: date | None = Query(None),
-    train_samples: int = Query(DEFAULT_ANFIS_TRAIN_SAMPLES, ge=100, le=2000),
-    test_samples: int = Query(DEFAULT_ANFIS_TEST_SAMPLES, ge=50, le=1000),
     seed: int | None = Query(DEFAULT_SCENARIO_SEED),
 ):
     try:
         return service.run_anfis(
             start=start,
             end=end,
-            train_samples=train_samples,
-            test_samples=test_samples,
             seed=seed,
         )
     except Exception as exc:
@@ -82,14 +76,34 @@ def run_dt_fuzzy_dt_experiment(
         raise http_error(exc, 500, "Fuzzy DT experiment failed") from exc
 
 
+@router.get("/runs")
+def list_experiment_runs(
+    experiment_type: str | None = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+):
+    try:
+        return {"runs": service.list_runs(experiment_type=experiment_type, limit=limit)}
+    except Exception as exc:
+        raise http_error(exc, 500, "Experiment run listing failed") from exc
+
+
+@router.get("/runs/{run_id}")
+def get_experiment_run(run_id: int):
+    try:
+        run = service.get_run(run_id)
+    except Exception as exc:
+        raise http_error(exc, 500, "Experiment run lookup failed") from exc
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Experiment run {run_id} was not found")
+    return run
+
+
 @router.post("/precompute")
 def precompute_dt_experiments(
     start: date | None = Query(None),
     end: date | None = Query(None),
     sample_interval_days: int = Query(3, ge=1, le=MAX_SAMPLING_INTERVAL_DAYS),
     sample_interval_hours: int | None = Query(None, ge=1, le=MAX_SAMPLING_INTERVAL_HOURS),
-    train_samples: int = Query(DEFAULT_ANFIS_TRAIN_SAMPLES, ge=100, le=2000),
-    test_samples: int = Query(DEFAULT_ANFIS_TEST_SAMPLES, ge=50, le=1000),
     seed: int | None = Query(DEFAULT_SCENARIO_SEED),
 ):
     try:
@@ -98,8 +112,6 @@ def precompute_dt_experiments(
             end=end,
             sample_interval_days=sample_interval_days,
             sample_interval_hours=sample_interval_hours,
-            train_samples=train_samples,
-            test_samples=test_samples,
             seed=seed,
         )
     except Exception as exc:

@@ -26,25 +26,30 @@
         chartMeasureColor
     } = ChartBuilder;
 
-    const ANFIS_SCORE_MEASURE = "ANFIS-GA irrigation score (%)";
+    const ANFIS_SCORE_MEASURE = "ANFIS zone signal (%)";
     const FUZZY_SCORE_MEASURE = "Fuzzy irrigation score (%)";
     const LEGEND_LABELS = {
         "Baseline Moisture": "Baseline",
-        "Sparse Moisture": "Sparse estimate",
+        "Sparse Moisture": "Sparse sensing",
         "ANFIS Moisture": "ANFIS estimate",
         "Fuzzy Moisture": "Fuzzy estimate",
-        [ANFIS_SCORE_MEASURE]: "ANFIS-GA score",
-        "Baseline Irrigation (L)": "Baseline irrigation",
-        "Baseline Water Usage (L)": "Baseline irrigation",
-        "Sparse-Sensing Irrigation (L)": "Sparse irrigation",
-        "Sparse Water Usage (L)": "Sparse irrigation",
-        "ANFIS Water Usage (L)": "ANFIS irrigation",
-        "Fuzzy Water Usage (L)": "Fuzzy irrigation",
+        [ANFIS_SCORE_MEASURE]: "ANFIS signal",
+        "Baseline Irrigation (L)": "Baseline",
+        "Baseline Water Usage (L)": "Baseline water",
+        "Sparse-Sensing Irrigation (L)": "Sparse sensing",
+        "Sparse Water Usage (L)": "Sparse water",
+        "ANFIS Water Usage (L)": "ANFIS",
+        "Fuzzy Water Usage (L)": "Fuzzy",
         [FUZZY_SCORE_MEASURE]: "Fuzzy score",
         "Rain (mm)": "Rain (mm)",
-        "Rain (L/m²)": "Rain",
-        "Max Temperature (C)": "Max temp",
-        "Max Temp (C)": "Max temp"
+        "Max Temperature (°C)": "Max Temperature (°C)",
+        "Max Temp (°C)": "Max Temperature (°C)"
+    };
+    const CHART_LEGEND_LABELS = {
+        samplingBaselineWeatherChart: {
+            "Baseline Moisture": "Moisture",
+            "Baseline Water Usage (L)": "Water Usage"
+        }
     };
 
     return {
@@ -110,7 +115,7 @@
                 },
                 valueAxis2: {
                     label: { style: { color: "#5d7187" } },
-                    title: { visible: false },
+                    title: this._secondaryAxisTitle(chartId),
                     scale: this._secondaryAxisScale(chartId)
                 },
                 categoryAxis: {
@@ -134,9 +139,31 @@
             this._connectChartPopover(chart, chartId);
         },
 
+        _secondaryAxisTitle(chartId) {
+            const titles = {
+                samplingBaselineWeatherChart: "Water Usage (L)",
+                anfisMoistureChart: "ANFIS Signal (%)",
+                anfisContextChart: "Weather (mm / °C)",
+                fuzzyMoistureChart: "Fuzzy Score (%)",
+                fuzzyContextChart: "Weather (mm / °C)"
+            };
+            return titles[chartId] ? this._axisTitle(titles[chartId]) : { visible: false };
+        },
+
+        _axisTitle(text) {
+            return {
+                visible: true,
+                text,
+                style: { color: "#5d7187" }
+            };
+        },
+
         _secondaryAxisScale(chartId) {
-            if (chartId === "anfisMoistureChart") {
+            if (chartId === "anfisMoistureChart" || chartId === "fuzzyMoistureChart") {
                 return { fixedRange: true, minValue: 0, maxValue: 100 };
+            }
+            if (chartId === "samplingBaselineWeatherChart") {
+                return { fixedRange: true, minValue: 0, maxValue: 250 };
             }
             return { fixedRange: true, minValue: 0, maxValue: 60 };
         },
@@ -257,7 +284,7 @@
                 return {
                     callback: (context) => this._chartMeasureName(chartId, context) === measure,
                     properties: this._chartSeriesColorProperties(color),
-                    displayName: this._chartLegendLabel(measure)
+                    displayName: this._chartLegendLabel(measure, chartId)
                 };
             });
         },
@@ -266,12 +293,17 @@
             return color ? { color, lineColor: color } : {};
         },
 
-        _chartLegendLabel(measure) {
+        _chartLegendLabel(measure, chartId) {
+            const chartLabels = CHART_LEGEND_LABELS[chartId] || {};
+            if (chartLabels[measure]) {
+                return chartLabels[measure];
+            }
             return LEGEND_LABELS[measure] || measure;
         },
 
         _isMoistureChart(chartId) {
             return chartId === "samplingMoistureChart"
+                || chartId === "samplingBaselineWeatherChart"
                 || chartId === "anfisMoistureChart"
                 || chartId === "fuzzyMoistureChart";
         },
@@ -387,7 +419,7 @@
         },
 
         _chartDetailLines(row, chartId, measureName) {
-            if (measureName === "Max Temp (C)" || measureName === "Max Temperature (C)") {
+            if (["Max Temp (°C)", "Max Temperature (°C)", "Max Temp (C)", "Max Temperature (C)"].includes(measureName)) {
                 return this._weatherTemperatureLines(row, chartId);
             }
             if (measureName === "Rain (L/m²)" || measureName === "Rain (mm)") {
@@ -412,7 +444,7 @@
                 "Sparse Moisture": "Sparse moisture",
                 "ANFIS Moisture": "ANFIS moisture",
                 "Fuzzy Moisture": "Fuzzy moisture",
-                [ANFIS_SCORE_MEASURE]: "ANFIS-GA score",
+                [ANFIS_SCORE_MEASURE]: "ANFIS zone signal",
                 "Baseline Irrigation (L)": "Baseline water",
                 "Baseline Water Usage (L)": "Baseline water",
                 "Sparse-Sensing Irrigation (L)": "Sparse water",
@@ -420,6 +452,8 @@
                 "ANFIS Water Usage (L)": "ANFIS water",
                 "Fuzzy Water Usage (L)": "Fuzzy water",
                 [FUZZY_SCORE_MEASURE]: "Fuzzy score",
+                "Max Temperature (°C)": "Temperature",
+                "Max Temp (°C)": "Temperature",
                 "Max Temperature (C)": "Temperature",
                 "Max Temp (C)": "Temperature",
                 "Rain (mm)": "Rain",
@@ -430,6 +464,7 @@
         },
 
         _chartMeasureSummaryValue(row, measureName) {
+            const temperatureValue = `${this._formatPopoverNumber(row.temperature ?? row.max_temperature)} °C`;
             const values = {
                 "Baseline Moisture": this._formatPopoverPercent(row.baseline_moisture),
                 "Sparse Moisture": this._formatPopoverPercent(row.sparse_moisture),
@@ -443,8 +478,10 @@
                 "ANFIS Water Usage (L)": `${this._formatPopoverNumber(row.anfis_water_usage_l)} L`,
                 "Fuzzy Water Usage (L)": `${this._formatPopoverNumber(row.fuzzy_water_usage_l)} L`,
                 [FUZZY_SCORE_MEASURE]: this._formatPopoverPercent(row.fuzzy_prescription_score_pct),
-                "Max Temperature (C)": `${this._formatPopoverNumber(row.temperature ?? row.max_temperature)} C`,
-                "Max Temp (C)": `${this._formatPopoverNumber(row.temperature ?? row.max_temperature)} C`,
+                "Max Temperature (°C)": temperatureValue,
+                "Max Temp (°C)": temperatureValue,
+                "Max Temperature (C)": temperatureValue,
+                "Max Temp (C)": temperatureValue,
                 "Rain (mm)": `${this._formatPopoverNumber(row.rain_amount)} mm`,
                 "Rain (L/m²)": `${this._formatPopoverNumber(row.rain_amount)} mm`
             };
@@ -455,10 +492,10 @@
         _weatherTemperatureLines(row, chartId) {
             const lines = [];
             if (this._isHourlyChartRow(row)) {
-                lines.push(["Temperature", `${this._formatPopoverNumber(row.temperature ?? row.max_temperature)} C`]);
+                lines.push(["Temperature", `${this._formatPopoverNumber(row.temperature ?? row.max_temperature)} °C`]);
             } else {
-                lines.push(["Max temperature", `${this._formatPopoverNumber(row.max_temperature)} C`]);
-                lines.push(["Min temperature", `${this._formatPopoverNumber(this._popoverMinTemperature(row, chartId))} C`]);
+                lines.push(["Max temperature", `${this._formatPopoverNumber(row.max_temperature)} °C`]);
+                lines.push(["Min temperature", `${this._formatPopoverNumber(this._popoverMinTemperature(row, chartId))} °C`]);
             }
             lines.push(["Humidity", `${this._formatPopoverNumber(row.humidity)}%`]);
             lines.push(["Cloud cover", `${this._formatPopoverNumber(this._popoverCloudCover(row, chartId))}%`]);
@@ -518,7 +555,7 @@
                     ["Fuzzy valves", this._formatPopoverValves(row, "fuzzy")]
                 ],
                 [ANFIS_SCORE_MEASURE]: [
-                    ["Average probability", this._formatPopoverPercent(row.predicted_probability_percent)],
+                    ["Zone signal", this._formatPopoverPercent(row.predicted_probability_percent)],
                     ["Max valve probability", this._formatPopoverPercent(row.trigger_probability_percent)],
                     ["Decision threshold", this._formatPopoverPercent(row.anfis_decision_threshold_percent)],
                     ["Average category", row.predicted_category || "N/A"],
@@ -528,7 +565,7 @@
                 [FUZZY_SCORE_MEASURE]: [
                     ["Irrigation score", this._formatPopoverPercent(row.fuzzy_prescription_score_pct)],
                     ["Prescription", `${this._formatPopoverNumber(row.fuzzy_water_usage_l)} L`],
-                    ["Temperature", `${this._formatPopoverNumber(row.max_temperature)} C`],
+                    ["Temperature", `${this._formatPopoverNumber(row.max_temperature)} °C`],
                     ["Precipitation", `${this._formatPopoverNumber(row.rain_amount)} mm`],
                     ["Fuzzy valves", this._formatPopoverValves(row, "fuzzy")]
                 ]
@@ -551,7 +588,7 @@
             }
 
             if (matches.includes("Rain (L/m²)") || matches.includes("Rain (L/m2)") || matches.includes("Rain (mm)")) {
-                return "Rain (L/m²)";
+                return "Rain (mm)";
             }
             return "";
         },
@@ -654,6 +691,8 @@
                 "ANFIS Water Usage (L)": ["anfis_water_usage_l", "anfis_water_usage_chart"],
                 "Fuzzy Water Usage (L)": ["fuzzy_water_usage_l", "fuzzy_water_usage_chart"],
                 [FUZZY_SCORE_MEASURE]: ["fuzzy_prescription_score_pct"],
+                "Max Temperature (°C)": ["max_temperature", "temperature"],
+                "Max Temp (°C)": ["max_temperature", "temperature"],
                 "Max Temperature (C)": ["max_temperature", "temperature"],
                 "Max Temp (C)": ["max_temperature", "temperature"],
                 "Rain (mm)": ["rain_amount"],
@@ -1429,7 +1468,7 @@
             const measureLegendHtml = measures.map((measure) => {
                 const color = chartMeasureColor(chartId, measure) || "#5d7187";
                 const shape = this._chartLegendShape(chartId, measure);
-                return this._chartLegendItemHtml(this._chartLegendLabel(measure), shape, color);
+                return this._chartLegendItemHtml(this._chartLegendLabel(measure, chartId), shape, color);
             }).join("");
             chartDom.insertAdjacentHTML(
                 "afterend",

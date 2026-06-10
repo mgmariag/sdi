@@ -56,6 +56,8 @@ class ArchitectureTests(unittest.TestCase):
             "/api/experiment/sampling",
             "/api/experiment/anfis",
             "/api/experiment/fuzzy",
+            "/api/experiment/runs",
+            "/api/experiment/runs/{run_id}",
         }
         self.assertTrue(expected_paths.issubset(paths))
         self.assertNotIn("/sensors/summary", paths)
@@ -79,6 +81,7 @@ class ArchitectureTests(unittest.TestCase):
         self.assertNotIn("decision_id BIGINT", schema)
         self.assertIn("DROP TABLE IF EXISTS irrigation_decisions", schema)
         self.assertIn("DROP TABLE IF EXISTS alerts", schema)
+        self.assertIn("CREATE TABLE IF NOT EXISTS experiment_runs", schema)
 
     def test_consolidated_sensor_repositories_import(self) -> None:
         from digital_twin.db.repositories.sensor_repository import (
@@ -95,8 +98,8 @@ class ArchitectureTests(unittest.TestCase):
         from digital_twin.simulation import engine
 
         self.assertTrue(callable(engine._apply_event_delivery))
-        self.assertTrue(callable(engine._baseline_irrigation_request))
-        self.assertTrue(callable(engine._fuzzy_prescribed_request))
+        self.assertTrue(callable(engine.DEFAULT_IRRIGATION_POLICY.irrigation_request))
+        self.assertTrue(callable(engine.DEFAULT_FUZZY_POLICY.irrigation_request))
 
     def test_settings_centralize_runtime_defaults(self) -> None:
         settings = get_settings()

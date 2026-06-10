@@ -27,6 +27,20 @@ services:
       postgres:
         condition: service_healthy
 
+  anfis-trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: ["python", "-m", "digital_twin.workers.anfis_training_worker"]
+    profiles:
+      - anfis-training
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql://dt_user:dt_password@postgres:5432/digital_twin
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   frontend:
     build:
       context: .

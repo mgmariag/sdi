@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 import math
 import time as perf_time
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
@@ -15,7 +16,6 @@ from digital_twin.experiments.anfis import ANFIS, probability_category, target_p
 from digital_twin.simulation.dto import (
     ANFIS_DECISION_THRESHOLD,
     ANFIS_FORECAST_DECISION_THRESHOLD,
-    ANFIS_TRAINING_LOOKBACK_DAYS,
     ExperimentSnapshot,
     HOURLY_CHART_MAX_RANGE_DAYS,
     LOCAL_TZ,
@@ -35,15 +35,10 @@ from digital_twin.simulation.weather_model import (
     _with_estimated_future_weather,
 )
 from digital_twin.simulation.irrigation_controller import (
+    DEFAULT_FUZZY_POLICY,
+    DEFAULT_IRRIGATION_POLICY,
     _alert_row,
     _apply_event_delivery,
-    _baseline_covered_rain_day,
-    _baseline_irrigation_request,
-    _baseline_decision_slot,
-    _baseline_rain_policy,
-    _baseline_threshold_for_pot,
-    _fuzzy_prescribed_request,
-    _fuzzy_prescribed_volume_ml,
     _is_emergency_dryness,
     _is_outdoor,
     _make_baseline_irrigation_decision,
@@ -75,6 +70,9 @@ ANFIS_HARD_STOP_REASON_CODES = {
     "anfis_rain_and_moisture_sufficient",
     "anfis_cool_day_moisture_sufficient",
 }
+ANFIS_ZONE_MODEL_MIN_SAMPLES = 120
+ANFIS_CALIBRATION_SHARE = 0.18
+ANFIS_TRAINING_DATASET_VERSION = 2
 
 
 def load_experiment_snapshot(start_date: date, end_date: date) -> ExperimentSnapshot:
@@ -163,7 +161,7 @@ def _resolve_anfis_training_snapshot(
     end_date: date,
     fallback_snapshot: ExperimentSnapshot,
 ) -> ExperimentSnapshot:
-    training_start = end_date - timedelta(days=ANFIS_TRAINING_LOOKBACK_DAYS - 1)
+    training_start = _state_simulation_start(end_date, end_date)
     try:
         return load_experiment_snapshot(training_start, end_date)
     except ValueError:
@@ -233,7 +231,7 @@ def _new_daily_moisture_tracker() -> dict[str, Any]:
 
 
 def _daily_moisture_snapshot_label(day: date, observed_at: datetime, day_profile: dict[str, Any]) -> str | None:
-    slot = _baseline_decision_slot(day, observed_at, day_profile)
+    slot = DEFAULT_IRRIGATION_POLICY.decision_slot(day, observed_at, day_profile)
     if slot:
         return f"before_{slot}"
 
@@ -439,7 +437,7 @@ def run_default_dt_irrigation_control(
             hourly_events = 0
             hourly_decisions = 0
             hourly_alerts = 0
-            slot = _baseline_decision_slot(current_date, observed_local, day_profile)
+            slot = DEFAULT_IRRIGATION_POLICY.decision_slot(current_date, observed_local, day_profile)
             decision_by_pot_id: dict[int, dict[str, Any]] = {}
             zone_trigger_decisions: dict[str, list[dict[str, Any]]] = {}
 
@@ -499,7 +497,7 @@ def run_default_dt_irrigation_control(
                             "should_irrigate": True,
                             "dose_factor": zone_dose_factor,
                         },
-                        _baseline_irrigation_request,
+                        DEFAULT_IRRIGATION_POLICY.irrigation_request,
                         {
                             "zone_triggered": True,
                             "zone_trigger_pot_ids": trigger_pot_ids,
@@ -824,15 +822,26 @@ def run_daily_fuzzy_dt_experiment(
     baseline_water = float(totals["baseline_total_water_usage_l"])
     fuzzy_water = float(totals["fuzzy_total_water_usage_l"])
     water_savings_l = baseline_water - fuzzy_water
+    water_savings_percent = round((water_savings_l / baseline_water) * 100.0, 2) if baseline_water > 0 else 0.0
+    comfort_metrics = _moisture_safe_savings_metrics(
+        entries,
+        "fuzzy",
+        snapshot.pots,
+        water_savings_percent,
+        comfort_threshold_pct=_fuzzy_comfort_threshold_pct(snapshot.pots),
+    )
     summary = {
         **comparison.base_summary(entries),
         **comparison.irrigation_day_counts(entries),
         **totals,
         **comparison.decision_counts(),
         "water_savings_l": round(water_savings_l, 2),
-        "water_savings_percent": round((water_savings_l / baseline_water) * 100.0, 2) if baseline_water > 0 else 0.0,
+        "water_savings_percent": water_savings_percent,
+        **comfort_metrics,
         "average_prescription_mm": fuzzy_summary.get("averagePrescriptionMm", 0.0),
         "fuzzyDataPolicy": fuzzy_summary.get("fuzzyDataPolicy", "daily-fis-prescription"),
+        "fuzzyControllerPolicy": fuzzy_summary.get("fuzzyControllerPolicy", "fuzzy_dt_prescription_control"),
+        "fuzzyDecisionPolicy": fuzzy_summary.get("fuzzyDecisionPolicy", "owned_fuzzy_timing_threshold_skip_prescription"),
         "comparisonBaseline": "default_dt_threshold_control",
         "decisionLevel": "valve_zone",
         "execution_time_seconds": round(perf_time.perf_counter() - start_time, 3),
@@ -844,57 +853,116 @@ def run_daily_fuzzy_dt_experiment(
     return comparison.payload(entries, chart_entries, summary)
 
 
+def train_anfis_model_for_experiment(
+    start_date: date,
+    end_date: date,
+    seed: int | None = 2026,
+    generations: int = 35,
+    population: int = 24,
+    snapshot: ExperimentSnapshot | None = None,
+) -> AnfisTrainingResult:
+    """Train and evaluate the ANFIS controller from database sensor/weather examples."""
+    selected_snapshot = _resolve_snapshot(start_date, end_date, snapshot)
+    training_snapshot = _resolve_anfis_training_snapshot(end_date, selected_snapshot)
+    anfis_dataset = _generate_database_anfis_dataset(
+        training_snapshot.selected_weather_rows,
+        training_snapshot.pots,
+        0,
+        seed,
+        training_snapshot.sensor_context,
+        training_snapshot.weather_by_day,
+        training_snapshot.day_profiles,
+    )
+    if not anfis_dataset:
+        raise ValueError("ANFIS training requires recorded sensor readings for the selected or historical interval")
+
+    train_dataset = list(anfis_dataset)
+    fit_dataset, calibration_dataset = _split_anfis_training_calibration(train_dataset, seed)
+    model = _train_anfis_controller(
+        fit_dataset,
+        calibration_dataset,
+        generations=generations,
+        population=population,
+        seed=seed,
+    )
+    evaluation = _evaluate_anfis_model(model, train_dataset)
+    metadata = {
+        "train_samples": len(train_dataset),
+        "fit_samples": len(fit_dataset),
+        "weighted_fit_samples": len(_expand_anfis_training_dataset(fit_dataset)),
+        "calibration_samples": len(calibration_dataset),
+        "test_samples": len(train_dataset),
+        "evaluation_samples": len(train_dataset),
+        "training_sample_policy": "all_available_sensor_readings",
+        "evaluation_sample_policy": "all_available_sensor_readings",
+        "training_dataset_version": ANFIS_TRAINING_DATASET_VERSION,
+        "seed": seed,
+        "generations": generations,
+        "population": population,
+        "training_start_date": training_snapshot.start_date.isoformat(),
+        "training_end_date": training_snapshot.end_date.isoformat(),
+        "training_lookback_days": (training_snapshot.end_date - training_snapshot.start_date).days + 1,
+        "training_history_days": (training_snapshot.end_date - training_snapshot.start_date).days + 1,
+        "training_signals": _anfis_training_signal_summary(train_dataset),
+        "evaluation": evaluation,
+    }
+    return AnfisTrainingResult(model=model, evaluation=evaluation, metadata=metadata)
+
+
 def run_daily_anfis_experiment(
     start_date: date,
     end_date: date,
-    train_samples: int = 2000,
-    test_samples: int = 800,
     seed: int | None = 2026,
     generations: int = 35,
     population: int = 24,
     persist: bool = False,
     snapshot: ExperimentSnapshot | None = None,
     baseline_result: dict[str, Any] | None = None,
+    trained_model: _AnfisModelController | None = None,
+    training_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apply an ANFIS controller to the same database weather/pot simulation."""
     if end_date < start_date:
         raise ValueError("end_date must not be before start_date")
 
     snapshot = _resolve_snapshot(start_date, end_date, snapshot)
-    training_snapshot = _resolve_anfis_training_snapshot(end_date, snapshot)
-    training_sensor_context = training_snapshot.sensor_context
     sensor_context = snapshot.sensor_context
 
     start_time = perf_time.perf_counter()
-    anfis_dataset = _generate_database_anfis_dataset(
-        training_snapshot.selected_weather_rows,
-        training_snapshot.pots,
-        max(2, train_samples + test_samples),
-        seed,
-        training_sensor_context,
-        training_snapshot.weather_by_day,
-        training_snapshot.day_profiles,
-    )
-    if not anfis_dataset:
-        raise ValueError("ANFIS training requires recorded sensor readings for the selected or lookback interval")
-    train_dataset, test_dataset = _split_anfis_dataset(anfis_dataset, train_samples, test_samples, seed)
+    if trained_model is None:
+        training_result = train_anfis_model_for_experiment(
+            start_date=start_date,
+            end_date=end_date,
+            seed=seed,
+            generations=generations,
+            population=population,
+            snapshot=snapshot,
+        )
+        model = training_result.model
+        training = training_result.metadata
+        evaluation = training_result.evaluation
+        model_source = "inline_training"
+    else:
+        model = trained_model
+        training = dict(training_metadata or {})
+        evaluation = dict(training.get("evaluation") or {})
+        model_source = str(training.get("model_source") or "persisted_model")
 
-    model = ANFIS()
-    model.fit(
-        train_dataset,
-        generations=generations,
-        population=population,
-        seed=seed,
+    decision_threshold = ANFIS_WATER_SAVING_POLICY.threshold(ANFIS_DECISION_THRESHOLD)
+    forecast_decision_threshold = ANFIS_WATER_SAVING_POLICY.threshold(
+        ANFIS_FORECAST_DECISION_THRESHOLD,
+        forecast=True,
     )
-    evaluation = _evaluate_anfis_model(model, test_dataset)
     threshold_calibration = {
-        "threshold": ANFIS_DECISION_THRESHOLD,
+        "threshold": decision_threshold,
         "raw_threshold": ANFIS_DECISION_THRESHOLD,
+        "forecast_threshold": forecast_decision_threshold,
+        "raw_forecast_threshold": ANFIS_FORECAST_DECISION_THRESHOLD,
         "calibrated": False,
-        "reason": "fixed_threshold_no_sensor_calibration",
+        "reason": "fixed_threshold_with_water_saving_margin",
+        "water_saving_margin": ANFIS_WATER_SAVING_POLICY.decision_margin,
+        "forecast_water_saving_margin": ANFIS_WATER_SAVING_POLICY.forecast_decision_margin,
     }
-    decision_threshold = ANFIS_DECISION_THRESHOLD
-    forecast_decision_threshold = ANFIS_FORECAST_DECISION_THRESHOLD
 
     baseline = baseline_result or run_default_dt_irrigation_control(
         start_date=start_date,
@@ -961,12 +1029,15 @@ def run_daily_anfis_experiment(
     baseline_water = float(totals["baseline_total_water_usage_l"])
     anfis_water = float(totals["anfis_total_water_usage_l"])
     water_savings_l = baseline_water - anfis_water
+    water_savings_percent = round(water_savings_l / baseline_water * 100.0, 2) if baseline_water > 0 else 0.0
+    comfort_metrics = _moisture_safe_savings_metrics(entries, "anfis", snapshot.pots, water_savings_percent)
     summary = {
         **comparison.base_summary(entries),
         **comparison.irrigation_day_counts(entries),
         **totals,
         "water_savings_l": round(water_savings_l, 2),
-        "water_savings_percent": round(water_savings_l / baseline_water * 100.0, 2) if baseline_water > 0 else 0.0,
+        "water_savings_percent": water_savings_percent,
+        **comfort_metrics,
         "anfis_probability_threshold": decision_threshold,
         "anfis_forecast_probability_threshold": forecast_decision_threshold,
         "anfis_default_probability_threshold": ANFIS_DECISION_THRESHOLD,
@@ -974,17 +1045,31 @@ def run_daily_anfis_experiment(
         "predicted_probability_mean": pred_prob_mean,
         "predicted_probability_min": pred_prob_min,
         "predicted_probability_max": pred_prob_max,
-        "train_samples": len(train_dataset),
-        "test_samples": len(test_dataset),
-        "requested_train_samples": train_samples,
-        "requested_test_samples": test_samples,
+        "train_samples": int(training.get("train_samples", 0)),
+        "fit_samples": int(training.get("fit_samples", 0)),
+        "weighted_fit_samples": int(training.get("weighted_fit_samples", 0)),
+        "calibration_samples": int(training.get("calibration_samples", 0)),
+        "test_samples": int(training.get("test_samples", 0)),
+        "evaluation_samples": int(training.get("evaluation_samples", training.get("test_samples", 0))),
+        "trainingSamplePolicy": training.get("training_sample_policy", "all_available_sensor_readings"),
+        "evaluationSamplePolicy": training.get("evaluation_sample_policy", "all_available_sensor_readings"),
+        "anfisModelSource": model_source,
+        "anfisModelId": training.get("model_id"),
+        "anfisModelTrainedAt": training.get("trained_at"),
+        "anfisTrainingSignals": training.get("training_signals", {}),
         "anfisTrainingTarget": "recorded-sensor-readings-moisture-temperature-effective-rain-probability",
+        "anfisProbabilityCalibration": model.summary(),
+        "anfisWaterSavingPolicy": ANFIS_WATER_SAVING_POLICY.summary(
+            ANFIS_DECISION_THRESHOLD,
+            ANFIS_FORECAST_DECISION_THRESHOLD,
+        ),
         "anfisRainInputPolicy": "pot_effective_rain_by_rain_exposure",
-        "anfisInputFeatures": model.input_names,
+        "anfisInputFeatures": model.global_model.input_names,
         "anfisOptimizer": "genetic-algorithm",
-        "trainingStartDate": training_snapshot.start_date.isoformat(),
-        "trainingEndDate": training_snapshot.end_date.isoformat(),
-        "trainingLookbackDays": (training_snapshot.end_date - training_snapshot.start_date).days + 1,
+        "trainingStartDate": training.get("training_start_date"),
+        "trainingEndDate": training.get("training_end_date"),
+        "trainingLookbackDays": training.get("training_lookback_days"),
+        "trainingHistoryDays": training.get("training_history_days", training.get("training_lookback_days")),
         "stateSimulationStartDate": anfis_summary.get(
             "stateSimulationStartDate",
             baseline.get("summary", {}).get("stateSimulationStartDate"),
@@ -1132,6 +1217,12 @@ def _execute_valve_zone_distribution(
     request_builder,
     event_metadata: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    minimum_runtime_min = max(0.0, _number(event_metadata.get("minimum_valve_runtime_min"), 0.0))
+    public_event_metadata = {
+        key: value
+        for key, value in event_metadata.items()
+        if key != "minimum_valve_runtime_min"
+    }
     request_items: list[tuple[dict[str, Any], PotState, dict[str, Any]]] = []
     for zone_pot in _valve_managed_zone_pots(zone_pots, zone, current_date):
         zone_decision = decision_builder(zone_pot, dict(decision_by_pot_id[int(zone_pot["id"])]))
@@ -1139,7 +1230,7 @@ def _execute_valve_zone_distribution(
             request_builder(zone_pot, hour_weather, zone_decision),
             zone_decision,
         )
-        request_event.update(event_metadata)
+        request_event.update(public_event_metadata)
         request_items.append((zone_pot, pot_states[int(zone_pot["id"])], request_event))
 
     total_requested_ml = sum(float(event.get("requested_volume_ml", event.get("planned_volume_ml", 0.0)) or 0.0) for _, _, event in request_items)
@@ -1148,6 +1239,8 @@ def _execute_valve_zone_distribution(
         return []
 
     runtime_min = total_requested_ml / total_flow_ml_min
+    if runtime_min < minimum_runtime_min:
+        return []
     delivered_total_ml = total_requested_ml
     events = []
     for zone_pot, state, event in request_items:
@@ -1411,6 +1504,7 @@ def _apply_valve_counts(entries: list[dict[str, Any]], rollup: dict[str, list[di
         entry["irrigated_pots"] = sum(int(event.get("affected_pots") or 0) for event in entry_events)
         entry["activated_valve_numbers"] = _activated_valve_numbers(entry_events)
         entry["activated_valves"] = _activated_valve_label(entry_events)
+        entry["valves"] = _entry_valves(entry_events)
         entry["decision_level"] = "valve_zone"
         if entry_events:
             entry["irrigation_start_at"] = min(str(event["scheduled_start_at"]) for event in entry_events)
@@ -1427,6 +1521,8 @@ def _comparison_window_fields(prefix: str, entry: dict[str, Any]) -> dict[str, A
         fields[f"{prefix}_activated_valves"] = entry["activated_valves"]
     if entry.get("activated_valve_numbers") is not None:
         fields[f"{prefix}_activated_valve_numbers"] = entry["activated_valve_numbers"]
+    if entry.get("valves") is not None:
+        fields[f"{prefix}_valves"] = entry["valves"]
     if entry.get("irrigation_start_at"):
         fields[f"{prefix}_irrigation_start_at"] = entry["irrigation_start_at"]
     if entry.get("irrigation_end_at"):
@@ -1447,6 +1543,38 @@ def _activated_valve_numbers(events: list[dict[str, Any]]) -> list[int]:
         if event.get("valve_number") is not None
     }
     return sorted(numbers)
+
+
+def _entry_valves(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    valves: dict[int, dict[str, Any]] = {}
+    for event in events:
+        valve_number = event.get("valve_number")
+        if valve_number is None:
+            continue
+        number = int(valve_number)
+        planned_volume_l = event.get("planned_volume_l")
+        if planned_volume_l is None:
+            planned_volume_l = float(event.get("planned_volume_ml") or 0.0) / 1000.0
+        current = valves.setdefault(
+            number,
+            {
+                "valve_number": number,
+                "valve_zone": event.get("valve_zone"),
+                "planned_volume_l": 0.0,
+                "duration_min": 0.0,
+            },
+        )
+        current["planned_volume_l"] += float(planned_volume_l or 0.0)
+        current["duration_min"] += float(event.get("duration_min") or 0.0)
+
+    return [
+        {
+            **valve,
+            "planned_volume_l": round(float(valve["planned_volume_l"]), 2),
+            "duration_min": round(float(valve["duration_min"]), 1),
+        }
+        for valve in sorted(valves.values(), key=lambda item: item["valve_number"])
+    ]
 
 
 def _activated_valve_label(events: list[dict[str, Any]]) -> str:
@@ -1527,6 +1655,62 @@ def _comparison_pot_info_entries(
             "period_water_usage_l": comparison_usage,
         },
     )
+
+
+def _comfort_threshold_pct(pots: list[dict[str, Any]]) -> float:
+    targets = [
+        float(pot["moisture_target_pct"])
+        for pot in pots
+        if pot.get("moisture_target_pct") is not None
+    ]
+    return round(sum(targets) / max(len(targets), 1), 2) if targets else 0.0
+
+
+def _fuzzy_comfort_threshold_pct(pots: list[dict[str, Any]]) -> float:
+    day_profile = {
+        "avg_temperature_c": 22.0,
+        "max_temperature_c": 22.0,
+        "precipitation_mm": 0.0,
+        "heatwave_day": False,
+        "dry_windy_day": False,
+    }
+    floors = [
+        DEFAULT_FUZZY_POLICY.comfort_floor(pot, day_profile, "morning")
+        for pot in pots
+        if pot.get("moisture_target_pct") is not None and pot.get("moisture_min_pct") is not None
+    ]
+    return round(sum(floors) / max(len(floors), 1), 2) if floors else 0.0
+
+
+def _moisture_safe_savings_metrics(
+    entries: list[dict[str, Any]],
+    prefix: str,
+    pots: list[dict[str, Any]],
+    water_savings_percent: float,
+    comfort_threshold_pct: float | None = None,
+) -> dict[str, Any]:
+    threshold = _comfort_threshold_pct(pots) if comfort_threshold_pct is None else float(comfort_threshold_pct)
+    tolerance_pct = 2.0
+    safe_days = 0
+    deficits = []
+    for entry in entries:
+        baseline_moisture = float(entry.get("baseline_moisture") or 0.0)
+        comparison_moisture = float(entry.get(f"{prefix}_moisture") or 0.0)
+        if comparison_moisture >= threshold or comparison_moisture >= baseline_moisture - tolerance_pct:
+            safe_days += 1
+        deficits.append(max(0.0, threshold - comparison_moisture))
+
+    total_days = max(len(entries), 1)
+    comfort_preserved = safe_days / total_days * 100.0
+    moisture_safe_savings = float(water_savings_percent) * comfort_preserved / 100.0
+    return {
+        "comfort_threshold_pct": threshold,
+        "comfort_preserved_days": safe_days,
+        "comfort_preserved_percent": round(comfort_preserved, 2),
+        "comfort_tolerance_pct": tolerance_pct,
+        "average_comfort_deficit_pct": round(sum(deficits) / total_days, 2),
+        "moisture_safe_savings_percent": round(moisture_safe_savings, 2),
+    }
 
 
 class _ExperimentComparison:
@@ -2245,7 +2429,7 @@ def _prime_future_states(
                 current.date(),
                 rain_exposure_factor=_rain_exposure_factor(pot, current.date()),
             )
-        slot = _baseline_decision_slot(current.date(), current, day_profile)
+        slot = DEFAULT_IRRIGATION_POLICY.decision_slot(current.date(), current, day_profile)
         if slot is None:
             current += timedelta(hours=1)
             continue
@@ -2274,7 +2458,7 @@ def _prime_future_states(
                     "should_irrigate": True,
                     "dose_factor": zone_dose_factor,
                 },
-                _baseline_irrigation_request,
+                DEFAULT_IRRIGATION_POLICY.irrigation_request,
                 {"zone_triggered": True, "zone_dose_factor": zone_dose_factor, "zone": zone},
             )
         current += timedelta(hours=1)
@@ -2439,44 +2623,326 @@ def _anfis_duration_policy_note(decision: dict[str, Any]) -> str:
     return " ANFIS water-saving policy keeps full runtime."
 
 
+@dataclass
+class _AnfisProbabilityCalibrator:
+    points: list[tuple[float, float]]
+
+    @classmethod
+    def fit(cls, model: ANFIS, dataset: list[dict[str, float | str]], max_bins: int = 8) -> "_AnfisProbabilityCalibrator":
+        pairs = sorted(
+            (
+                _clamp(model.predict(item), 0.0, 1.0),
+                _clamp(float(item["target_probability"]), 0.0, 1.0),
+            )
+            for item in dataset
+            if item.get("target_probability") is not None
+        )
+        if len(pairs) < 30:
+            return cls([])
+
+        bin_count = min(max_bins, max(3, len(pairs) // 45))
+        bin_size = max(1, math.ceil(len(pairs) / bin_count))
+        bins = []
+        for index in range(0, len(pairs), bin_size):
+            chunk = pairs[index:index + bin_size]
+            if not chunk:
+                continue
+            raw_mean = sum(raw for raw, _ in chunk) / len(chunk)
+            target_mean = sum(target for _, target in chunk) / len(chunk)
+            bins.append([raw_mean, target_mean, len(chunk)])
+
+        # Pool adjacent bins so the calibration curve remains monotonic.
+        pooled: list[list[float]] = []
+        for raw_mean, target_mean, weight in bins:
+            pooled.append([raw_mean, target_mean, float(weight)])
+            while len(pooled) >= 2 and pooled[-2][1] > pooled[-1][1]:
+                right = pooled.pop()
+                left = pooled.pop()
+                merged_weight = left[2] + right[2]
+                pooled.append(
+                    [
+                        (left[0] * left[2] + right[0] * right[2]) / merged_weight,
+                        (left[1] * left[2] + right[1] * right[2]) / merged_weight,
+                        merged_weight,
+                    ]
+                )
+
+        points = [(float(raw), _clamp(float(target), 0.0, 1.0)) for raw, target, _ in pooled]
+        return cls(points)
+
+    def predict(self, raw_probability: float) -> float:
+        raw = _clamp(float(raw_probability), 0.0, 1.0)
+        if not self.points:
+            return raw
+        if raw <= self.points[0][0]:
+            return self.points[0][1]
+        if raw >= self.points[-1][0]:
+            return self.points[-1][1]
+        for index in range(1, len(self.points)):
+            left_raw, left_target = self.points[index - 1]
+            right_raw, right_target = self.points[index]
+            if raw <= right_raw:
+                span = max(right_raw - left_raw, 1e-9)
+                ratio = (raw - left_raw) / span
+                return _clamp(left_target + (right_target - left_target) * ratio, 0.0, 1.0)
+        return raw
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(self.points),
+            "bin_count": len(self.points),
+            "points": [
+                {"raw": round(raw, 4), "calibrated": round(calibrated, 4)}
+                for raw, calibrated in self.points
+            ],
+        }
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            "points": [
+                {"raw": float(raw), "calibrated": float(calibrated)}
+                for raw, calibrated in self.points
+            ],
+        }
+
+    @classmethod
+    def deserialize(cls, payload: dict[str, Any] | None) -> "_AnfisProbabilityCalibrator":
+        points = []
+        for item in (payload or {}).get("points") or []:
+            points.append((float(item["raw"]), float(item["calibrated"])))
+        return cls(points)
+
+
+@dataclass
+class _AnfisModelController:
+    global_model: ANFIS
+    global_calibrator: _AnfisProbabilityCalibrator
+    zone_models: dict[str, ANFIS]
+    zone_calibrators: dict[str, _AnfisProbabilityCalibrator]
+
+    def predict(self, inputs: dict[str, float], zone: str | None = None) -> float:
+        raw = self.raw_predict(inputs, zone)
+        return self.calibrator_for_zone(zone).predict(raw)
+
+    def raw_predict(self, inputs: dict[str, float], zone: str | None = None) -> float:
+        return self.model_for_zone(zone).predict(inputs)
+
+    def model_for_zone(self, zone: str | None) -> ANFIS:
+        return self.zone_models.get(str(zone or ""), self.global_model)
+
+    def calibrator_for_zone(self, zone: str | None) -> _AnfisProbabilityCalibrator:
+        return self.zone_calibrators.get(str(zone or ""), self.global_calibrator)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "trained_per_valve_zone": bool(self.zone_models),
+            "zone_model_count": len(self.zone_models),
+            "zone_models": sorted(self.zone_models),
+            "global_probability_calibration": self.global_calibrator.summary(),
+            "zone_probability_calibration": {
+                zone: calibrator.summary()
+                for zone, calibrator in sorted(self.zone_calibrators.items())
+            },
+        }
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            "global_model": self.global_model.serialize(),
+            "global_calibrator": self.global_calibrator.serialize(),
+            "zone_models": {
+                zone: model.serialize()
+                for zone, model in sorted(self.zone_models.items())
+            },
+            "zone_calibrators": {
+                zone: calibrator.serialize()
+                for zone, calibrator in sorted(self.zone_calibrators.items())
+            },
+        }
+
+    @classmethod
+    def deserialize(cls, payload: dict[str, Any]) -> "_AnfisModelController":
+        return cls(
+            global_model=ANFIS.deserialize(payload["global_model"]),
+            global_calibrator=_AnfisProbabilityCalibrator.deserialize(payload.get("global_calibrator")),
+            zone_models={
+                str(zone): ANFIS.deserialize(model_payload)
+                for zone, model_payload in (payload.get("zone_models") or {}).items()
+            },
+            zone_calibrators={
+                str(zone): _AnfisProbabilityCalibrator.deserialize(calibrator_payload)
+                for zone, calibrator_payload in (payload.get("zone_calibrators") or {}).items()
+            },
+        )
+
+
+@dataclass
+class AnfisTrainingResult:
+    model: _AnfisModelController
+    evaluation: dict[str, Any]
+    metadata: dict[str, Any]
+
+
+def serialize_trained_anfis_model(model: _AnfisModelController) -> dict[str, Any]:
+    return model.serialize()
+
+
+def deserialize_trained_anfis_model(payload: dict[str, Any]) -> _AnfisModelController:
+    return _AnfisModelController.deserialize(payload)
+
+
+@dataclass(frozen=True)
+class _AnfisWaterSavingPolicy:
+    decision_margin: float = 0.04
+    forecast_decision_margin: float = 0.04
+    maximum_threshold: float = 0.92
+    light_deficit_pct: float = 4.0
+    moderate_deficit_pct: float = 9.0
+    severe_deficit_pct: float = 12.0
+    low_confidence_margin: float = 0.06
+    medium_confidence_margin: float = 0.14
+    light_rain_mm: float = 0.5
+    moderate_rain_mm: float = 2.5
+    safety_dose_floor: float = 0.75
+    cadence_high_confidence_probability: float = 0.92
+    cadence_deficit_escape_pct: float = 10.0
+
+    def threshold(self, raw_threshold: float, forecast: bool = False) -> float:
+        margin = self.forecast_decision_margin if forecast else self.decision_margin
+        return round(_clamp(float(raw_threshold) + margin, 0.0, self.maximum_threshold), 4)
+
+    def zone_dose_factor(
+        self,
+        trigger_decisions: list[dict[str, Any]],
+        slot_probability: float,
+        decision_threshold: float,
+        day_profile: dict[str, Any],
+    ) -> float:
+        max_deficit = self._max_deficit(trigger_decisions)
+        need_factor = self._need_factor(max_deficit)
+        confidence_factor = self._confidence_factor(slot_probability, decision_threshold)
+        rain_factor = self._rain_factor(day_profile)
+        dose_factor = _anfis_allowed_dose_factor(min(need_factor, confidence_factor, rain_factor))
+
+        if self._has_safety_override(trigger_decisions):
+            dose_factor = max(dose_factor, self.safety_dose_floor)
+        if max_deficit >= self.severe_deficit_pct and rain_factor > 0.5:
+            dose_factor = max(dose_factor, 0.75)
+        return _anfis_allowed_dose_factor(dose_factor)
+
+    def cadence_days(self, day_profile: dict[str, Any]) -> int:
+        if day_profile.get("heatwave_day") or day_profile.get("dry_windy_day"):
+            return 1
+        avg_temp = _number(day_profile.get("avg_temperature_c"), 20.0)
+        rain_mm = _number(day_profile.get("precipitation_mm"), 0.0)
+        if avg_temp < 18.0:
+            return 4
+        if avg_temp < 24.0 or rain_mm >= self.light_rain_mm:
+            return 3
+        return 2
+
+    def cadence_blocks(
+        self,
+        last_irrigated_by_zone: dict[str, date],
+        zone: str,
+        current_date: date,
+        trigger_decisions: list[dict[str, Any]],
+        slot_probability: float,
+        day_profile: dict[str, Any],
+    ) -> bool:
+        last_irrigated = last_irrigated_by_zone.get(zone)
+        if last_irrigated is None:
+            return False
+        if self._has_safety_override(trigger_decisions):
+            return False
+        if (
+            slot_probability >= self.cadence_high_confidence_probability
+            or self._max_deficit(trigger_decisions) >= self.cadence_deficit_escape_pct
+        ):
+            return False
+        return (current_date - last_irrigated).days < self.cadence_days(day_profile)
+
+    def summary(self, raw_threshold: float, raw_forecast_threshold: float) -> dict[str, Any]:
+        return {
+            "decision_threshold": self.threshold(raw_threshold),
+            "forecast_decision_threshold": self.threshold(raw_forecast_threshold, forecast=True),
+            "decision_margin": self.decision_margin,
+            "forecast_decision_margin": self.forecast_decision_margin,
+            "dose_steps": [0.5, 0.75, 1.0],
+            "light_deficit_pct": self.light_deficit_pct,
+            "moderate_deficit_pct": self.moderate_deficit_pct,
+            "light_rain_mm": self.light_rain_mm,
+            "moderate_rain_mm": self.moderate_rain_mm,
+            "safety_dose_floor": self.safety_dose_floor,
+            "cadence_high_confidence_probability": self.cadence_high_confidence_probability,
+            "cadence_deficit_escape_pct": self.cadence_deficit_escape_pct,
+        }
+
+    def _max_deficit(self, decisions: list[dict[str, Any]]) -> float:
+        return max(
+            (
+                max(
+                    0.0,
+                    float(decision.get("target_moisture_pct") or 0.0)
+                    - float(decision.get("current_moisture_pct") or 0.0),
+                )
+                for decision in decisions
+            ),
+            default=0.0,
+        )
+
+    def _has_safety_override(self, decisions: list[dict[str, Any]]) -> bool:
+        return any(bool(decision.get("anfis_below_safety_threshold")) for decision in decisions)
+
+    def _need_factor(self, max_deficit: float) -> float:
+        if max_deficit <= self.light_deficit_pct:
+            return 0.5
+        if max_deficit <= self.moderate_deficit_pct:
+            return 0.75
+        return 1.0
+
+    def _confidence_factor(self, slot_probability: float, decision_threshold: float) -> float:
+        confidence_margin = float(slot_probability) - float(decision_threshold)
+        if confidence_margin < self.low_confidence_margin:
+            return 0.5
+        if confidence_margin < self.medium_confidence_margin:
+            return 0.75
+        return 1.0
+
+    def _rain_factor(self, day_profile: dict[str, Any]) -> float:
+        same_day_rain_mm = _number(day_profile.get("precipitation_mm"), 0.0)
+        if same_day_rain_mm >= self.moderate_rain_mm:
+            return 0.5
+        if same_day_rain_mm >= self.light_rain_mm:
+            return 0.75
+        return 1.0
+
+
+ANFIS_WATER_SAVING_POLICY = _AnfisWaterSavingPolicy()
+
+
+def _anfis_zone_probability_summary(decisions: list[dict[str, Any]]) -> tuple[float, float]:
+    probabilities = [
+        float(decision["predicted_probability"])
+        for decision in decisions
+        if decision.get("predicted_probability") is not None
+    ]
+    if not probabilities:
+        return 0.0, 0.0
+    return sum(probabilities) / len(probabilities), max(probabilities)
+
+
 def _anfis_zone_dose_factor(
     trigger_decisions: list[dict[str, Any]],
     slot_probability: float,
     day_profile: dict[str, Any],
+    decision_threshold: float = ANFIS_DECISION_THRESHOLD,
 ) -> float:
-    max_deficit = max(
-        (
-            max(
-                0.0,
-                float(decision.get("target_moisture_pct") or 0.0)
-                - float(decision.get("current_moisture_pct") or 0.0),
-            )
-            for decision in trigger_decisions
-        ),
-        default=0.0,
+    return ANFIS_WATER_SAVING_POLICY.zone_dose_factor(
+        trigger_decisions,
+        slot_probability,
+        decision_threshold,
+        day_profile,
     )
-    if max_deficit <= 3.0:
-        need_factor = 0.5
-    elif max_deficit <= 7.0:
-        need_factor = 0.75
-    else:
-        need_factor = 1.0
-
-    if slot_probability < 0.80:
-        confidence_factor = 0.5
-    elif slot_probability < 0.88:
-        confidence_factor = 0.75
-    else:
-        confidence_factor = 1.0
-
-    rain_factor = 1.0
-    same_day_rain_mm = _number(day_profile.get("precipitation_mm"), 0.0)
-    if same_day_rain_mm >= 4.0:
-        rain_factor = 0.5
-    elif same_day_rain_mm >= 1.0:
-        rain_factor = 0.75
-
-    return _anfis_allowed_dose_factor(min(need_factor, confidence_factor, rain_factor))
 
 
 def _anfis_allowed_dose_factor(value: float) -> float:
@@ -2489,11 +2955,7 @@ def _anfis_allowed_dose_factor(value: float) -> float:
 
 
 def _anfis_zone_cadence_days(day_profile: dict[str, Any]) -> int:
-    if day_profile.get("heatwave_day") or day_profile.get("dry_windy_day"):
-        return 1
-    if _number(day_profile.get("avg_temperature_c"), 20.0) < 18.0:
-        return 3
-    return 2
+    return ANFIS_WATER_SAVING_POLICY.cadence_days(day_profile)
 
 
 def _anfis_zone_cadence_blocks(
@@ -2504,26 +2966,14 @@ def _anfis_zone_cadence_blocks(
     slot_probability: float,
     day_profile: dict[str, Any],
 ) -> bool:
-    last_irrigated = last_irrigated_by_zone.get(zone)
-    if last_irrigated is None:
-        return False
-    if any(bool(decision.get("anfis_below_safety_threshold")) for decision in trigger_decisions):
-        return False
-    max_deficit = max(
-        (
-            max(
-                0.0,
-                float(decision.get("target_moisture_pct") or 0.0)
-                - float(decision.get("current_moisture_pct") or 0.0),
-            )
-            for decision in trigger_decisions
-        ),
-        default=0.0,
+    return ANFIS_WATER_SAVING_POLICY.cadence_blocks(
+        last_irrigated_by_zone,
+        zone,
+        current_date,
+        trigger_decisions,
+        slot_probability,
+        day_profile,
     )
-    if slot_probability >= 0.88 or max_deficit >= 8.0:
-        return False
-    cadence_days = _anfis_zone_cadence_days(day_profile)
-    return (current_date - last_irrigated).days < cadence_days
 
 
 def _sensor_hour_is_future(experiment_date: date, hour: int) -> bool:
@@ -2762,7 +3212,7 @@ class _SparseSamplingController:
 
         for hour_weather in day_weather:
             observed_local = _local_observed_at(hour_weather)
-            slot = _baseline_decision_slot(current_date, observed_local, day_profile)
+            slot = DEFAULT_IRRIGATION_POLICY.decision_slot(current_date, observed_local, day_profile)
             self._apply_weather_window(current_date, [hour_weather], self.states)
             self._apply_weather_window(current_date, [hour_weather], self.probe_states)
             self._calibrate_probe_states(current_date, observed_local, day_profile)
@@ -2929,7 +3379,7 @@ class _SparseSamplingController:
                     "should_irrigate": True,
                     "dose_factor": zone_dose_factor,
                 },
-                _baseline_irrigation_request,
+                DEFAULT_IRRIGATION_POLICY.irrigation_request,
                 {
                     "zone_triggered": True,
                     "zone_trigger_pot_ids": trigger_pot_ids,
@@ -3072,7 +3522,7 @@ class _SparseSamplingController:
                     "should_irrigate": True,
                     "dose_factor": zone_dose_factor,
                 },
-                _baseline_irrigation_request,
+                DEFAULT_IRRIGATION_POLICY.irrigation_request,
                 {"zone_triggered": True, "zone_dose_factor": zone_dose_factor, "zone": zone},
             )
 
@@ -3171,7 +3621,7 @@ def _run_fuzzy_dt_daily_irrigation(
             hourly_alerts = 0
             hourly_prescription_sum = 0.0
             hourly_prescription_count = 0
-            slot = _baseline_decision_slot(current_date, observed_local, day_profile)
+            slot = DEFAULT_FUZZY_POLICY.decision_slot(current_date, observed_local, day_profile)
             decision_by_pot_id: dict[int, dict[str, Any]] = {}
             zone_trigger_decisions: dict[str, list[dict[str, Any]]] = {}
 
@@ -3195,7 +3645,7 @@ def _run_fuzzy_dt_daily_irrigation(
                             hourly_alerts += 1
                     continue
 
-                decision = _make_fuzzy_dt_decision(state, pot, hour_weather, day_profile)
+                decision = _make_fuzzy_dt_decision(state, pot, hour_weather, day_profile, slot)
                 decision = _with_sensor_key(decision, pot, sensor_context)
                 decision = _apply_cold_month_indoor_skip(decision, pot, current_date)
                 decision_by_pot_id[int(pot["id"])] = decision
@@ -3247,7 +3697,7 @@ def _run_fuzzy_dt_daily_irrigation(
                         hour_weather,
                         decision_by_pot_id,
                         fuzzy_zone_decision,
-                        _fuzzy_prescribed_request,
+                        DEFAULT_FUZZY_POLICY.irrigation_request,
                         {
                             "zone_triggered": True,
                             "zone_trigger_pot_ids": trigger_pot_ids,
@@ -3255,6 +3705,7 @@ def _run_fuzzy_dt_daily_irrigation(
                             "zone_prescription_mm": round(zone_average_prescription_mm, 2),
                             "zone_max_prescription_mm": round(zone_max_prescription_mm, 2),
                             "zone": zone,
+                            "minimum_valve_runtime_min": 0.5,
                         },
                     )
                     for event in zone_events:
@@ -3338,6 +3789,8 @@ def _run_fuzzy_dt_daily_irrigation(
     summary["decisionLevel"] = "valve_zone"
     summary["averagePrescriptionMm"] = round(prescription_sum / max(prescription_count, 1), 2)
     summary["fuzzyDataPolicy"] = "daily-fis-prescription"
+    summary["fuzzyControllerPolicy"] = "fuzzy_dt_prescription_control"
+    summary["fuzzyDecisionPolicy"] = "owned_fuzzy_timing_threshold_skip_prescription"
     summary["stateSimulationStartDate"] = simulation_start_date.isoformat()
     summary["stateLookbackDays"] = (end_date - simulation_start_date).days + 1
     summary["stateAnchorPolicy"] = "stable_historical_timeline"
@@ -3364,7 +3817,7 @@ def _run_fuzzy_dt_daily_irrigation(
 def _run_anfis_daily_irrigation(
     start_date: date,
     end_date: date,
-    model: ANFIS,
+    model: ANFIS | _AnfisModelController,
     persist: bool = False,
     snapshot: ExperimentSnapshot | None = None,
     decision_threshold: float = ANFIS_DECISION_THRESHOLD,
@@ -3415,6 +3868,9 @@ def _run_anfis_daily_irrigation(
         probability_sum = 0.0
         probability_count = 0
         probability_max = 0.0
+        zone_signal_sum = 0.0
+        zone_signal_count = 0
+        zone_signal_max = 0.0
         current_decision_threshold = _anfis_decision_threshold(
             sensor_context,
             current_date,
@@ -3431,9 +3887,13 @@ def _run_anfis_daily_irrigation(
             hourly_probability_sum = 0.0
             hourly_probability_count = 0
             hourly_probability_max = 0.0
-            slot = _baseline_decision_slot(current_date, observed_local, day_profile)
+            hourly_zone_signal_sum = 0.0
+            hourly_zone_signal_count = 0
+            hourly_zone_signal_max = 0.0
+            slot = DEFAULT_IRRIGATION_POLICY.decision_slot(current_date, observed_local, day_profile)
             decision_by_pot_id: dict[int, dict[str, Any]] = {}
             slot_decisions: list[dict[str, Any]] = []
+            slot_decisions_by_zone: dict[str, list[dict[str, Any]]] = {}
             eligible_decisions_by_zone: dict[str, list[dict[str, Any]]] = {}
             safety_decisions_by_zone: dict[str, list[dict[str, Any]]] = {}
             zone_trigger_decisions: dict[str, list[dict[str, Any]]] = {}
@@ -3460,7 +3920,7 @@ def _run_anfis_daily_irrigation(
 
                 anfis_input = _anfis_inputs(state, hour_weather, None, pot, day_profile)
                 rule_decision = _make_anfis_execution_decision(state, pot, hour_weather, day_profile, slot)
-                predicted_probability = model.predict(anfis_input)
+                predicted_probability = _predict_anfis_probability(model, anfis_input, pot.get("balcony_zone"))
                 probability_sum += predicted_probability
                 probability_count += 1
                 probability_max = max(probability_max, predicted_probability)
@@ -3493,15 +3953,15 @@ def _run_anfis_daily_irrigation(
                 hard_stop = decision["reason_code"] in ANFIS_HARD_STOP_REASON_CODES
                 below_target = state.moisture < decision["target_moisture_pct"]
                 safety_threshold = _threshold_for_pot(pot, day_profile, slot)
-                trigger_threshold = _baseline_threshold_for_pot(pot, day_profile, slot)
+                trigger_threshold = DEFAULT_IRRIGATION_POLICY.trigger_threshold(pot, day_profile, slot)
                 below_trigger_threshold = state.moisture < trigger_threshold
                 decision["anfis_trigger_threshold_pct"] = round(trigger_threshold, 2)
                 below_safety_threshold = state.moisture < safety_threshold
                 decision["anfis_safety_threshold_pct"] = round(safety_threshold, 2)
                 decision["anfis_below_safety_threshold"] = below_safety_threshold
-                rain_policy = _baseline_rain_policy(pot, current_date, day_profile)
+                rain_policy = DEFAULT_IRRIGATION_POLICY.rain_policy(pot, current_date, day_profile)
                 covered_rain_need = (
-                    _baseline_covered_rain_day(rain_policy, day_profile)
+                    DEFAULT_IRRIGATION_POLICY.is_covered_rain_day(rain_policy, day_profile)
                     and state.moisture < decision["target_moisture_pct"]
                 )
                 decision["anfis_covered_rain_need"] = covered_rain_need
@@ -3512,6 +3972,8 @@ def _run_anfis_daily_irrigation(
                     hourly_decisions += 1
                 decision_by_pot_id[int(pot["id"])] = decision
                 slot_decisions.append(decision)
+                if valve_managed:
+                    slot_decisions_by_zone.setdefault(pot["balcony_zone"], []).append(decision)
 
                 if not hard_stop and valve_managed and (
                     (below_target and below_trigger_threshold)
@@ -3529,79 +3991,116 @@ def _run_anfis_daily_irrigation(
                 slot_average_probability = hourly_probability_sum / max(hourly_probability_count, 1)
                 slot_max_probability = hourly_probability_max
                 for decision in slot_decisions:
+                    decision["anfis_global_slot_average_probability"] = round(slot_average_probability, 4)
+                    decision["anfis_global_slot_average_probability_percent"] = round(slot_average_probability * 100.0, 2)
+                    decision["anfis_global_slot_max_probability"] = round(slot_max_probability, 4)
+                    decision["anfis_global_slot_max_probability_percent"] = round(slot_max_probability * 100.0, 2)
                     decision["anfis_slot_average_probability"] = round(slot_average_probability, 4)
                     decision["anfis_slot_average_probability_percent"] = round(slot_average_probability * 100.0, 2)
                     decision["anfis_slot_max_probability"] = round(slot_max_probability, 4)
                     decision["anfis_slot_max_probability_percent"] = round(slot_max_probability * 100.0, 2)
 
-                if slot_max_probability >= current_decision_threshold:
-                    for zone, eligible_decisions in eligible_decisions_by_zone.items():
+                zone_probability_summary = {
+                    zone: _anfis_zone_probability_summary(zone_decisions)
+                    for zone, zone_decisions in slot_decisions_by_zone.items()
+                }
+                slot_zone_probabilities = [
+                    zone_max_probability
+                    for _, zone_max_probability in zone_probability_summary.values()
+                ]
+                if slot_zone_probabilities:
+                    slot_zone_signal = sum(slot_zone_probabilities) / len(slot_zone_probabilities)
+                    slot_zone_max = max(slot_zone_probabilities)
+                    zone_signal_sum += slot_zone_signal
+                    zone_signal_count += 1
+                    zone_signal_max = max(zone_signal_max, slot_zone_max)
+                    hourly_zone_signal_sum += slot_zone_signal
+                    hourly_zone_signal_count += 1
+                    hourly_zone_signal_max = max(hourly_zone_signal_max, slot_zone_max)
+                for zone, zone_decisions in slot_decisions_by_zone.items():
+                    zone_average_probability, zone_max_probability = zone_probability_summary[zone]
+                    for decision in zone_decisions:
+                        decision["anfis_slot_average_probability"] = round(zone_average_probability, 4)
+                        decision["anfis_slot_average_probability_percent"] = round(zone_average_probability * 100.0, 2)
+                        decision["anfis_slot_max_probability"] = round(zone_max_probability, 4)
+                        decision["anfis_slot_max_probability_percent"] = round(zone_max_probability * 100.0, 2)
+
+                    eligible_decisions = eligible_decisions_by_zone.get(zone, [])
+                    safety_decisions = safety_decisions_by_zone.get(zone, [])
+                    if zone_max_probability >= current_decision_threshold:
                         for decision in eligible_decisions:
                             decision["should_irrigate"] = True
-                            decision["reason_code"] = "anfis_max_valve_probability_high"
+                            decision["reason_code"] = "anfis_zone_probability_high"
                             decision["reason_detail"] = (
-                                f"Max valve ANFIS probability {slot_max_probability:.2f} is above threshold "
-                                f"{current_decision_threshold:.2f}; average probability is {slot_average_probability:.2f}, "
+                                f"Valve-zone ANFIS probability {zone_max_probability:.2f} is above threshold "
+                                f"{current_decision_threshold:.2f}; zone average probability is {zone_average_probability:.2f}, "
                                 "and this pot is below target moisture."
                                 f"{_anfis_duration_policy_note(decision)}"
                             )
-                        zone_trigger_decisions[zone] = eligible_decisions
+                        if eligible_decisions:
+                            zone_trigger_decisions[zone] = eligible_decisions
 
-                    if zone_trigger_decisions:
-                        for decision in slot_decisions:
+                        for decision in zone_decisions:
                             if not decision.get("should_irrigate") and decision["reason_code"] not in ANFIS_HARD_STOP_REASON_CODES:
-                                decision["reason_code"] = "anfis_max_valve_high_pot_not_triggering"
+                                decision["reason_code"] = (
+                                    "anfis_zone_probability_high_pot_not_triggering"
+                                    if eligible_decisions
+                                    else "anfis_zone_probability_high_no_moisture_deficit"
+                                )
                                 decision["reason_detail"] = (
-                                    f"Max valve ANFIS probability {slot_max_probability:.2f} is above threshold "
+                                    f"Valve-zone ANFIS probability {zone_max_probability:.2f} is above threshold "
                                     f"{current_decision_threshold:.2f}, but this pot is not a managed below-target trigger."
+                                    if eligible_decisions
+                                    else (
+                                        f"Valve-zone ANFIS probability {zone_max_probability:.2f} is above threshold "
+                                        f"{current_decision_threshold:.2f}, but no managed pot in this valve zone "
+                                        "is below target moisture."
+                                    )
                                 )
-                    else:
-                        for decision in slot_decisions:
-                            if decision["reason_code"] not in ANFIS_HARD_STOP_REASON_CODES:
-                                decision["reason_code"] = "anfis_max_valve_high_no_moisture_deficit"
-                                decision["reason_detail"] = (
-                                    f"Max valve ANFIS probability {slot_max_probability:.2f} is above threshold "
-                                    f"{current_decision_threshold:.2f}, but no managed pot is below target moisture."
-                                )
-                elif safety_decisions_by_zone:
-                    for zone, safety_decisions in safety_decisions_by_zone.items():
+                    elif safety_decisions:
                         for decision in safety_decisions:
                             decision["should_irrigate"] = True
                             decision["reason_code"] = "anfis_moisture_safety_threshold"
                             decision["reason_detail"] = (
                                 f"Moisture {decision['current_moisture_pct']:.1f}% is below safety threshold "
                                 f"{decision['anfis_safety_threshold_pct']:.1f}%; ANFIS probability "
-                                f"{slot_max_probability:.2f} is below threshold {current_decision_threshold:.2f}, "
+                                f"{zone_max_probability:.2f} is below threshold {current_decision_threshold:.2f}, "
                                 f"so a moisture safety override waters the valve zone."
                                 f"{_anfis_duration_policy_note(decision)}"
                             )
                         zone_trigger_decisions[zone] = safety_decisions
 
-                    for decision in slot_decisions:
-                        if not decision.get("should_irrigate") and decision["reason_code"] not in ANFIS_HARD_STOP_REASON_CODES:
-                            decision["reason_code"] = "anfis_probability_low_safety_not_triggering"
-                            decision["reason_detail"] = (
-                                f"ANFIS probability {slot_max_probability:.2f} is below threshold "
-                                f"{current_decision_threshold:.2f}; another managed pot in the valve zone "
-                                "triggered the moisture safety override."
-                            )
-                else:
-                    for decision in slot_decisions:
-                        if decision["reason_code"] not in ANFIS_HARD_STOP_REASON_CODES:
-                            decision["reason_code"] = "anfis_max_valve_probability_low"
-                            decision["reason_detail"] = (
-                                f"Max valve ANFIS probability {slot_max_probability:.2f} is below threshold "
-                                f"{current_decision_threshold:.2f}; average probability is {slot_average_probability:.2f}."
-                            )
+                        for decision in zone_decisions:
+                            if not decision.get("should_irrigate") and decision["reason_code"] not in ANFIS_HARD_STOP_REASON_CODES:
+                                decision["reason_code"] = "anfis_probability_low_safety_not_triggering"
+                                decision["reason_detail"] = (
+                                    f"Valve-zone ANFIS probability {zone_max_probability:.2f} is below threshold "
+                                    f"{current_decision_threshold:.2f}; another managed pot in the valve zone "
+                                    "triggered the moisture safety override."
+                                )
+                    else:
+                        for decision in zone_decisions:
+                            if decision["reason_code"] not in ANFIS_HARD_STOP_REASON_CODES:
+                                decision["reason_code"] = "anfis_zone_probability_low"
+                                decision["reason_detail"] = (
+                                    f"Valve-zone ANFIS probability {zone_max_probability:.2f} is below threshold "
+                                    f"{current_decision_threshold:.2f}; zone average probability is {zone_average_probability:.2f}."
+                                )
+
+                for decision in slot_decisions:
+                    if decision["reason_code"] == "anfis_probability_pending":
+                        decision["reason_code"] = "anfis_not_valve_managed"
+                        decision["reason_detail"] = "Pot is not managed by an outdoor irrigation valve in this season."
 
                 for zone in list(zone_trigger_decisions):
                     trigger_decisions = zone_trigger_decisions[zone]
+                    zone_max_probability = zone_probability_summary.get(zone, (slot_average_probability, slot_max_probability))[1]
                     if not _anfis_zone_cadence_blocks(
                         last_irrigated_by_zone,
                         zone,
                         current_date,
                         trigger_decisions,
-                        slot_max_probability,
+                        zone_max_probability,
                         day_profile,
                     ):
                         continue
@@ -3611,7 +4110,7 @@ def _run_anfis_daily_irrigation(
                         decision["should_irrigate"] = False
                         decision["reason_code"] = "anfis_water_saving_cadence"
                         decision["reason_detail"] = (
-                            f"ANFIS probability {slot_max_probability:.2f} is above threshold "
+                            f"Valve-zone ANFIS probability {zone_max_probability:.2f} is above threshold "
                             f"{current_decision_threshold:.2f}, but valve zone {zone} was watered on "
                             f"{last_irrigated.isoformat() if last_irrigated else 'a recent day'}; "
                             f"water-saving cadence waits {cadence_days} days unless moisture is unsafe."
@@ -3621,7 +4120,13 @@ def _run_anfis_daily_irrigation(
                 for zone, trigger_decisions in zone_trigger_decisions.items():
                     trigger_pot_ids = [int(decision["pot_id"]) for decision in trigger_decisions]
                     trigger_pot_codes = [decision["pot_code"] for decision in trigger_decisions if decision.get("pot_code")]
-                    zone_dose_factor = _anfis_zone_dose_factor(trigger_decisions, slot_max_probability, day_profile)
+                    zone_max_probability = zone_probability_summary.get(zone, (slot_average_probability, slot_max_probability))[1]
+                    zone_dose_factor = _anfis_zone_dose_factor(
+                        trigger_decisions,
+                        zone_max_probability,
+                        day_profile,
+                        current_decision_threshold,
+                    )
                     for decision in trigger_decisions:
                         decision["dose_factor"] = zone_dose_factor
                         decision["dose_policy_source"] = "anfis_water_saving_policy"
@@ -3646,7 +4151,7 @@ def _run_anfis_daily_irrigation(
                         hour_weather,
                         decision_by_pot_id,
                         anfis_zone_decision,
-                        _baseline_irrigation_request,
+                        DEFAULT_IRRIGATION_POLICY.irrigation_request,
                         {
                             "zone_triggered": True,
                             "zone_trigger_pot_ids": trigger_pot_ids,
@@ -3678,6 +4183,11 @@ def _run_anfis_daily_irrigation(
 
             if record_date and _uses_hourly_chart(start_date, end_date):
                 hourly_probability = hourly_probability_sum / hourly_probability_count if hourly_probability_count else 0.0
+                hourly_zone_probability = (
+                    hourly_zone_signal_sum / hourly_zone_signal_count
+                    if hourly_zone_signal_count
+                    else hourly_probability
+                )
                 detail_entries.append(
                     _hourly_aggregate_entry(
                         observed_local,
@@ -3690,10 +4200,12 @@ def _run_anfis_daily_irrigation(
                         hourly_alerts,
                         {
                             **_hourly_line_metadata(selected_sensor_context, current_date, observed_local, hour_weather),
-                            "predicted_probability": round(hourly_probability, 4),
-                            "predicted_probability_percent": round(hourly_probability * 100.0, 2),
-                            "trigger_probability": round(hourly_probability_max, 4),
-                            "trigger_probability_percent": round(hourly_probability_max * 100.0, 2),
+                            "predicted_probability": round(hourly_zone_probability, 4),
+                            "predicted_probability_percent": round(hourly_zone_probability * 100.0, 2),
+                            "trigger_probability": round(hourly_zone_signal_max or hourly_probability_max, 4),
+                            "trigger_probability_percent": round((hourly_zone_signal_max or hourly_probability_max) * 100.0, 2),
+                            "global_predicted_probability": round(hourly_probability, 4),
+                            "global_predicted_probability_percent": round(hourly_probability * 100.0, 2),
                             "anfis_decision_threshold": round(current_decision_threshold, 4),
                             "anfis_decision_threshold_percent": round(current_decision_threshold * 100.0, 2),
                         },
@@ -3704,7 +4216,12 @@ def _run_anfis_daily_irrigation(
             current_date += timedelta(days=1)
             continue
 
-        predicted_probability = probability_sum / max(probability_count, 1)
+        global_predicted_probability = probability_sum / max(probability_count, 1)
+        predicted_probability = (
+            zone_signal_sum / zone_signal_count
+            if zone_signal_count
+            else global_predicted_probability
+        )
         moisture_summary = _daily_moisture_summary(daily_moisture_tracker, pot_states)
         entries.append(
             _daily_aggregate_entry(
@@ -3719,8 +4236,10 @@ def _run_anfis_daily_irrigation(
                     **_daily_line_metadata(selected_sensor_context, current_date, day_weather),
                     "predicted_probability": round(predicted_probability, 4),
                     "predicted_probability_percent": round(predicted_probability * 100.0, 2),
-                    "trigger_probability": round(probability_max, 4),
-                    "trigger_probability_percent": round(probability_max * 100.0, 2),
+                    "trigger_probability": round(zone_signal_max or probability_max, 4),
+                    "trigger_probability_percent": round((zone_signal_max or probability_max) * 100.0, 2),
+                    "global_predicted_probability": round(global_predicted_probability, 4),
+                    "global_predicted_probability_percent": round(global_predicted_probability * 100.0, 2),
                     "anfis_decision_threshold": round(current_decision_threshold, 4),
                     "anfis_decision_threshold_percent": round(current_decision_threshold * 100.0, 2),
                 },
@@ -4102,9 +4621,15 @@ def _generate_database_anfis_dataset(
     day_profiles = day_profiles or {}
     dataset: list[dict[str, float | str]] = []
     seen: set[tuple[date, time, int]] = set()
+    latest_by_sensor: dict[int, dict[str, Any]] = {}
 
+    exact_sensor_keys = [
+        key for key in lookup.keys()
+        if len(key) >= 3 and not isinstance(key[1], int)
+    ]
+    seen_readings: set[tuple[int, str]] = set()
     sorted_keys = sorted(
-        lookup.keys(),
+        exact_sensor_keys,
         key=lambda item: (item[0], _sensor_lookup_time(item[1]), int(item[2])),
     )
     for reading_date, slot_time, sensor_id in sorted_keys:
@@ -4120,6 +4645,18 @@ def _generate_database_anfis_dataset(
         sensor_reading = _lookup_sensor_reading(lookup, reading_date, slot_time, int(sensor_id))
         if sensor_reading is None:
             continue
+        recorded_at = sensor_reading.get("recorded_at")
+        reading_time_key = (
+            _local_timestamp_key(recorded_at)
+            if recorded_at is not None
+            else f"{reading_date.isoformat()}T{slot_time.isoformat()}"
+        )
+        reading_identity = (
+            int(sensor_id),
+            reading_time_key,
+        )
+        if reading_identity in seen_readings:
+            continue
 
         day_weather = weather_by_day.get(reading_date, [])
         if not day_weather:
@@ -4129,48 +4666,130 @@ def _generate_database_anfis_dataset(
         if weather is None:
             continue
         day_profile = day_profiles.get(reading_date) or _day_profile(reading_date, day_weather, weather_by_day)
-        decision_slot = _baseline_decision_slot(reading_date, observed_at, day_profile)
+        decision_slot = DEFAULT_IRRIGATION_POLICY.decision_slot(reading_date, observed_at, day_profile)
         if decision_slot is None:
             decision_slot = _anfis_training_slot(reading_date, day_profile, rng)
 
-        example = _anfis_training_example(pot, sensor_reading, weather, day_profile, decision_slot)
+        prior_reading = latest_by_sensor.get(int(sensor_id))
+        example = _anfis_training_example(
+            pot,
+            sensor_reading,
+            weather,
+            day_profile,
+            decision_slot,
+            prior_reading=prior_reading,
+            slot_time=slot_time,
+        )
         if example is not None:
             dataset.append(example)
+            seen_readings.add(reading_identity)
+        latest_by_sensor[int(sensor_id)] = sensor_reading
 
     if samples > 0 and len(dataset) > samples:
-        return rng.sample(dataset, samples)
+        return _weighted_anfis_dataset_sample(dataset, samples, rng)
     return dataset
 
 
-def _split_anfis_dataset(
+def _weighted_anfis_dataset_sample(
     dataset: list[dict[str, float | str]],
-    train_samples: int,
-    test_samples: int,
-    seed: int | None = None,
+    samples: int,
+    rng: random.Random,
+) -> list[dict[str, float | str]]:
+    if samples >= len(dataset):
+        return list(dataset)
+    selected: list[dict[str, float | str]] = []
+    remaining = list(dataset)
+    while remaining and len(selected) < samples:
+        total_weight = sum(max(0.1, float(item.get("training_weight", 1.0))) for item in remaining)
+        pick = rng.uniform(0.0, total_weight)
+        cursor = 0.0
+        for index, item in enumerate(remaining):
+            cursor += max(0.1, float(item.get("training_weight", 1.0)))
+            if cursor >= pick:
+                selected.append(item)
+                del remaining[index]
+                break
+    return selected
+
+
+def _split_anfis_training_calibration(
+    dataset: list[dict[str, float | str]],
+    seed: int | None,
+    calibration_share: float = ANFIS_CALIBRATION_SHARE,
 ) -> tuple[list[dict[str, float | str]], list[dict[str, float | str]]]:
-    if len(dataset) == 1:
+    if len(dataset) < 2:
         return dataset, dataset
+    rng = random.Random(None if seed is None else seed + 17)
+    rows = list(dataset)
+    rng.shuffle(rows)
+    calibration_count = max(1, min(len(rows) - 1, int(round(len(rows) * calibration_share))))
+    calibration = _stratified_anfis_test_sample(rows, calibration_count, rng)
+    calibration_ids = {id(item) for item in calibration}
+    training = [item for item in rows if id(item) not in calibration_ids]
+    return training or rows, calibration or training or rows
 
-    rng = random.Random(seed)
-    requested_train = max(1, train_samples)
-    requested_test = max(1, test_samples)
-    requested_total = min(len(dataset), requested_train + requested_test)
-    working = rng.sample(dataset, requested_total) if len(dataset) > requested_total else list(dataset)
-    rng.shuffle(working)
 
-    train_count = min(requested_train, max(1, len(working) - 1))
-    remaining = len(working) - train_count
-    if remaining <= 0:
-        train_count = max(1, len(working) - 1)
-    test_count = min(requested_test, len(working) - train_count)
-    test_dataset = _stratified_anfis_test_sample(working, test_count, rng)
-    test_ids = {id(item) for item in test_dataset}
-    train_dataset = [item for item in working if id(item) not in test_ids][:train_count]
-    if not test_dataset:
-        test_dataset = train_dataset
-    if not train_dataset:
-        train_dataset = test_dataset
-    return train_dataset, test_dataset
+def _expand_anfis_training_dataset(dataset: list[dict[str, float | str]]) -> list[dict[str, float | str]]:
+    expanded: list[dict[str, float | str]] = []
+    for item in dataset:
+        weight = max(1, min(5, int(round(float(item.get("training_weight", 1.0))))))
+        expanded.extend([item] * weight)
+    return expanded or dataset
+
+
+def _train_anfis_controller(
+    train_dataset: list[dict[str, float | str]],
+    calibration_dataset: list[dict[str, float | str]],
+    generations: int,
+    population: int,
+    seed: int | None,
+) -> _AnfisModelController:
+    weighted_train = _expand_anfis_training_dataset(train_dataset)
+    global_model = ANFIS()
+    global_model.fit(
+        weighted_train,
+        generations=generations,
+        population=population,
+        seed=seed,
+    )
+    global_calibrator = _AnfisProbabilityCalibrator.fit(global_model, calibration_dataset)
+    zone_models: dict[str, ANFIS] = {}
+    zone_calibrators: dict[str, _AnfisProbabilityCalibrator] = {}
+    by_zone: dict[str, list[dict[str, float | str]]] = {}
+    for item in train_dataset:
+        zone = str(item.get("valve_zone") or "")
+        if zone:
+            by_zone.setdefault(zone, []).append(item)
+
+    zone_generations = max(8, min(generations, generations // 2 or generations))
+    zone_population = max(8, min(population, population // 2 or population))
+    for zone, rows in sorted(by_zone.items()):
+        if len(rows) < ANFIS_ZONE_MODEL_MIN_SAMPLES:
+            continue
+        zone_training, zone_calibration = _split_anfis_training_calibration(
+            rows,
+            None if seed is None else seed + _valve_number_for_zone(zone),
+            calibration_share=ANFIS_CALIBRATION_SHARE,
+        )
+        model = ANFIS(
+            membership_params=list(global_model.membership_params),
+            rule_outputs=list(global_model.rule_outputs),
+        )
+        model.fit(
+            _expand_anfis_training_dataset(zone_training),
+            generations=zone_generations,
+            population=zone_population,
+            seed=None if seed is None else seed + _valve_number_for_zone(zone),
+        )
+        zone_models[zone] = model
+        zone_calibrators[zone] = _AnfisProbabilityCalibrator.fit(model, zone_calibration)
+
+    return _AnfisModelController(
+        global_model=global_model,
+        global_calibrator=global_calibrator,
+        zone_models=zone_models,
+        zone_calibrators=zone_calibrators,
+    )
 
 
 def _stratified_anfis_test_sample(
@@ -4213,6 +4832,8 @@ def _anfis_training_example(
     weather: dict[str, Any],
     day_profile: dict[str, Any],
     slot: str,
+    prior_reading: dict[str, Any] | None = None,
+    slot_time: time | None = None,
 ) -> dict[str, float | str] | None:
     moisture = _number(sensor_reading.get("soil_moisture_pct"), None)
     if moisture is None:
@@ -4221,10 +4842,86 @@ def _anfis_training_example(
     state = PotState(moisture=_clamp(float(moisture), 0.0, 100.0))
     inputs = _anfis_inputs(state, weather, sensor_reading, pot, day_profile)
     probability = _anfis_training_target_probability(inputs)
+    signals, weight = _anfis_training_signals(pot, sensor_reading, day_profile, prior_reading, slot_time)
     return {
         **inputs,
         "target_probability": probability,
         "target_category": probability_category(probability),
+        "valve_zone": str(pot.get("balcony_zone") or ""),
+        "training_signals": ",".join(signals),
+        "training_weight": weight,
+    }
+
+
+def _anfis_training_signals(
+    pot: dict[str, Any],
+    sensor_reading: dict[str, Any],
+    day_profile: dict[str, Any],
+    prior_reading: dict[str, Any] | None,
+    slot_time: time | None,
+) -> tuple[list[str], float]:
+    moisture = _number(sensor_reading.get("soil_moisture_pct"), 50.0)
+    target = _number(pot.get("moisture_target_pct"), 40.0)
+    min_moisture = _number(pot.get("moisture_min_pct"), target - 8.0)
+    max_temp = _number(day_profile.get("max_temperature_c"), 20.0)
+    rain_mm = _number(day_profile.get("precipitation_mm"), 0.0)
+    signals = ["real_sensor_reading"]
+    weight = 1.0
+
+    if moisture <= min(target, 42.0) and max_temp >= 30.0 and rain_mm < 0.5:
+        signals.append("dry_hot_no_rain")
+        weight += 2.0
+    elif moisture <= target and rain_mm < 0.5:
+        signals.append("dry_no_rain")
+        weight += 1.0
+
+    if _is_post_irrigation_recovery_reading(sensor_reading, prior_reading, slot_time, target, moisture):
+        signals.append("post_irrigation_recovery")
+        weight += 1.0
+
+    if moisture <= min_moisture:
+        signals.append("below_minimum")
+        weight += 1.0
+
+    return signals, min(weight, 5.0)
+
+
+def _is_post_irrigation_recovery_reading(
+    sensor_reading: dict[str, Any],
+    prior_reading: dict[str, Any] | None,
+    slot_time: time | None,
+    target: float,
+    moisture: float,
+) -> bool:
+    if slot_time is not None and (
+        time(7, 0) <= slot_time <= time(10, 30)
+        or time(19, 0) <= slot_time <= time(22, 30)
+    ) and moisture >= target - 2.0:
+        return True
+
+    if not prior_reading:
+        return False
+    prior_moisture = _number(prior_reading.get("soil_moisture_pct"), moisture)
+    return moisture >= target - 2.0 and moisture - prior_moisture >= 2.0
+
+
+def _anfis_training_signal_summary(dataset: list[dict[str, float | str]]) -> dict[str, Any]:
+    signal_counts: dict[str, int] = {}
+    weighted_samples = 0
+    zones: dict[str, int] = {}
+    for item in dataset:
+        weighted_samples += max(1, min(5, int(round(float(item.get("training_weight", 1.0))))))
+        zone = str(item.get("valve_zone") or "")
+        if zone:
+            zones[zone] = zones.get(zone, 0) + 1
+        for signal in str(item.get("training_signals") or "real_sensor_reading").split(","):
+            if signal:
+                signal_counts[signal] = signal_counts.get(signal, 0) + 1
+    return {
+        "samples": len(dataset),
+        "weighted_samples": weighted_samples,
+        "signals": dict(sorted(signal_counts.items())),
+        "valve_zones": dict(sorted(zones.items())),
     }
 
 
@@ -4247,20 +4944,34 @@ def _anfis_training_slot(observed_date: date, day_profile: dict[str, Any], rng: 
     return "morning"
 
 
-def _evaluate_anfis_model(model: ANFIS, dataset: list[dict[str, float | str]]) -> dict[str, Any]:
+def _predict_anfis_probability(model: ANFIS | _AnfisModelController, inputs: dict[str, Any], zone: str | None = None) -> float:
+    if isinstance(model, _AnfisModelController):
+        return model.predict(inputs, zone or str(inputs.get("valve_zone") or ""))
+    return model.predict(inputs)
+
+
+def _evaluate_anfis_model(model: ANFIS | _AnfisModelController, dataset: list[dict[str, float | str]]) -> dict[str, Any]:
     matches = 0
+    decision_matches = 0
     mse = 0.0
     for item in dataset:
-        predicted = model.predict(item)
+        predicted = _predict_anfis_probability(model, item)
         target_probability = float(item["target_probability"])
         mse += (predicted - target_probability) ** 2
         if probability_category(predicted) == item["target_category"]:
             matches += 1
+        if (predicted >= ANFIS_DECISION_THRESHOLD) == (target_probability >= ANFIS_DECISION_THRESHOLD):
+            decision_matches += 1
 
     mse /= max(len(dataset), 1)
+    rmse = mse**0.5
     return {
         "test_mse": round(mse, 6),
+        "test_rmse": round(rmse, 4),
+        "test_probability_fit_percent": round(max(0.0, 1.0 - rmse) * 100.0, 2),
         "test_accuracy_percent": round(matches / max(len(dataset), 1) * 100.0, 2),
+        "test_decision_accuracy_percent": round(decision_matches / max(len(dataset), 1) * 100.0, 2),
+        "test_decision_threshold": ANFIS_DECISION_THRESHOLD,
         "test_samples": len(dataset),
     }
 

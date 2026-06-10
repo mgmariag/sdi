@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import unittest
 from datetime import date, datetime
+from decimal import Decimal
 
 from digital_twin.control.prescriptions import RuntimePrescriptionStore
-from digital_twin.db.repositories.experiment_repository import _prescription_event_row
+from digital_twin.db.repositories.experiment_repository import _experiment_run_row, _prescription_event_row
 from digital_twin.services.irrigation_service import IrrigationActuationService
 
 
@@ -56,6 +57,24 @@ class RuntimePrescriptionStoreTests(unittest.TestCase):
         self.assertEqual(row["valve_number"], 2)
         self.assertEqual(row["payload"].obj["per_pot_distribution"][0]["delivered_volume_ml"], 260)
         self.assertEqual(row["scheduled_end_at"], datetime.fromisoformat("2026-05-22T05:10:00+03:00"))
+
+    def test_experiment_run_row_keeps_json_safe_snapshot(self) -> None:
+        row = _experiment_run_row(
+            "fuzzy_dt",
+            date(2026, 5, 21),
+            date(2026, 5, 22),
+            {"threshold": Decimal("36.82"), "created": datetime(2026, 5, 21, 6, 0)},
+            {
+                "summary": {"water_savings_percent": Decimal("10.12")},
+                "entries": [{"date": date(2026, 5, 22), "fuzzy_moisture": Decimal("37.4")}],
+            },
+        )
+
+        self.assertEqual(row["experiment_type"], "fuzzy_dt")
+        self.assertEqual(row["parameters"].obj["threshold"], 36.82)
+        self.assertEqual(row["parameters"].obj["created"], "2026-05-21T06:00:00")
+        self.assertEqual(row["summary"].obj["water_savings_percent"], 10.12)
+        self.assertEqual(row["payload"].obj["entries"][0]["date"], "2026-05-22")
 
     def test_actuation_service_materializes_then_consumes_due_windows(self) -> None:
         service = IrrigationActuationService(repository=_FakeActuationRepository())

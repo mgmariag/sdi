@@ -38,26 +38,26 @@ def run_daily_sampling_experiment(
 def run_daily_anfis_experiment(
     start_date: date,
     end_date: date,
-    train_samples: int = 2000,
-    test_samples: int = 800,
     seed: int | None = 2026,
     generations: int = 35,
     population: int = 24,
     persist: bool = False,
     snapshot: ExperimentSnapshot | None = None,
     baseline_result: dict[str, Any] | None = None,
+    trained_model: Any | None = None,
+    training_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return AnfisIrrigationExperiment(
         start_date,
         end_date,
-        train_samples,
-        test_samples,
         seed,
         generations,
         population,
         persist,
         snapshot,
         baseline_result,
+        trained_model,
+        training_metadata,
     ).run()
 
 

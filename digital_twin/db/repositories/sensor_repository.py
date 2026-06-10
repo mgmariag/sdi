@@ -15,6 +15,7 @@ from digital_twin.domain.irrigation_methods import VALVE_COUNT, VALVE_ZONE_DESIG
 
 SAFE_TAP_FLOW_L_MIN = 2.0
 VALVE_SWITCH_PAUSE_MIN = 1.0
+PHYSICAL_ACTUATION_EXPERIMENT_TYPE = "baseline"
 NO_IRRIGATION_PLANNED_LABEL = "No irrigation planned"
 NO_IRRIGATION_RECORDED_LABEL = "No irrigation recorded"
 
@@ -468,11 +469,12 @@ def _next_planned_irrigation(conn, now: datetime) -> dict[str, Any] | None:
         SELECT scheduled_start_at
         FROM irrigation_actuations
         WHERE status = 'planned'
+          AND experiment_type = %(experiment_type)s
           AND scheduled_start_at AT TIME ZONE 'Europe/Bucharest' > %(now)s
         ORDER BY scheduled_start_at
         LIMIT 1
         """,
-        {"now": now},
+        {"now": now, "experiment_type": PHYSICAL_ACTUATION_EXPERIMENT_TYPE},
     ).fetchone()
     if row:
         return _planned_irrigation_window(
@@ -498,9 +500,13 @@ def _planned_irrigation_window(conn, table_name: str, scheduled_start_at: dateti
             coalesce(sum(planned_volume_ml), 0) AS planned_volume_ml
         FROM {table_name}
         WHERE status = 'planned'
+          AND experiment_type = %(experiment_type)s
           AND scheduled_start_at = %(scheduled_start_at)s
         """,
-        {"scheduled_start_at": scheduled_start_at},
+        {
+            "scheduled_start_at": scheduled_start_at,
+            "experiment_type": PHYSICAL_ACTUATION_EXPERIMENT_TYPE,
+        },
     ).fetchone()
     if not row or not row["start_at"] or not row["end_at"]:
         return None
@@ -523,10 +529,11 @@ def _next_prescription_irrigation(conn, now: datetime) -> dict[str, Any] | None:
         SELECT experiment_type, prescription_date, payload
         FROM irrigation_prescriptions
         WHERE status = 'dispatched'
+          AND experiment_type = %(experiment_type)s
           AND prescription_date > %(today)s
         ORDER BY prescription_date, experiment_type
         """,
-        {"today": now.date()},
+        {"today": now.date(), "experiment_type": PHYSICAL_ACTUATION_EXPERIMENT_TYPE},
     ).fetchall()
     candidates = []
     for prescription in prescriptions:
@@ -564,11 +571,12 @@ def _most_recent_irrigation(conn, now: datetime) -> dict[str, Any] | None:
         SELECT scheduled_start_at
         FROM irrigation_actuations
         WHERE status IN ('running', 'completed')
+          AND experiment_type = %(experiment_type)s
           AND scheduled_start_at AT TIME ZONE 'Europe/Bucharest' <= %(now)s
         ORDER BY coalesce(completed_at, scheduled_end_at, scheduled_start_at) DESC
         LIMIT 1
         """,
-        {"now": now},
+        {"now": now, "experiment_type": PHYSICAL_ACTUATION_EXPERIMENT_TYPE},
     ).fetchone()
     if not row:
         return None
@@ -584,10 +592,14 @@ def _most_recent_irrigation(conn, now: datetime) -> dict[str, Any] | None:
             valve_zone
         FROM irrigation_actuations
         WHERE status IN ('running', 'completed')
+          AND experiment_type = %(experiment_type)s
           AND scheduled_start_at = %(scheduled_start_at)s
         ORDER BY experiment_type, valve_number, pot_id
         """,
-        {"scheduled_start_at": row["scheduled_start_at"]},
+        {
+            "scheduled_start_at": row["scheduled_start_at"],
+            "experiment_type": PHYSICAL_ACTUATION_EXPERIMENT_TYPE,
+        },
     ).fetchall()
     return _activity_window(
         rows,
@@ -614,6 +626,7 @@ def _irrigation_activity(
         "display_label": "Most recent irrigation",
         "item_count": 0,
         "planned_volume_l": 0.0,
+        "valves": [],
     }
 
 
@@ -633,6 +646,7 @@ def _activity_window(
         for item in rows
         if item.get("valve_number") is not None
     })
+    valves = _activity_window_valves(rows)
     return {
         "label": f"{start:%Y-%m-%d %H:%M} - {end:%H:%M}",
         "start_at": start.isoformat(),
@@ -647,7 +661,47 @@ def _activity_window(
         ),
         "experiment_types": experiments,
         "activated_valves": _valve_label(valve_numbers),
+        "valves": valves,
     }
+
+
+def _activity_window_valves(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    valves: dict[int, dict[str, Any]] = {}
+    for item in rows:
+        valve_number = item.get("valve_number")
+        if valve_number is None:
+            continue
+        number = int(valve_number)
+        valve_zone = item.get("valve_zone") or _valve_zone_for_number(number)
+        current = valves.setdefault(
+            number,
+            {
+                "valve_number": number,
+                "valve_zone": valve_zone,
+                "valve_name": _valve_zone_label(valve_zone),
+                "planned_volume_l": 0.0,
+            },
+        )
+        current["planned_volume_l"] += _number(item.get("planned_volume_ml"), 0.0) / 1000.0
+
+    return [
+        {
+            **item,
+            "planned_volume_l": round(item["planned_volume_l"], 2),
+        }
+        for item in sorted(valves.values(), key=lambda value: value["valve_number"])
+    ]
+
+
+def _valve_zone_for_number(valve_number: int) -> str:
+    for item in VALVE_ZONE_DESIGN:
+        if int(item["valve_number"]) == valve_number:
+            return str(item["zone"])
+    return ""
+
+
+def _valve_zone_label(zone: Any) -> str:
+    return str(zone).replace("_", " ") if zone else "Unmapped"
 
 
 def _next_recommendation_ready_at(now: datetime) -> datetime:

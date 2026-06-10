@@ -40,6 +40,17 @@ sap.ui.define([], () => {
         return (Number(baselineValue) || 0) - (Number(experimentValue) || 0);
     }
 
+    function evidenceCountDeltaDetail(reducedCount, label) {
+        const delta = Number(reducedCount) || 0;
+        if (delta > 0) {
+            return `${summaryInteger(delta)} fewer ${label} vs baseline`;
+        }
+        if (delta < 0) {
+            return `${summaryInteger(Math.abs(delta))} extra ${label} vs baseline`;
+        }
+        return `same ${label} as baseline`;
+    }
+
     function samplingWaterUseAcceptable(summary, waterSavedPercent) {
         const waterSavedLiters = summaryReducedCount(summary.sparse_total_water_usage_l, summary.baseline_total_water_usage_l);
         const extraWaterLiters = Math.max(0, -waterSavedLiters);
@@ -223,18 +234,18 @@ sap.ui.define([], () => {
 
     function anfisEvidenceSummaryHtml(summary) {
         const waterSavings = summaryReducedCount(summary.anfis_total_water_usage_l, summary.baseline_total_water_usage_l);
-        const valveRunsReduced = summaryReducedCount(summary.anfis_valve_run_count, summary.baseline_valve_run_count);
+        const comfortDays = `${summaryInteger(summary.comfort_preserved_days)}/${summaryInteger(summary.daysAnalyzed)}`;
         return evidencePanelHtml(
             "Summary",
             waterSavings >= 0 ? "WATER-SAVING MODEL" : "HIGHER WATER USE",
             "good",
             [
                 evidenceMetricHtml(evidenceWaterLabel(waterSavings), evidenceWaterValue(waterSavings, summary.baseline_total_water_usage_l), evidenceWaterDetail(waterSavings)),
-                evidenceMetricHtml("Valve activations", `${summaryInteger(summary.anfis_valve_run_count)}/${summaryInteger(summary.baseline_valve_run_count)}`, `${summaryInteger(valveRunsReduced)} fewer vs baseline`),
-                evidenceMetricHtml("Test accuracy", `${summaryNumber(summary.test_accuracy_percent, 1)}%`, "calibrated ANFIS-GA model"),
-                evidenceMetricHtml("Confidence", summaryNumber(summary.predicted_probability_mean, 2), `max ${summaryNumber(summary.predicted_probability_max, 2)}`)
+                evidenceMetricHtml("Moisture-safe savings", `${summaryNumber(summary.moisture_safe_savings_percent, 1)}%`, "water savings discounted by comfort"),
+                evidenceMetricHtml("Comfort preserved", `${summaryNumber(summary.comfort_preserved_percent, 1)}%`, `${comfortDays} days near baseline or above ${summaryNumber(summary.comfort_threshold_pct, 1)}%`),
+                evidenceMetricHtml("ANFIS signal", summaryNumber(summary.predicted_probability_mean, 2), `zone max ${summaryNumber(summary.predicted_probability_max, 2)}`)
             ],
-            `ANFIS-GA is compared against the default strategy over the same weather and pot conditions. Execution time: ${summaryDuration(summary.execution_time_seconds)}.`
+            `ANFIS-GA uses weighted dry/hot and recovery readings, per-zone probability calibration, and the same weather and pot conditions as the default strategy. Execution time: ${summaryDuration(summary.execution_time_seconds)}.`
         );
     }
 
@@ -250,11 +261,11 @@ sap.ui.define([], () => {
             "good",
             [
                 evidenceMetricHtml(evidenceWaterLabel(waterSavings), evidenceWaterValue(waterSavings, summary.baseline_total_water_usage_l, summary.water_savings_percent), evidenceWaterDetail(waterSavings)),
-                evidenceMetricHtml("Valve activations", `${summaryInteger(summary.fuzzy_valve_run_count)}/${summaryInteger(summary.baseline_valve_run_count)}`, `${summaryInteger(valveRunsReduced)} fewer vs baseline`),
-                evidenceMetricHtml("Avg. prescription", `${summaryNumber(averagePrescriptionLiters, 2)} L`, `${summaryNumber(averageScore, 1)}% fuzzy score`),
-                evidenceMetricHtml("Execution time", summaryDuration(summary.execution_time_seconds), "fuzzy inference")
+                evidenceMetricHtml("Test accuracy", `${summaryNumber(summary.accuracy_percent, 1)}%`, `${summaryInteger(summary.mismatch_days)} mismatch days`),
+                evidenceMetricHtml("Valve activations", `${summaryInteger(summary.fuzzy_valve_run_count)}/${summaryInteger(summary.baseline_valve_run_count)}`, evidenceCountDeltaDetail(valveRunsReduced, "activations")),
+                evidenceMetricHtml("Avg. prescription", `${summaryNumber(averagePrescriptionLiters, 2)} L`, `${summaryNumber(averageScore, 1)}% fuzzy score`)
             ],
-            "Fuzzy Control is compared against the default strategy over the same weather and pot conditions."
+            `Fuzzy Control is compared against the default strategy over the same weather and pot conditions. Execution time: ${summaryDuration(summary.execution_time_seconds)}.`
         );
     }
 
@@ -416,6 +427,30 @@ sap.ui.define([], () => {
         );
     }
 
+    function overviewSegmentCount(segments, key) {
+        const segment = segments.find((item) => item.key === key);
+        return segment ? Number(segment.count) || 0 : 0;
+    }
+
+    function overviewSensorCoverageInfoHtml(coverage, segments, totalPots) {
+        const sensorNodes = Number(coverage.sensor_nodes) || 0;
+        const measuredPots = overviewSegmentCount(segments, "measured");
+        const estimatedPots = overviewSegmentCount(segments, "estimated");
+        const anchorCount = sensorNodes || measuredPots;
+        const anchorText = anchorCount > 0
+            ? `<strong>${escapeHtml(anchorCount)}</strong> ${escapeHtml(anchorCount === 1 ? "sensor node" : "sensor nodes")} calibrate ${escapeHtml(totalPots || 0)} active pots`
+            : "No sensor nodes are configured yet";
+        const estimateText = estimatedPots > 0
+            ? `${estimatedPots} pots estimated from plant type, zone and weather`
+            : "All active pots have same-day sensor data";
+        return (
+            `<div class="overviewSensorInfo">` +
+                `<p>${anchorText}</p>` +
+                `<p>${escapeHtml(estimateText)}</p>` +
+            `</div>`
+        );
+    }
+
     function overviewIconSvg(type) {
         const paths = {
             moisture: `<path d="M12 3.5C9.3 7 7 9.9 7 13a5 5 0 0 0 10 0c0-3.1-2.3-6-5-9.5Z"/><path d="M9.8 14.1c.5 1.2 1.4 1.8 2.7 1.8"/>`,
@@ -451,26 +486,93 @@ sap.ui.define([], () => {
         );
     }
 
+    function overviewStateOptionalRowHtmlValueHtml(icon, label, valueHtml) {
+        return valueHtml
+            ? overviewStateRowHtmlValueHtml(icon, label, valueHtml)
+            : "";
+    }
+
+    function irrigationWindowValveLabel(window) {
+        return window && window.activated_valves && window.activated_valves !== "none"
+            ? String(window.activated_valves)
+            : "";
+    }
+
+    function irrigationWindowValveLabelHtml(windowOrLabel) {
+        const label = typeof windowOrLabel === "string"
+            ? windowOrLabel
+            : irrigationWindowValveLabel(windowOrLabel);
+        return label
+            ? escapeHtml(label).replace(/V(\d+)-V(\d+)/g, "V$1&ndash;V$2")
+            : "";
+    }
+
+    function irrigationWindowWaterLabel(window) {
+        const liters = Number(window && window.planned_volume_l);
+        return Number.isFinite(liters) && liters > 0
+            ? `${overviewNumber(liters, 2)} L`
+            : "0 L";
+    }
+
+    function overviewLatestIrrigationHtml(window) {
+        if (!window || !window.start_at) {
+            return overviewStateRowHtml("irrigation", "Latest run", NO_IRRIGATION_RECORDED_LABEL);
+        }
+        const valves = Array.isArray(window.valves) ? window.valves : [];
+        const listClass = valves.length > 3
+            ? "overviewLatestIrrigationList overviewLatestIrrigationListTwoColumns"
+            : "overviewLatestIrrigationList";
+        const valveRowsHtml = valves.length
+            ? overviewLatestIrrigationValveRowsHtml(valves)
+            : overviewStateRowHtmlValueHtml("valve", "Activated valves", irrigationWindowValveLabelHtml(window) || escapeHtml("No valves"));
+        return (
+            `<div class="${listClass}">${valveRowsHtml}</div>` +
+            `<div class="overviewLatestIrrigationTotal">` +
+                `<span>Total water</span>` +
+                `<strong>${escapeHtml(irrigationWindowWaterLabel(window))}</strong>` +
+            `</div>`
+        );
+    }
+
+    function experimentPlannedValveRunsHtml(window) {
+        if (!window || !window.start_at) {
+            return overviewStateRowHtml("valve", "Planned runs", "No planned run");
+        }
+        return overviewLatestIrrigationHtml(window);
+    }
+
+    function overviewLatestIrrigationValveRowsHtml(valves) {
+        const maxLiters = valves.reduce((maxValue, valve) => {
+            const liters = Number(valve && valve.planned_volume_l);
+            return Number.isFinite(liters) ? Math.max(maxValue, liters) : maxValue;
+        }, 0);
+        return valves.map((valve) => {
+            const liters = Number(valve && valve.planned_volume_l);
+            const safeLiters = Number.isFinite(liters) ? liters : 0;
+            const share = maxLiters > 0 ? Math.max(4, Math.min(100, safeLiters / maxLiters * 100)) : 0;
+            const valveNumber = Number(valve && valve.valve_number);
+            const valveLabel = Number.isFinite(valveNumber) ? `V${valveNumber}` : "Valve";
+            const valveName = valve && (valve.valve_name || overviewZoneLabel(valve.valve_zone));
+            return (
+                `<div class="overviewLatestValveRow" style="--overview-valve-share:${share.toFixed(1)}%;">` +
+                    `<div class="overviewLatestValveHeader">` +
+                        `<span><b>${escapeHtml(valveLabel)}</b>${escapeHtml(valveName || "Unmapped")}</span>` +
+                        `<strong>${escapeHtml(`${overviewNumber(safeLiters, 2)} L`)}</strong>` +
+                    `</div>` +
+                    `<i class="overviewLatestValveTrack"><span></span></i>` +
+                `</div>`
+            );
+        }).join("");
+    }
+
     function compactIrrigationWindowHtml(window) {
         if (!window || !window.label) {
             return NO_IRRIGATION_PLANNED_LABEL;
         }
-        const valves = window.activated_valves && window.activated_valves !== "none"
-            ? escapeHtml(window.activated_valves)
-            : "";
         const match = String(window.label).match(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s+-\s+(\d{2}:\d{2})$/);
-        const timeLabel = match
+        return match
             ? `${escapeHtml(match[1])} ${escapeHtml(`${match[2]}-${match[3]}`)}`
             : escapeHtml(window.label);
-        if (!valves) {
-            return timeLabel;
-        }
-        return (
-            `<span class="overviewIrrigationWindow">` +
-                `<span class="overviewIrrigationWindowTime">${timeLabel}</span>` +
-                `<span class="overviewIrrigationValves">Active valves: ${valves}</span>` +
-            `</span>`
-        );
     }
 
     /*
@@ -543,6 +645,11 @@ sap.ui.define([], () => {
             return "Medium";
         }
         return "Low";
+    }
+
+    function overviewValvePriorityLevel(score, requiresRun) {
+        const level = overviewPriorityLevel(score);
+        return !requiresRun && level === "High" ? "Medium" : level;
     }
 
     function overviewZoneLabel(zone) {
@@ -627,16 +734,16 @@ sap.ui.define([], () => {
                 const valveLabel = item.valve_number ? `V${item.valve_number}` : `#${item.rank}`;
                 const flowLabel = `${overviewNumber(item.total_flow_l_min, 3)} L/min`;
                 const durationLabel = `${overviewNumber(item.estimated_run_minutes, 1)} min`;
-                const priorityLevel = overviewPriorityLevel(item.priority_score);
                 const requiresRun = Boolean(item.requires_run || Number(item.immediate_pots) > 0);
-                const statusLabel = requiresRun ? "Needs water" : "Standby";
+                const priorityLevel = overviewValvePriorityLevel(item.priority_score, requiresRun);
+                const statusLabel = requiresRun ? "Below minimum" : "Above minimum";
                 const statusClass = requiresRun ? "overviewValveTagNeedsWater" : "overviewValveTagStandby";
                 return (
                     `<article class="overviewValveRow">` +
                         `<div class="overviewValveRowHeader">` +
                             `<span class="overviewValveRank">${escapeHtml(`#${item.rank || 0}`)}</span>` +
                             `<div>` +
-                                `<strong>${escapeHtml(`${valveLabel} - ${overviewZoneLabel(item.zone)}`)}</strong>` +
+                                `<strong>${escapeHtml(`${valveLabel} ${overviewZoneLabel(item.zone)}`)}</strong>` +
                                 `<em>${escapeHtml(`${affectedPotsInZone} pots`)}</em>` +
                             `</div>` +
                             `<span class="overviewValveTag ${statusClass}">${escapeHtml(statusLabel)}</span>` +
@@ -696,14 +803,14 @@ sap.ui.define([], () => {
                     `<em>${escapeHtml(`${overviewNumber(safeTapFlow, 1)} L/min safe limit`)}</em>` +
                 `</div>` +
                 `<div class="overviewValveGauge overviewValveGaugeWater" style="--gauge-share:100%">` +
-                    `<div><span>Complete irrigation</span><strong>${escapeHtml(`${overviewNumber(completeVolume, 2)} L`)}</strong></div>` +
+                    `<div><span>Total irrigation volume</span><strong>${escapeHtml(`${overviewNumber(completeVolume, 2)} L`)}</strong></div>` +
                     `<i><span></span></i>` +
                     `<em>${escapeHtml("All active pots, design dose")}</em>` +
                 `</div>` +
             `</div>` +
             `<div class="overviewValveSectionHeader"><span>Optimized batches</span><strong>${escapeHtml(`${schedule.length}`)}</strong></div>` +
             `<div class="overviewValveSchedule">${scheduleRows}</div>` +
-            `<div class="overviewValveSectionHeader"><span>Priority order</span><strong>${escapeHtml(`${priority.length} zones`)}</strong></div>` +
+            `<div class="overviewValveSectionHeader"><span>Zone irrigation priority</span><strong>${escapeHtml(`${priority.length} zones`)}</strong></div>` +
             `<div class="overviewValveList">${priorityRows}</div>`
         );
     }
@@ -712,18 +819,22 @@ sap.ui.define([], () => {
         return (
             `<aside class="overviewSideRail">` +
                 `<div class="overviewRailStack">` +
-                    `<section class="overviewRailCard">` +
-                        `<h3>Current State</h3>` +
-                        overviewStateRowHtml("moisture", "Soil moisture", state.currentMoistureLabel) +
+                    `<section class="overviewRailCard overviewCurrentStateCard">` +
+                        `<h3>Digital Twin State</h3>` +
+                        overviewStateRowHtml("moisture", "Average soil moisture", state.currentMoistureLabel) +
                         overviewStateRowHtml("rain", "Forecast rain (next 3 days)", state.forecastRainLabel) +
                         overviewStateRowHtml("irrigation", "Irrigation recommendation", state.irrigationRecommendation) +
                         overviewStateRowHtml("clock", state.irrigationActivityLabel, state.irrigationActivityValue) +
                     `</section>` +
-                    `<section class="overviewRailCard">` +
+                    `<section class="overviewRailCard overviewLatestIrrigationCard">` +
+                        `<h3>Recent Activity</h3>` +
+                        state.latestIrrigationHtml +
+                    `</section>` +
+                    `<section class="overviewRailCard overviewSensorCoverageCard">` +
                         `<h3>Sensor Coverage</h3>` +
                         sensorCoverageHtml +
                     `</section>` +
-                    `<section class="overviewRailCard">` +
+                    `<section class="overviewRailCard overviewPlantOverviewCard">` +
                         `<h3>Pot &amp; Plant Overview</h3>` +
                         plantOverviewHtml +
                     `</section>` +
@@ -731,6 +842,20 @@ sap.ui.define([], () => {
                 `<section class="overviewRailCard overviewValveCard">` +
                     `<h3>Valve Priority Plan</h3>` +
                     valvePlanHtml +
+                `</section>` +
+            `</aside>`
+        );
+    }
+
+    function overviewStatusHtml(title, detail) {
+        return (
+            `<aside class="overviewSideRail">` +
+                `<section class="overviewRailCard">` +
+                    `<h3>${escapeHtml(title)}</h3>` +
+                    `<div class="overviewRailMetric">` +
+                        `<span>${overviewIconSvg("shield")}<span>Status</span></span>` +
+                        `<strong>${escapeHtml(detail)}</strong>` +
+                    `</div>` +
                 `</section>` +
             `</aside>`
         );
@@ -747,39 +872,51 @@ sap.ui.define([], () => {
                 nextIrrigationWindowLabel: NO_IRRIGATION_PLANNED_LABEL,
                 irrigationActivityLabel: "Most recent irrigation",
                 irrigationActivityValue: NO_IRRIGATION_RECORDED_LABEL,
-                compactIrrigationActivityHtml: NO_IRRIGATION_RECORDED_LABEL
+                compactIrrigationActivityHtml: NO_IRRIGATION_RECORDED_LABEL,
+                latestIrrigationHtml: overviewStateRowHtml("irrigation", "Latest run", NO_IRRIGATION_RECORDED_LABEL),
+                plannedValvesHtml: ""
             },
             sensorCoverageHtml: "",
             valvePlanHtml: "",
             plantOverviewHtml: "",
             weatherImpactHtml: "",
-            sideRailHtml: "",
+            sideRailHtml: overviewStatusHtml("Overview loading", "Waiting for current system state"),
             experimentSideRailHtml: ""
         };
     }
 
-    function experimentSideRailHtml(state, plantOverviewHtml, weatherImpactHtml, experiment, summary) {
-    return (
-        `<aside class="overviewSideRail experimentOnlyOverview">` +
-            experimentEvidenceSummaryHtml(experiment, summary) +
-            `<details class="experimentOverviewContext" open>` +
-                `<summary class="experimentOverviewContextTitle">Decision Context</summary>` +
-                `<div class="experimentOverviewCards">` +
-                    `<section class="overviewRailCard overviewStateContextCard">` +
-                        `<h3>Current State</h3>` +
-                        overviewStateRowHtml("moisture", "Current soil moisture", state.currentMoistureLabel) +
-                        overviewStateRowHtml("rain", "Forecast rain (next 3 days)", state.forecastRainLabel) +
-                        overviewStateRowHtmlValueHtml("clock", state.irrigationActivityLabel, state.compactIrrigationActivityHtml) +
-                    `</section>` +
-                    weatherImpactHtml +
-                    `<section class="overviewRailCard">` +
-                        `<h3>Pot &amp; Plant Overview</h3>` +
-                        plantOverviewHtml +
-                    `</section>` +
-                `</div>` +
-            `</details>` +
-        `</aside>`
-    );
+    function overviewUnavailable(error) {
+        const detail = error && error.message
+            ? error.message
+            : "Current system state could not be loaded";
+        return Object.assign(defaultOverview(), {
+            sideRailHtml: overviewStatusHtml("Overview unavailable", detail)
+        });
+    }
+
+    function experimentSideRailHtml(state, plannedValveRunsHtml, weatherImpactHtml, experiment, summary) {
+        return (
+            `<aside class="overviewSideRail experimentOnlyOverview">` +
+                experimentEvidenceSummaryHtml(experiment, summary) +
+                `<details class="experimentOverviewContext" open>` +
+                    `<summary class="experimentOverviewContextTitle">Decision Context</summary>` +
+                    `<div class="experimentOverviewCards">` +
+                        `<section class="overviewRailCard overviewStateContextCard">` +
+                            `<h3>Digital Twin State</h3>` +
+                            overviewStateRowHtml("moisture", "Average soil moisture", state.currentMoistureLabel) +
+                            overviewStateRowHtml("rain", "Forecast rain (next 3 days)", state.forecastRainLabel) +
+                            overviewStateRowHtmlValueHtml("clock", state.irrigationActivityLabel, state.compactIrrigationActivityHtml) +
+                            overviewStateOptionalRowHtmlValueHtml("valve", "Planned valves", state.plannedValvesHtml) +
+                        `</section>` +
+                        `<section class="overviewRailCard overviewLatestIrrigationCard experimentPlannedValveRunsCard">` +
+                            `<h3>Planned Valve Runs</h3>` +
+                            plannedValveRunsHtml +
+                        `</section>` +
+                        weatherImpactHtml +
+                    `</div>` +
+                `</details>` +
+            `</aside>`
+        );
     }
 
     function prepareOverview(result) {
@@ -794,7 +931,8 @@ sap.ui.define([], () => {
             `<div class="overviewChartLayout">` +
                 overviewDonutHtml(coverageSegments, totalPots, totalPots || 0, "Pots", "overviewCoverageDonut") +
                 `<div class="overviewLegend">${overviewLegendHtml(coverageSegments, totalPots)}</div>` +
-            `</div>`
+            `</div>` +
+            overviewSensorCoverageInfoHtml(coverage, coverageSegments, totalPots)
             /*
             Data reliability is disabled for now.
             `<div class="overviewSensorFooter">` +
@@ -847,7 +985,9 @@ sap.ui.define([], () => {
             compactNextIrrigationWindowHtml: compactIrrigationWindowHtml(state.next_irrigation_window),
             irrigationActivityLabel: activityState.label,
             irrigationActivityValue: activityState.value,
-            compactIrrigationActivityHtml: activityState.compactHtml
+            compactIrrigationActivityHtml: activityState.compactHtml,
+            latestIrrigationHtml: overviewLatestIrrigationHtml(state.recent_irrigation_window),
+            plannedValvesHtml: ""
         };
 
         return {
@@ -865,7 +1005,7 @@ sap.ui.define([], () => {
             ),
             experimentSideRailHtml: experimentSideRailHtml(
                 stateModel,
-                plantOverviewHtml,
+                "",
                 weatherImpactHtml,
                 null,
                 null
@@ -878,9 +1018,12 @@ sap.ui.define([], () => {
         defaultOverview,
         escapeHtml,
         compactIrrigationWindowHtml,
+        experimentPlannedValveRunsHtml,
         experimentSideRailHtml,
         formatChartGranularity,
         formatLocalDate,
+        irrigationWindowValveLabelHtml,
+        overviewUnavailable,
         parseLocalDate,
         prepareOverview,
         summaryDuration,
