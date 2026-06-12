@@ -20,6 +20,15 @@ sap.ui.define([], () => {
         return Number.isFinite(numberValue) ? String(Math.round(numberValue)) : "0";
     }
 
+    function summaryProbabilityPercent(value, decimals) {
+        const numberValue = Number(value);
+        if (!Number.isFinite(numberValue)) {
+            return `${summaryNumber(0, decimals)}%`;
+        }
+        const percentValue = Math.abs(numberValue) <= 1 ? numberValue * 100 : numberValue;
+        return `${summaryNumber(percentValue, decimals)}%`;
+    }
+
     function summaryPercentChange(delta, baseline) {
         const baselineValue = Number(baseline);
         if (!Number.isFinite(baselineValue) || baselineValue === 0) {
@@ -191,6 +200,12 @@ sap.ui.define([], () => {
         return `${savedLiters >= 0 ? "" : "+"}${summaryNumber(Math.abs(savedLiters), 2)} L vs baseline`;
     }
 
+    function evidenceValveActivationShiftDetail(missedActivations, extraActivations) {
+        const missed = Math.abs(Number(missedActivations) || 0);
+        const extra = Math.abs(Number(extraActivations) || 0);
+        return `valve activations ${summarySignedInteger(-missed)}/${summarySignedInteger(extra)}`;
+    }
+
     function samplingEvidenceSummaryHtml(summary) {
         const waterSaved = summaryReducedCount(summary.sparse_total_water_usage_l, summary.baseline_total_water_usage_l);
         const baselineWater = Number(summary.baseline_total_water_usage_l) || 0;
@@ -234,38 +249,93 @@ sap.ui.define([], () => {
 
     function anfisEvidenceSummaryHtml(summary) {
         const waterSavings = summaryReducedCount(summary.anfis_total_water_usage_l, summary.baseline_total_water_usage_l);
-        const comfortDays = `${summaryInteger(summary.comfort_preserved_days)}/${summaryInteger(summary.daysAnalyzed)}`;
+        const validationSamples = Number(summary.evaluation_samples) || Number(summary.test_samples) || 0;
+        const operatingThreshold = summary.anfis_probability_threshold || summary.test_decision_threshold;
+        const modelSource = String(summary.anfisModelSource || "model").replace(/_/g, " ");
+        const decisionAccuracy = Number(summary.test_decision_accuracy_percent) || 0;
+        const probabilityFit = Number(summary.test_probability_fit_percent) || 0;
+        const baselineAgreement = Number(summary.baseline_agreement_percent) || 0;
+        let tone = "good";
+        if (validationSamples > 0 && (decisionAccuracy < 50 || probabilityFit < 50)) {
+            tone = "risk";
+        } else if (validationSamples > 0 && decisionAccuracy < 70) {
+            tone = "watch";
+        }
+        const note =
+            `ANFIS-GA uses a ${modelSource} trained from sensor and weather data. ` +
+            "It is compared against the default strategy under the same " +
+            `weather and pot conditions.`;
         return evidencePanelHtml(
             "Summary",
-            waterSavings >= 0 ? "WATER-SAVING MODEL" : "HIGHER WATER USE",
-            "good",
+            "IRRIGATION PROBABILITY MODEL",
+            tone,
             [
-                evidenceMetricHtml(evidenceWaterLabel(waterSavings), evidenceWaterValue(waterSavings, summary.baseline_total_water_usage_l), evidenceWaterDetail(waterSavings)),
-                evidenceMetricHtml("Moisture-safe savings", `${summaryNumber(summary.moisture_safe_savings_percent, 1)}%`, "water savings discounted by comfort"),
-                evidenceMetricHtml("Comfort preserved", `${summaryNumber(summary.comfort_preserved_percent, 1)}%`, `${comfortDays} days near baseline or above ${summaryNumber(summary.comfort_threshold_pct, 1)}%`),
-                evidenceMetricHtml("ANFIS signal", summaryNumber(summary.predicted_probability_mean, 2), `zone max ${summaryNumber(summary.predicted_probability_max, 2)}`)
+                evidenceMetricHtml(
+                    "Baseline agreement",
+                    `${summaryNumber(baselineAgreement, 1)}%`,
+                    `${summaryInteger(summary.baseline_mismatch_days)} mismatch days; ${evidenceValveActivationShiftDetail(summary.missed_valve_run_delta, summary.anfis_extra_valve_run_delta)}`
+                ),
+                evidenceMetricHtml(
+                    evidenceWaterLabel(waterSavings),
+                    evidenceWaterValue(waterSavings, summary.baseline_total_water_usage_l, summary.water_savings_percent),
+                    `${evidenceWaterDetail(waterSavings)}`
+                ),
+                evidenceMetricHtml(
+                    "Validation agreement",
+                    `${summaryNumber(summary.test_decision_accuracy_percent, 1)}%`,
+                    `${summaryInteger(validationSamples)} validation samples; threshold ${summaryProbabilityPercent(operatingThreshold, 0)}`
+                ),
+                evidenceMetricHtml(
+                    "Target probability fit",
+                    `${summaryNumber(probabilityFit, 1)}%`,
+                    `RMSE ${summaryNumber(summary.test_rmse, 3)}`
+                )
             ],
-            `ANFIS-GA uses weighted dry/hot and recovery readings, per-zone probability calibration, and the same weather and pot conditions as the default strategy. Execution time: ${summaryDuration(summary.execution_time_seconds)}.`
+            note
         );
     }
 
     function fuzzyEvidenceSummaryHtml(summary) {
-        const valveRunsReduced = summaryReducedCount(summary.fuzzy_valve_run_count, summary.baseline_valve_run_count);
         const waterSavings = Number(summary.water_savings_l) || 0;
         const averagePrescriptionMm = Number(summary.average_prescription_mm) || 0;
         const averagePrescriptionLiters = (Number(summary.fuzzy_total_water_usage_l) || 0) / Math.max(Number(summary.daysAnalyzed) || 1, 1);
         const averageScore = Math.min(100, Math.max(0, averagePrescriptionMm / FUZZY_PRESCRIPTION_SCORE_MAX_MM * 100));
+        const baselineAgreement = Number(summary.baseline_agreement_percent ?? summary.accuracy_percent) || 0;
+        const mismatchDays = Number(summary.baseline_mismatch_days ?? summary.mismatch_days) || 0;
+        const comfortDays = `${summaryInteger(summary.comfort_preserved_days)}/${summaryInteger(summary.daysAnalyzed)}`;
+        let tone = "good";
+        if (baselineAgreement < 65 || Number(summary.moisture_safe_savings_percent) < -5) {
+            tone = "risk";
+        } else if (baselineAgreement < 80) {
+            tone = "watch";
+        }
         return evidencePanelHtml(
             "Summary",
-            waterSavings >= 0 ? "WATER-SAVING MODEL" : "HIGHER WATER USE",
-            "good",
+            "IRRIGATION PRESCRIPTION MODEL",
+            tone,
             [
-                evidenceMetricHtml(evidenceWaterLabel(waterSavings), evidenceWaterValue(waterSavings, summary.baseline_total_water_usage_l, summary.water_savings_percent), evidenceWaterDetail(waterSavings)),
-                evidenceMetricHtml("Test accuracy", `${summaryNumber(summary.accuracy_percent, 1)}%`, `${summaryInteger(summary.mismatch_days)} mismatch days`),
-                evidenceMetricHtml("Valve activations", `${summaryInteger(summary.fuzzy_valve_run_count)}/${summaryInteger(summary.baseline_valve_run_count)}`, evidenceCountDeltaDetail(valveRunsReduced, "activations")),
-                evidenceMetricHtml("Avg. prescription", `${summaryNumber(averagePrescriptionLiters, 2)} L`, `${summaryNumber(averageScore, 1)}% fuzzy score`)
+                evidenceMetricHtml(
+                    "Baseline agreement",
+                    `${summaryNumber(baselineAgreement, 1)}%`,
+                    `${summaryInteger(mismatchDays)} mismatch days; ${evidenceValveActivationShiftDetail(summary.missed_valve_run_delta, summary.fuzzy_extra_valve_run_delta)}`
+                ),
+                evidenceMetricHtml(
+                    evidenceWaterLabel(waterSavings),
+                    evidenceWaterValue(waterSavings, summary.baseline_total_water_usage_l, summary.water_savings_percent),
+                    `${evidenceWaterDetail(waterSavings)}`
+                ),
+                evidenceMetricHtml(
+                    "Prescription signal",
+                    `${summaryNumber(averageScore, 1)}%`,
+                    `${summaryNumber(averagePrescriptionMm, 2)} mm average; ${summaryNumber(averagePrescriptionLiters, 2)} L/day`
+                ),
+                evidenceMetricHtml(
+                    "Moisture safety",
+                    `${summaryNumber(summary.moisture_safe_savings_percent, 1)}%`,
+                    `${comfortDays} days preserved; floor ${summaryNumber(summary.comfort_threshold_pct, 1)}%`
+                )
             ],
-            `Fuzzy Control is compared against the default strategy over the same weather and pot conditions. Execution time: ${summaryDuration(summary.execution_time_seconds)}.`
+            `Fuzzy Control is compared against the default strategy over the same weather and pot conditions.`
         );
     }
 

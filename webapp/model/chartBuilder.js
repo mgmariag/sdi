@@ -8,7 +8,10 @@ sap.ui.define([], () => {
     const FUZZY_SCORE_MEASURE = "Fuzzy irrigation score (%)";
     const FUZZY_PRESCRIPTION_SCORE_MAX_MM = 8;
 
-    function toChartNumber(value) {
+    function toChartNumber(value, preserveBlank) {
+        if (preserveBlank && (value === null || value === undefined || value === "")) {
+            return null;
+        }
         const numberValue = Number(value);
         return Number.isFinite(numberValue) ? numberValue : 0;
     }
@@ -47,12 +50,15 @@ sap.ui.define([], () => {
     function withDerivedChartFields(entries) {
         const rows = Array.isArray(entries) ? entries : [];
         return rows.map((entry) => {
-            const prescriptionScore = Math.min(
-                100,
-                Math.max(0, toChartNumber(entry.fuzzy_prescription_mm) / FUZZY_PRESCRIPTION_SCORE_MAX_MM * 100)
-            );
+            const prescriptionMm = toChartNumber(entry.fuzzy_prescription_mm, true);
+            const prescriptionScore = prescriptionMm === null
+                ? null
+                : Math.min(
+                    100,
+                    Math.max(0, prescriptionMm / FUZZY_PRESCRIPTION_SCORE_MAX_MM * 100)
+                );
             return Object.assign({}, entry, {
-                fuzzy_prescription_score_pct: Number(prescriptionScore.toFixed(2))
+                fuzzy_prescription_score_pct: prescriptionScore === null ? null : Number(prescriptionScore.toFixed(2))
             });
         });
     }

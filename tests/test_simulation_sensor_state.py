@@ -96,6 +96,35 @@ class SimulationSensorStateTests(unittest.TestCase):
         self.assertEqual(state.moisture, 52.0)
         self.assertEqual(result["sensor_blend_weight"], 1.0)
 
+    def test_initial_state_anchor_uses_associated_sensor_readings(self) -> None:
+        start_date = date(2026, 5, 21)
+        states = {1: PotState(moisture=12.0), 2: PotState(moisture=18.0)}
+        reading = _sensor_reading(DEFAULT_SENSOR_SOURCE, 52.0)
+        sensor_context = {
+            "available": True,
+            "lookup": {
+                (start_date, time(5, 30), 1): reading,
+            },
+            "associations": {
+                1: {"sensor_id": 1, "direct": True, "distance": 0.0},
+                2: {"sensor_id": 1, "direct": False, "distance": 1.0},
+            },
+            "sensor_pots": {
+                1: _associated_pot(1),
+            },
+        }
+
+        anchor = engine._initialize_states_from_first_day_sensor_readings(
+            states,
+            [_associated_pot(1), _associated_pot(2)],
+            sensor_context,
+            start_date,
+        )
+
+        self.assertEqual(anchor["anchored_pots"], 2)
+        self.assertEqual(states[1].moisture, 52.0)
+        self.assertEqual(states[2].moisture, 52.0)
+
     def test_evening_marker_is_skipped_when_day_is_not_hot(self) -> None:
         state = PotState(moisture=31.0)
         reading = _sensor_reading(DEFAULT_SENSOR_SOURCE, 44.0)

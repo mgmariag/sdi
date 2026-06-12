@@ -45,7 +45,6 @@ from digital_twin.simulation.irrigation_controller import (
     _make_fuzzy_dt_decision,
     _precipitation_last_days,
     _rain_exposure_factor,
-    _three_input_irrigation_skip_reason,
     _threshold_for_pot,
     _upcoming_freeze,
 )
@@ -65,14 +64,10 @@ ANFIS_HARD_STOP_REASON_CODES = {
     "freeze_risk",
     "winter_indoor_not_valve_managed",
     "anfis_cold_skip",
-    "anfis_moisture_sufficient",
-    "anfis_rain_sufficient",
-    "anfis_rain_and_moisture_sufficient",
-    "anfis_cool_day_moisture_sufficient",
 }
 ANFIS_ZONE_MODEL_MIN_SAMPLES = 120
 ANFIS_CALIBRATION_SHARE = 0.18
-ANFIS_TRAINING_DATASET_VERSION = 2
+ANFIS_TRAINING_DATASET_VERSION = 4
 
 
 def load_experiment_snapshot(start_date: date, end_date: date) -> ExperimentSnapshot:
@@ -158,10 +153,11 @@ def _resolve_snapshot(
 
 
 def _resolve_anfis_training_snapshot(
+    start_date: date,
     end_date: date,
     fallback_snapshot: ExperimentSnapshot,
 ) -> ExperimentSnapshot:
-    training_start = _state_simulation_start(end_date, end_date)
+    training_start = min(start_date, _state_simulation_start(end_date, end_date))
     try:
         return load_experiment_snapshot(training_start, end_date)
     except ValueError:
@@ -169,10 +165,21 @@ def _resolve_anfis_training_snapshot(
 
 
 def _state_simulation_start(start_date: date, end_date: date) -> date:
-    anchor_date = _historical_state_anchor_date(end_date)
-    if anchor_date is None:
+    season_start = _active_season_start_date(end_date)
+    if season_start is None:
         return start_date
-    return min(start_date, anchor_date)
+
+    anchor_date = _historical_state_anchor_date(end_date)
+    warmup_start = season_start
+    if anchor_date is not None:
+        warmup_start = max(season_start, anchor_date)
+    return min(start_date, warmup_start)
+
+
+def _active_season_start_date(day: date) -> date | None:
+    if DEFAULT_IRRIGATION_POLICY.dormant_period(day):
+        return None
+    return date(day.year, 4, 1)
 
 
 def _historical_state_anchor_date(end_date: date) -> date | None:
@@ -377,11 +384,34 @@ def _sampling_moisture_chart_summary(
     return {"sample_count": sample_count, "sample_interval_rows": sample_interval_rows}
 
 
+def _strategy_comparison_baseline(
+    start_date: date,
+    end_date: date,
+    snapshot: ExperimentSnapshot,
+    baseline_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    summary = (baseline_result or {}).get("summary") or {}
+    if (
+        baseline_result is not None
+        and summary.get("baselineSensorCalibrationPolicy") == "continuous_sensor_calibration"
+    ):
+        return baseline_result
+
+    return run_default_dt_irrigation_control(
+        start_date=start_date,
+        end_date=end_date,
+        persist=False,
+        snapshot=snapshot,
+    )
+
+
 def run_default_dt_irrigation_control(
     start_date: date,
     end_date: date,
     persist: bool = False,
     snapshot: ExperimentSnapshot | None = None,
+    state_anchor_policy: str = "stable_historical_timeline",
+    sensor_calibration_policy: str = "continuous_sensor_calibration",
 ) -> dict[str, Any]:
     """Run the database-backed default DT irrigation control strategy.
 
@@ -392,12 +422,18 @@ def run_default_dt_irrigation_control(
         raise ValueError("end_date must not be before start_date")
 
     selected_snapshot = _resolve_snapshot(start_date, end_date, snapshot)
-    simulation_start_date, simulation_snapshot = _resolve_simulation_snapshot(start_date, end_date, selected_snapshot)
+    if state_anchor_policy == "experiment_start_sensor_anchor":
+        simulation_start_date = start_date
+        simulation_snapshot = selected_snapshot
+    else:
+        simulation_start_date, simulation_snapshot = _resolve_simulation_snapshot(start_date, end_date, selected_snapshot)
     weather_rows = selected_snapshot.selected_weather_rows
     pots = simulation_snapshot.pots
     zone_pots = _pots_by_valve_zone(pots)
     sensor_context = simulation_snapshot.sensor_context
     selected_sensor_context = selected_snapshot.sensor_context
+    control_pots = _sensor_control_pots(pots, sensor_context)
+    control_pot_ids = {int(pot["id"]) for pot in control_pots}
     weather_by_day = simulation_snapshot.weather_by_day
     pot_states = _copy_pot_states(simulation_snapshot.initial_pot_states)
     sensor_state_anchor = _initialize_states_from_first_day_sensor_readings(
@@ -406,6 +442,7 @@ def run_default_dt_irrigation_control(
         sensor_context,
         simulation_start_date,
     )
+    state_at_experiment_start: dict[str, dict[str, float | int]] | None = None
 
     entries = []
     detail_entries = []
@@ -418,6 +455,9 @@ def run_default_dt_irrigation_control(
     total_irrigation_decisions = 0
     current_date = simulation_start_date
     while current_date <= end_date:
+        if current_date == start_date and state_at_experiment_start is None:
+            state_at_experiment_start = _serialize_pot_states(pot_states)
+
         day_weather = weather_by_day.get(current_date, [])
         if not day_weather:
             current_date += timedelta(days=1)
@@ -451,30 +491,32 @@ def run_default_dt_irrigation_control(
                     observed_local.date(),
                     rain_exposure_factor=_rain_exposure_factor(pot, observed_local.date()),
                 )
-                _apply_sensor_calibration_marker(state, pot, current_date, observed_local, sensor_context, day_profile)
+                if sensor_calibration_policy != "initial_state_only" and int(pot["id"]) in control_pot_ids:
+                    _apply_sensor_calibration_marker(state, pot, current_date, observed_local, sensor_context, day_profile)
 
                 if slot is None:
-                    if _is_emergency_dryness(state, pot, current_date, observed_local):
+                    if int(pot["id"]) in control_pot_ids and _is_emergency_dryness(state, pot, current_date, observed_local):
                         if record_date:
                             alerts.append(_alert_row(pot, hour_weather, "emergency_dryness", "warning", "Emergency dryness outside watering window"))
                             daily_alerts += 1
                             hourly_alerts += 1
-                    continue
+            if slot is not None:
+                for pot in control_pots:
+                    state = pot_states[pot["id"]]
+                    decision = _with_sensor_key(
+                        _make_baseline_irrigation_decision(state, pot, hour_weather, day_profile, slot),
+                        pot,
+                        sensor_context,
+                    )
+                    decision = _apply_cold_month_indoor_skip(decision, pot, current_date)
+                    decision_by_pot_id[int(pot["id"])] = decision
+                    if record_date:
+                        decisions.append(decision)
+                        daily_decisions += 1
+                        hourly_decisions += 1
 
-                decision = _with_sensor_key(
-                    _make_baseline_irrigation_decision(state, pot, hour_weather, day_profile, slot),
-                    pot,
-                    sensor_context,
-                )
-                decision = _apply_cold_month_indoor_skip(decision, pot, current_date)
-                decision_by_pot_id[int(pot["id"])] = decision
-                if record_date:
-                    decisions.append(decision)
-                    daily_decisions += 1
-                    hourly_decisions += 1
-
-                if decision["should_irrigate"] and _is_valve_managed_pot(pot, current_date):
-                    zone_trigger_decisions.setdefault(pot["balcony_zone"], []).append(decision)
+                    if decision["should_irrigate"] and _is_valve_managed_pot(pot, current_date):
+                        zone_trigger_decisions.setdefault(pot["balcony_zone"], []).append(decision)
 
             snapshot_label = _daily_moisture_snapshot_label(current_date, observed_local, day_profile)
             if record_date and snapshot_label:
@@ -482,16 +524,24 @@ def run_default_dt_irrigation_control(
 
             if slot is not None:
                 for zone, trigger_decisions in zone_trigger_decisions.items():
-                    trigger_pot_ids = [int(decision["pot_id"]) for decision in trigger_decisions]
-                    trigger_pot_codes = [decision["pot_code"] for decision in trigger_decisions if decision.get("pot_code")]
+                    trigger_pot_ids = _trigger_pot_ids(trigger_decisions)
+                    trigger_sensor_ids = _trigger_sensor_ids(trigger_decisions)
+                    trigger_pot_codes = _trigger_pot_codes(trigger_decisions)
                     zone_dose_factor = _baseline_zone_dose_factor(trigger_decisions)
+                    execution_decisions = _zone_execution_decision_map(
+                        decision_by_pot_id,
+                        zone_pots,
+                        zone,
+                        current_date,
+                        trigger_decisions,
+                    )
                     zone_events = _execute_valve_zone_distribution(
                         pot_states,
                         zone_pots,
                         zone,
                         current_date,
                         hour_weather,
-                        decision_by_pot_id,
+                        execution_decisions,
                         lambda zone_pot, zone_decision: {
                             **zone_decision,
                             "should_irrigate": True,
@@ -500,10 +550,14 @@ def run_default_dt_irrigation_control(
                         DEFAULT_IRRIGATION_POLICY.irrigation_request,
                         {
                             "zone_triggered": True,
+                            "zone_trigger_sensor_ids": trigger_sensor_ids,
                             "zone_trigger_pot_ids": trigger_pot_ids,
                             "zone_trigger_pot_codes": trigger_pot_codes,
+                            "runtime_request_sensor_ids": trigger_sensor_ids,
                             "zone_dose_factor": zone_dose_factor,
                             "zone": zone,
+                            "zone_activation_policy": "sensor_pot_trigger",
+                            "zone_runtime_policy": "sensor_trigger_zone_budget_runtime",
                         },
                     )
                     for event in zone_events:
@@ -610,9 +664,11 @@ def run_default_dt_irrigation_control(
         "endDate": end_date.isoformat(),
         "stateSimulationStartDate": simulation_start_date.isoformat(),
         "stateLookbackDays": (end_date - simulation_start_date).days + 1,
-        "stateAnchorPolicy": "stable_historical_timeline",
+        "stateAnchorPolicy": state_anchor_policy,
+        "baselineSensorCalibrationPolicy": sensor_calibration_policy,
         "source": _experiment_source(selected_sensor_context),
     }
+    summary.update(_sensor_control_summary_fields(pots, selected_sensor_context))
     if sensor_state_anchor is not None:
         summary["stateSensorAnchor"] = sensor_state_anchor
     summary.update(_sensor_summary_fields(selected_sensor_context))
@@ -632,6 +688,7 @@ def run_default_dt_irrigation_control(
         "samplePotDecisions": decisions[:200],
         "samplePotEvents": events[:200],
         "sampleAlerts": alerts[:200],
+        "stateAtExperimentStart": state_at_experiment_start or _serialize_pot_states(pot_states),
     }
 
 
@@ -665,6 +722,7 @@ def run_daily_sampling_experiment(
         sample_interval_hours=sample_interval_hours,
         persist=persist,
         snapshot=snapshot,
+        baseline_result=baseline,
     )
 
     comparison = _ExperimentComparison(start_date, end_date, snapshot, baseline, sparse, "sparse", "sparse_water_usage_l")
@@ -763,6 +821,12 @@ def run_daily_sampling_experiment(
             "stateLookbackDays",
             baseline_summary.get("stateLookbackDays"),
         ),
+        "stateAnchorPolicy": sparse_summary.get("stateAnchorPolicy"),
+        "samplingWarmupReusePolicy": sparse_summary.get("samplingWarmupReusePolicy"),
+        "baselineWarmupStateSimulationStartDate": sparse_summary.get(
+            "baselineWarmupStateSimulationStartDate",
+        ),
+        "baselineWarmupStateLookbackDays": sparse_summary.get("baselineWarmupStateLookbackDays"),
         "source": baseline_summary.get("source", "database-weather-and-pot-inventory"),
     }
     summary.update(comparison.sensor_summary())
@@ -788,12 +852,7 @@ def run_daily_fuzzy_dt_experiment(
 
     start_time = perf_time.perf_counter()
     snapshot = _resolve_snapshot(start_date, end_date, snapshot)
-    baseline = baseline_result or run_default_dt_irrigation_control(
-        start_date=start_date,
-        end_date=end_date,
-        persist=False,
-        snapshot=snapshot,
-    )
+    baseline = _strategy_comparison_baseline(start_date, end_date, snapshot, baseline_result)
     fuzzy = _run_fuzzy_dt_daily_irrigation(
         start_date=start_date,
         end_date=end_date,
@@ -818,7 +877,32 @@ def run_daily_fuzzy_dt_experiment(
     entries = comparison.daily_entries(fuzzy_row)
     chart_entries = comparison.chart_entries(fuzzy_row)
     totals = comparison.total_usage_counts(entries)
+    baseline_agreement_matches = sum(
+        1
+        for entry in entries
+        if entry["baseline_irrigation_active"] == entry["fuzzy_irrigation_active"]
+    )
+    baseline_mismatch_days = len(entries) - baseline_agreement_matches
+    baseline_only_irrigation_days = [
+        entry
+        for entry in entries
+        if entry["baseline_irrigation_active"] and not entry["fuzzy_irrigation_active"]
+    ]
+    fuzzy_only_irrigation_days = [
+        entry
+        for entry in entries
+        if entry["fuzzy_irrigation_active"] and not entry["baseline_irrigation_active"]
+    ]
+    missed_valve_run_delta = sum(
+        max(0, int(entry["baseline_valve_runs"] or 0) - int(entry["fuzzy_valve_runs"] or 0))
+        for entry in entries
+    )
+    fuzzy_extra_valve_run_delta = sum(
+        max(0, int(entry["fuzzy_valve_runs"] or 0) - int(entry["baseline_valve_runs"] or 0))
+        for entry in entries
+    )
     fuzzy_summary = fuzzy["summary"]
+    control_pots = _sensor_control_pots(snapshot.pots, snapshot.sensor_context)
     baseline_water = float(totals["baseline_total_water_usage_l"])
     fuzzy_water = float(totals["fuzzy_total_water_usage_l"])
     water_savings_l = baseline_water - fuzzy_water
@@ -826,27 +910,54 @@ def run_daily_fuzzy_dt_experiment(
     comfort_metrics = _moisture_safe_savings_metrics(
         entries,
         "fuzzy",
-        snapshot.pots,
+        control_pots,
         water_savings_percent,
-        comfort_threshold_pct=_fuzzy_comfort_threshold_pct(snapshot.pots),
+        comfort_threshold_pct=_fuzzy_comfort_threshold_pct(control_pots),
     )
     summary = {
         **comparison.base_summary(entries),
         **comparison.irrigation_day_counts(entries),
         **totals,
         **comparison.decision_counts(),
+        "baseline_agreement_percent": round(baseline_agreement_matches / max(len(entries), 1) * 100.0, 2),
+        "baseline_mismatch_days": baseline_mismatch_days,
+        "baseline_only_irrigation_days": len(baseline_only_irrigation_days),
+        "fuzzy_only_irrigation_days": len(fuzzy_only_irrigation_days),
+        "missed_valve_run_delta": missed_valve_run_delta,
+        "fuzzy_extra_valve_run_delta": fuzzy_extra_valve_run_delta,
         "water_savings_l": round(water_savings_l, 2),
         "water_savings_percent": water_savings_percent,
         **comfort_metrics,
         "average_prescription_mm": fuzzy_summary.get("averagePrescriptionMm", 0.0),
         "fuzzyDataPolicy": fuzzy_summary.get("fuzzyDataPolicy", "daily-fis-prescription"),
         "fuzzyControllerPolicy": fuzzy_summary.get("fuzzyControllerPolicy", "fuzzy_dt_prescription_control"),
-        "fuzzyDecisionPolicy": fuzzy_summary.get("fuzzyDecisionPolicy", "owned_fuzzy_timing_threshold_skip_prescription"),
+        "fuzzyDecisionPolicy": fuzzy_summary.get("fuzzyDecisionPolicy", "daily_zone_prescription_control"),
+        "fuzzyActuationPolicy": fuzzy_summary.get("fuzzyActuationPolicy", FUZZY_ACTUATION_POLICY.summary()),
+        "fuzzySensorCalibrationPolicy": fuzzy_summary.get("fuzzySensorCalibrationPolicy", "initial_state_only"),
+        "controllerInputPolicy": fuzzy_summary.get("controllerInputPolicy"),
+        "sensorDecisionPotCount": fuzzy_summary.get("sensorDecisionPotCount"),
+        "sensorThresholdPolicy": fuzzy_summary.get("sensorThresholdPolicy"),
         "comparisonBaseline": "default_dt_threshold_control",
+        "comparisonBaselineStateAnchorPolicy": baseline.get("summary", {}).get("stateAnchorPolicy"),
+        "comparisonBaselineSensorCalibrationPolicy": baseline.get("summary", {}).get("baselineSensorCalibrationPolicy"),
+        "comparisonBaselineStateSimulationStartDate": baseline.get("summary", {}).get("stateSimulationStartDate"),
+        "comparisonBaselineStateLookbackDays": baseline.get("summary", {}).get("stateLookbackDays"),
         "decisionLevel": "valve_zone",
         "execution_time_seconds": round(perf_time.perf_counter() - start_time, 3),
         "startDate": start_date.isoformat(),
         "endDate": end_date.isoformat(),
+        "stateSimulationStartDate": fuzzy_summary.get(
+            "stateSimulationStartDate",
+            baseline.get("summary", {}).get("stateSimulationStartDate"),
+        ),
+        "stateLookbackDays": fuzzy_summary.get(
+            "stateLookbackDays",
+            baseline.get("summary", {}).get("stateLookbackDays"),
+        ),
+        "stateAnchorPolicy": fuzzy_summary.get(
+            "stateAnchorPolicy",
+            baseline.get("summary", {}).get("stateAnchorPolicy"),
+        ),
         "source": comparison.baseline_summary.get("source", "database-weather-and-pot-inventory"),
     }
     summary.update(comparison.sensor_summary())
@@ -863,7 +974,7 @@ def train_anfis_model_for_experiment(
 ) -> AnfisTrainingResult:
     """Train and evaluate the ANFIS controller from database sensor/weather examples."""
     selected_snapshot = _resolve_snapshot(start_date, end_date, snapshot)
-    training_snapshot = _resolve_anfis_training_snapshot(end_date, selected_snapshot)
+    training_snapshot = _resolve_anfis_training_snapshot(start_date, end_date, selected_snapshot)
     anfis_dataset = _generate_database_anfis_dataset(
         training_snapshot.selected_weather_rows,
         training_snapshot.pots,
@@ -904,6 +1015,7 @@ def train_anfis_model_for_experiment(
         "training_lookback_days": (training_snapshot.end_date - training_snapshot.start_date).days + 1,
         "training_history_days": (training_snapshot.end_date - training_snapshot.start_date).days + 1,
         "training_signals": _anfis_training_signal_summary(train_dataset),
+        "anfis_input_features": list(model.global_model.input_names),
         "evaluation": evaluation,
     }
     return AnfisTrainingResult(model=model, evaluation=evaluation, metadata=metadata)
@@ -964,12 +1076,7 @@ def run_daily_anfis_experiment(
         "forecast_water_saving_margin": ANFIS_WATER_SAVING_POLICY.forecast_decision_margin,
     }
 
-    baseline = baseline_result or run_default_dt_irrigation_control(
-        start_date=start_date,
-        end_date=end_date,
-        persist=False,
-        snapshot=snapshot,
-    )
+    baseline = _strategy_comparison_baseline(start_date, end_date, snapshot, baseline_result)
     anfis = _run_anfis_daily_irrigation(
         start_date=start_date,
         end_date=end_date,
@@ -1025,16 +1132,47 @@ def run_daily_anfis_experiment(
     pred_prob_max = round(max(predicted_probabilities), 4) if predicted_probabilities else 0.0
 
     anfis_summary = comparison.comparison_summary
+    control_pots = _sensor_control_pots(snapshot.pots, snapshot.sensor_context)
     totals = comparison.total_usage_counts(entries)
+    baseline_agreement_matches = sum(
+        1
+        for entry in entries
+        if entry["baseline_irrigation_active"] == entry["anfis_irrigation_active"]
+    )
+    baseline_mismatch_days = len(entries) - baseline_agreement_matches
+    baseline_only_irrigation_days = [
+        entry
+        for entry in entries
+        if entry["baseline_irrigation_active"] and not entry["anfis_irrigation_active"]
+    ]
+    anfis_only_irrigation_days = [
+        entry
+        for entry in entries
+        if entry["anfis_irrigation_active"] and not entry["baseline_irrigation_active"]
+    ]
+    missed_valve_run_delta = sum(
+        max(0, int(entry["baseline_valve_runs"] or 0) - int(entry["anfis_valve_runs"] or 0))
+        for entry in entries
+    )
+    anfis_extra_valve_run_delta = sum(
+        max(0, int(entry["anfis_valve_runs"] or 0) - int(entry["baseline_valve_runs"] or 0))
+        for entry in entries
+    )
     baseline_water = float(totals["baseline_total_water_usage_l"])
     anfis_water = float(totals["anfis_total_water_usage_l"])
     water_savings_l = baseline_water - anfis_water
     water_savings_percent = round(water_savings_l / baseline_water * 100.0, 2) if baseline_water > 0 else 0.0
-    comfort_metrics = _moisture_safe_savings_metrics(entries, "anfis", snapshot.pots, water_savings_percent)
+    comfort_metrics = _moisture_safe_savings_metrics(entries, "anfis", control_pots, water_savings_percent)
     summary = {
         **comparison.base_summary(entries),
         **comparison.irrigation_day_counts(entries),
         **totals,
+        "baseline_agreement_percent": round(baseline_agreement_matches / max(len(entries), 1) * 100.0, 2),
+        "baseline_mismatch_days": baseline_mismatch_days,
+        "baseline_only_irrigation_days": len(baseline_only_irrigation_days),
+        "anfis_only_irrigation_days": len(anfis_only_irrigation_days),
+        "missed_valve_run_delta": missed_valve_run_delta,
+        "anfis_extra_valve_run_delta": anfis_extra_valve_run_delta,
         "water_savings_l": round(water_savings_l, 2),
         "water_savings_percent": water_savings_percent,
         **comfort_metrics,
@@ -1057,12 +1195,22 @@ def run_daily_anfis_experiment(
         "anfisModelId": training.get("model_id"),
         "anfisModelTrainedAt": training.get("trained_at"),
         "anfisTrainingSignals": training.get("training_signals", {}),
-        "anfisTrainingTarget": "recorded-sensor-readings-moisture-temperature-effective-rain-probability",
+        "anfisTrainingTarget": (
+            "recorded-sensor-readings-moisture-temperature-effective-rain-probability"
+        ),
         "anfisProbabilityCalibration": model.summary(),
         "anfisWaterSavingPolicy": ANFIS_WATER_SAVING_POLICY.summary(
             ANFIS_DECISION_THRESHOLD,
             ANFIS_FORECAST_DECISION_THRESHOLD,
         ),
+        "anfisSensorCalibrationPolicy": anfis_summary.get("anfisSensorCalibrationPolicy", "initial_state_only"),
+        "controllerInputPolicy": anfis_summary.get("controllerInputPolicy"),
+        "sensorDecisionPotCount": anfis_summary.get("sensorDecisionPotCount"),
+        "sensorThresholdPolicy": anfis_summary.get("sensorThresholdPolicy"),
+        "comparisonBaselineStateAnchorPolicy": baseline.get("summary", {}).get("stateAnchorPolicy"),
+        "comparisonBaselineSensorCalibrationPolicy": baseline.get("summary", {}).get("baselineSensorCalibrationPolicy"),
+        "comparisonBaselineStateSimulationStartDate": baseline.get("summary", {}).get("stateSimulationStartDate"),
+        "comparisonBaselineStateLookbackDays": baseline.get("summary", {}).get("stateLookbackDays"),
         "anfisRainInputPolicy": "pot_effective_rain_by_rain_exposure",
         "anfisInputFeatures": model.global_model.input_names,
         "anfisOptimizer": "genetic-algorithm",
@@ -1233,15 +1381,48 @@ def _execute_valve_zone_distribution(
         request_event.update(public_event_metadata)
         request_items.append((zone_pot, pot_states[int(zone_pot["id"])], request_event))
 
+    runtime_request_sensor_ids = {
+        int(sensor_id)
+        for sensor_id in event_metadata.get("runtime_request_sensor_ids", [])
+    }
+    runtime_request_pot_ids = {
+        int(pot_id)
+        for pot_id in event_metadata.get("runtime_request_pot_ids", [])
+    }
+    if runtime_request_sensor_ids:
+        runtime_request_items = [
+            item
+            for item in request_items
+            if int(item[2].get("request_sensor_id", item[2].get("sensor_id", item[0]["id"]))) in runtime_request_sensor_ids
+            and int(item[2].get("associated_pot_id", item[0]["id"])) == int(item[0]["id"])
+            and int(item[2].get("sensor_id", item[0]["id"])) == int(item[0]["id"])
+        ]
+    elif runtime_request_pot_ids:
+        runtime_request_items = [
+            item
+            for item in request_items
+            if int(item[0]["id"]) in runtime_request_pot_ids
+        ]
+    else:
+        runtime_request_items = request_items
+    if (runtime_request_sensor_ids or runtime_request_pot_ids) and not runtime_request_items:
+        runtime_request_items = request_items
+
     total_requested_ml = sum(float(event.get("requested_volume_ml", event.get("planned_volume_ml", 0.0)) or 0.0) for _, _, event in request_items)
     total_flow_ml_min = sum(float(event.get("flow_rate_ml_min") or 0.0) for _, _, event in request_items)
-    if total_requested_ml <= 0.0 or total_flow_ml_min <= 0.0:
+    runtime_requested_ml = sum(
+        float(event.get("requested_volume_ml", event.get("planned_volume_ml", 0.0)) or 0.0)
+        for _, _, event in runtime_request_items
+    )
+    runtime_request_flow_ml_min = sum(float(event.get("flow_rate_ml_min") or 0.0) for _, _, event in runtime_request_items)
+    runtime_flow_ml_min = runtime_request_flow_ml_min if runtime_request_sensor_ids else total_flow_ml_min
+    if runtime_requested_ml <= 0.0 or runtime_flow_ml_min <= 0.0 or total_flow_ml_min <= 0.0:
         return []
 
-    runtime_min = total_requested_ml / total_flow_ml_min
+    runtime_min = runtime_requested_ml / runtime_flow_ml_min
     if runtime_min < minimum_runtime_min:
         return []
-    delivered_total_ml = total_requested_ml
+    delivered_total_ml = total_flow_ml_min * runtime_min
     events = []
     for zone_pot, state, event in request_items:
         flow_rate = max(float(event.get("flow_rate_ml_min") or zone_pot["drip_flow_ml_min"]), 1.0)
@@ -1249,6 +1430,11 @@ def _execute_valve_zone_distribution(
         event.update(
             {
                 "zone_requested_volume_ml": round(total_requested_ml, 2),
+                "zone_runtime_requested_volume_ml": round(runtime_requested_ml, 2),
+                "zone_runtime_request_flow_ml_min": round(runtime_request_flow_ml_min, 2),
+                "zone_runtime_request_sensor_ids": sorted(runtime_request_sensor_ids),
+                "zone_runtime_request_pot_ids": [int(item[0]["id"]) for item in runtime_request_items],
+                "zone_runtime_flow_ml_min": round(runtime_flow_ml_min, 2),
                 "zone_delivered_volume_ml": round(delivered_total_ml, 2),
                 "zone_total_flow_ml_min": round(total_flow_ml_min, 2),
                 "valve_runtime_min": round(runtime_min, 3),
@@ -1337,6 +1523,21 @@ def _baseline_zone_dose_factor(trigger_decisions: list[dict[str, Any]]) -> float
     return max((float(decision.get("dose_factor") or 1.0) for decision in trigger_decisions), default=1.0)
 
 
+def _trigger_pot_ids(trigger_decisions: list[dict[str, Any]]) -> list[int]:
+    return [int(decision["pot_id"]) for decision in trigger_decisions]
+
+
+def _trigger_sensor_ids(trigger_decisions: list[dict[str, Any]]) -> list[int]:
+    return sorted({
+        int(decision.get("sensor_id", decision["pot_id"]))
+        for decision in trigger_decisions
+    })
+
+
+def _trigger_pot_codes(trigger_decisions: list[dict[str, Any]]) -> list[str]:
+    return [decision["pot_code"] for decision in trigger_decisions if decision.get("pot_code")]
+
+
 def _sparse_zone_dose_factor(
     trigger_decisions: list[dict[str, Any]],
     sample_interval_hours: int,
@@ -1365,6 +1566,7 @@ def _valve_decision_from_group(
     valve_number = _valve_number_for_zone(zone)
     managed = _valve_managed_zone_pots(zone_pots, zone, date.fromisoformat(decision_date))
     trigger_pot_ids = [int(decision["pot_id"]) for decision in should]
+    trigger_sensor_ids = _trigger_sensor_ids(should)
     trigger_pot_codes = [decision.get("pot_code") for decision in should if decision.get("pot_code")]
     affected_pot_ids = [int(pot["id"]) for pot in managed] if should else []
     affected_pot_codes = [pot["pot_code"] for pot in managed] if should else []
@@ -1393,10 +1595,36 @@ def _valve_decision_from_group(
         "affected_pot_codes": affected_pot_codes,
         "trigger_pots": len(trigger_pot_ids),
         "trigger_pot_ids": trigger_pot_ids,
+        "trigger_sensor_ids": trigger_sensor_ids,
         "trigger_pot_codes": trigger_pot_codes,
         "priority_score": round(priority, 2),
         "decision_level": "valve_zone",
     }
+
+
+def _average_event_field(group: list[dict[str, Any]], field: str) -> float | None:
+    values = [
+        float(event[field])
+        for event in group
+        if event.get(field) is not None
+    ]
+    if not values:
+        return None
+    return round(sum(values) / len(values), 2)
+
+
+def _weighted_average_event_field(group: list[dict[str, Any]], field: str, weight_field: str = "affected_pots") -> float | None:
+    weighted_total = 0.0
+    weight_total = 0.0
+    for event in group:
+        if event.get(field) is None:
+            continue
+        weight = max(float(event.get(weight_field) or 1.0), 1.0)
+        weighted_total += float(event[field]) * weight
+        weight_total += weight
+    if weight_total <= 0.0:
+        return None
+    return round(weighted_total / weight_total, 2)
 
 
 def _valve_event_from_group(
@@ -1428,6 +1656,11 @@ def _valve_event_from_group(
         for event in group
         for pot_id in event.get("zone_trigger_pot_ids", [])
     })
+    trigger_sensor_ids = sorted({
+        int(sensor_id)
+        for event in group
+        for sensor_id in event.get("zone_trigger_sensor_ids", event.get("zone_trigger_pot_ids", []))
+    })
     trigger_pot_codes = [
         pot_by_id[pot_id]["pot_code"]
         for pot_id in trigger_pot_ids
@@ -1450,6 +1683,9 @@ def _valve_event_from_group(
         "delivered_volume_ml": round(delivered_volume, 2),
         "delivered_volume_l": round(delivered_volume / 1000.0, 3),
         "delivery_error_ml": round(delivered_volume - requested_volume, 2),
+        "affected_pre_moisture_pct": _average_event_field(group, "pre_delivery_moisture_pct"),
+        "affected_post_moisture_pct": _average_event_field(group, "post_delivery_moisture_pct"),
+        "affected_moisture_gain_pct": _average_event_field(group, "delivery_moisture_gain_pct"),
         "duration_min": round(duration_min, 1),
         "physical_distribution_policy": "valve_runtime_x_pot_drip_flow",
         "per_pot_distribution": _valve_pot_distribution(group),
@@ -1461,6 +1697,7 @@ def _valve_event_from_group(
         "affected_pot_codes": [pot["pot_code"] for pot in affected_pots],
         "trigger_pots": len(trigger_pot_ids),
         "trigger_pot_ids": trigger_pot_ids,
+        "trigger_sensor_ids": trigger_sensor_ids,
         "trigger_pot_codes": trigger_pot_codes,
         "priority_rank": 0 if any(event.get("priority_rank") == 0 for event in group) else 1,
         "priority_score": round(priority, 2),
@@ -1469,9 +1706,12 @@ def _valve_event_from_group(
 
 
 def _valve_pot_distribution(group: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
+    distribution = []
+    for event in sorted(group, key=lambda item: int(item["pot_id"])):
+        row = {
             "pot_id": int(event["pot_id"]),
+            "sensor_id": int(event.get("sensor_id", event["pot_id"])),
+            "request_sensor_id": int(event.get("request_sensor_id", event.get("sensor_id", event["pot_id"]))),
             "pot_code": event.get("pot_code"),
             "flow_rate_ml_min": round(float(event.get("flow_rate_ml_min") or 0.0), 2),
             "requested_volume_ml": round(float(event.get("requested_volume_ml", event.get("planned_volume_ml", 0.0)) or 0.0), 2),
@@ -1479,8 +1719,14 @@ def _valve_pot_distribution(group: list[dict[str, Any]]) -> list[dict[str, Any]]
             "delivery_error_ml": round(float(event.get("delivery_error_ml") or 0.0), 2),
             "delivery_ratio": event.get("delivery_ratio"),
         }
-        for event in sorted(group, key=lambda item: int(item["pot_id"]))
-    ]
+        if event.get("pre_delivery_moisture_pct") is not None:
+            row["pre_delivery_moisture_pct"] = round(float(event["pre_delivery_moisture_pct"]), 2)
+        if event.get("post_delivery_moisture_pct") is not None:
+            row["post_delivery_moisture_pct"] = round(float(event["post_delivery_moisture_pct"]), 2)
+        if event.get("delivery_moisture_gain_pct") is not None:
+            row["delivery_moisture_gain_pct"] = round(float(event["delivery_moisture_gain_pct"]), 2)
+        distribution.append(row)
+    return distribution
 
 
 def _apply_valve_counts(entries: list[dict[str, Any]], rollup: dict[str, list[dict[str, Any]]], hourly: bool) -> None:
@@ -1513,6 +1759,15 @@ def _apply_valve_counts(entries: list[dict[str, Any]], rollup: dict[str, list[di
                 sum(float(event.get("planned_volume_ml") or 0.0) for event in entry_events) / 1000.0,
                 2,
             )
+            irrigated_pre_moisture = _weighted_average_event_field(entry_events, "affected_pre_moisture_pct")
+            irrigated_post_moisture = _weighted_average_event_field(entry_events, "affected_post_moisture_pct")
+            irrigated_gain = _weighted_average_event_field(entry_events, "affected_moisture_gain_pct")
+            if irrigated_pre_moisture is not None:
+                entry["irrigated_pre_moisture"] = irrigated_pre_moisture
+            if irrigated_post_moisture is not None:
+                entry["irrigated_post_moisture"] = irrigated_post_moisture
+            if irrigated_gain is not None:
+                entry["irrigated_moisture_gain"] = irrigated_gain
 
 
 def _comparison_window_fields(prefix: str, entry: dict[str, Any]) -> dict[str, Any]:
@@ -1533,6 +1788,12 @@ def _comparison_window_fields(prefix: str, entry: dict[str, Any]) -> dict[str, A
         fields[f"{prefix}_pre_irrigation_moisture"] = entry["pre_irrigation_moisture"]
     if entry.get("post_irrigation_moisture") is not None:
         fields[f"{prefix}_post_irrigation_moisture"] = entry["post_irrigation_moisture"]
+    if entry.get("irrigated_pre_moisture") is not None:
+        fields[f"{prefix}_irrigated_pre_moisture"] = entry["irrigated_pre_moisture"]
+    if entry.get("irrigated_post_moisture") is not None:
+        fields[f"{prefix}_irrigated_post_moisture"] = entry["irrigated_post_moisture"]
+    if entry.get("irrigated_moisture_gain") is not None:
+        fields[f"{prefix}_irrigated_moisture_gain"] = entry["irrigated_moisture_gain"]
     return fields
 
 
@@ -1638,6 +1899,19 @@ def _result_pot_usage_l(result: dict[str, Any], field: str = "period_water_usage
         if pot_id is not None:
             usage[int(pot_id)] = float(pot.get(field, 0.0))
     return usage
+
+
+def _average_moisture_from_state_payload(payload: Any) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    moistures = [
+        float(item["moisture"])
+        for item in payload.values()
+        if isinstance(item, dict) and item.get("moisture") is not None
+    ]
+    if not moistures:
+        return None
+    return round(sum(moistures) / len(moistures), 2)
 
 
 def _comparison_pot_info_entries(
@@ -1754,12 +2028,17 @@ class _ExperimentComparison:
         self.baseline_summary = baseline["summary"]
         self.comparison_summary = comparison["summary"]
         self._baseline_by_date = {entry["date"]: entry for entry in baseline["entries"]}
+        self.shared_initial_moisture = _average_moisture_from_state_payload(
+            baseline.get("stateAtExperimentStart")
+        )
 
     def daily_entries(self, row_builder) -> list[dict[str, Any]]:
-        return self._aligned_rows(
-            self.comparison["entries"],
-            self._baseline_by_date,
-            row_builder,
+        return self._align_first_row_to_shared_initial_moisture(
+            self._aligned_rows(
+                self.comparison["entries"],
+                self._baseline_by_date,
+                row_builder,
+            )
         )
 
     def chart_entries(self, row_builder) -> list[dict[str, Any]]:
@@ -1767,12 +2046,14 @@ class _ExperimentComparison:
             entry["timestamp"]: entry
             for entry in self.baseline.get("chartEntries", self.baseline["entries"])
         }
-        return self._aligned_rows(
-            self.comparison.get("chartEntries", self.comparison["entries"]),
-            baseline_by_timestamp,
-            row_builder,
-            fallback_lookup=self._baseline_by_date,
-            lookup_key="timestamp",
+        return self._align_first_row_to_shared_initial_moisture(
+            self._aligned_rows(
+                self.comparison.get("chartEntries", self.comparison["entries"]),
+                baseline_by_timestamp,
+                row_builder,
+                fallback_lookup=self._baseline_by_date,
+                lookup_key="timestamp",
+            )
         )
 
     def row(
@@ -1853,12 +2134,23 @@ class _ExperimentComparison:
         allowed = keys or self.SENSOR_SUMMARY_KEYS
         return {key: self.baseline_summary[key] for key in allowed if key in self.baseline_summary}
 
+    def shared_initial_summary(self) -> dict[str, Any]:
+        if self.shared_initial_moisture is None:
+            return {
+                "firstPointAlignmentPolicy": "unavailable",
+            }
+        return {
+            "firstPointAlignmentPolicy": "shared_experiment_start_state",
+            "sharedInitialMoisture": self.shared_initial_moisture,
+        }
+
     def payload(
         self,
         entries: list[dict[str, Any]],
         chart_entries: list[dict[str, Any]],
         summary: dict[str, Any],
     ) -> dict[str, Any]:
+        summary.update(self.shared_initial_summary())
         _add_chart_summary(summary, chart_entries, self.start_date, self.end_date)
         return {
             "entries": entries,
@@ -1894,6 +2186,21 @@ class _ExperimentComparison:
     @staticmethod
     def valve_run_total(entries: list[dict[str, Any]], prefix: str) -> int:
         return sum(int(entry.get(f"{prefix}_valve_runs") or 0) for entry in entries)
+
+    def _align_first_row_to_shared_initial_moisture(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not rows or self.shared_initial_moisture is None:
+            return rows
+        first = rows[0]
+        if first.get("date") != self.start_date.isoformat():
+            return rows
+        aligned = dict(first)
+        aligned["baseline_moisture"] = self.shared_initial_moisture
+        aligned[f"{self.prefix}_moisture"] = self.shared_initial_moisture
+        aligned["shared_initial_moisture"] = self.shared_initial_moisture
+        aligned["first_point_alignment_policy"] = "shared_experiment_start_state"
+        if "moisture" in aligned:
+            aligned["moisture"] = self.shared_initial_moisture
+        return [aligned, *rows[1:]]
 
     @staticmethod
     def _aligned_rows(
@@ -1968,13 +2275,189 @@ def _with_sensor_associations(sensor_context: dict[str, Any], pots: list[dict[st
     enriched["associations"] = associations
     enriched["sensor_pots"] = {int(pot["id"]): pot for pot in sensor_pots}
     enriched["associated_pot_count"] = len([item for item in associations.values() if not item["direct"]])
+    sensor_thresholds = _load_sensor_threshold_overrides(sensor_ids)
+    if sensor_context.get("sensor_thresholds"):
+        sensor_thresholds.update(sensor_context["sensor_thresholds"])
+    if sensor_thresholds:
+        enriched["sensor_thresholds"] = sensor_thresholds
     return enriched
+
+
+def _sensor_control_ids(sensor_context: dict[str, Any] | None, pots: list[dict[str, Any]]) -> set[int]:
+    pot_ids = {int(pot["id"]) for pot in pots}
+    sensor_ids = {
+        int(sensor_id)
+        for sensor_id in (sensor_context or {}).get("sensor_ids", [])
+        if int(sensor_id) in pot_ids
+    }
+    if sensor_ids:
+        return sensor_ids
+
+    sensor_pots = (sensor_context or {}).get("sensor_pots") or {}
+    sensor_ids = {int(sensor_id) for sensor_id in sensor_pots if int(sensor_id) in pot_ids}
+    if sensor_ids:
+        return sensor_ids
+
+    return set(pot_ids)
+
+
+def _sensor_control_pots(pots: list[dict[str, Any]], sensor_context: dict[str, Any] | None) -> list[dict[str, Any]]:
+    control_ids = _sensor_control_ids(sensor_context, pots)
+    return [
+        _sensor_control_pot(pot, sensor_context)
+        for pot in pots
+        if int(pot["id"]) in control_ids
+    ]
+
+
+def _sensor_control_pot(pot: dict[str, Any], sensor_context: dict[str, Any] | None) -> dict[str, Any]:
+    overrides = _sensor_threshold_overrides(sensor_context, int(pot["id"]))
+    if not overrides:
+        return pot
+
+    enriched = dict(pot)
+    enriched.update(overrides)
+    enriched["sensor_threshold_override"] = dict(overrides)
+    return enriched
+
+
+def _sensor_threshold_overrides(sensor_context: dict[str, Any] | None, sensor_id: int) -> dict[str, float]:
+    if not sensor_context:
+        return {}
+
+    raw_configs = (
+        sensor_context.get("sensor_thresholds")
+        or sensor_context.get("sensor_comfort_thresholds")
+        or sensor_context.get("sensor_configs")
+        or {}
+    )
+    raw_config = raw_configs.get(sensor_id) or raw_configs.get(str(sensor_id)) or {}
+    if not isinstance(raw_config, dict):
+        return {}
+
+    return _normalize_sensor_threshold_config(raw_config)
+
+
+def _normalize_sensor_threshold_config(raw_config: dict[str, Any]) -> dict[str, float]:
+    aliases = {
+        "moisture_min_pct": "moisture_min_pct",
+        "minimum_moisture_pct": "moisture_min_pct",
+        "min_moisture_pct": "moisture_min_pct",
+        "moisture_target_pct": "moisture_target_pct",
+        "target_moisture_pct": "moisture_target_pct",
+        "comfort_threshold_pct": "moisture_target_pct",
+        "moisture_max_pct": "moisture_max_pct",
+        "maximum_moisture_pct": "moisture_max_pct",
+        "max_moisture_pct": "moisture_max_pct",
+        "winter_moisture_target_pct": "winter_moisture_target_pct",
+        "winter_comfort_threshold_pct": "winter_moisture_target_pct",
+    }
+    overrides: dict[str, float] = {}
+    for source_key, target_key in aliases.items():
+        if source_key not in raw_config:
+            continue
+        value = _number(raw_config.get(source_key), None)
+        if value is None:
+            continue
+        overrides[target_key] = round(_clamp(value, 0.0, 100.0), 2)
+    return overrides
+
+
+def _load_sensor_threshold_overrides(sensor_ids: set[int]) -> dict[int, dict[str, float]]:
+    if not sensor_ids:
+        return {}
+    try:
+        with get_connection(row_factory=dict_row) as conn:
+            rows = conn.execute(
+                """
+                SELECT pot_id, criteria
+                FROM sensor_location_recommendations
+                WHERE pot_id = ANY(%(sensor_ids)s)
+                """,
+                {"sensor_ids": list(sensor_ids)},
+            ).fetchall()
+    except Exception:
+        return {}
+
+    thresholds: dict[int, dict[str, float]] = {}
+    for row in rows:
+        criteria = row.get("criteria") or {}
+        if not isinstance(criteria, dict):
+            continue
+        overrides = _normalize_sensor_threshold_config(criteria)
+        if overrides:
+            thresholds[int(row["pot_id"])] = overrides
+    return thresholds
+
+
+def _sensor_control_summary_fields(
+    pots: list[dict[str, Any]],
+    sensor_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    control_ids = _sensor_control_ids(sensor_context, pots)
+    configured = bool(
+        (sensor_context or {}).get("sensor_thresholds")
+        or (sensor_context or {}).get("sensor_comfort_thresholds")
+        or (sensor_context or {}).get("sensor_configs")
+    )
+    return {
+        "controllerInputPolicy": "sensor_locations_only",
+        "sensorDecisionPotCount": len(control_ids),
+        "sensorThresholdPolicy": (
+            "sensor_configurable_thresholds" if configured else "sensor_location_pot_thresholds"
+        ),
+    }
+
+
+def _zone_execution_decision_map(
+    decision_by_pot_id: dict[int, dict[str, Any]],
+    zone_pots: dict[str, list[dict[str, Any]]],
+    zone: str,
+    current_date: date,
+    trigger_decisions: list[dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    execution_decisions = dict(decision_by_pot_id)
+    if not trigger_decisions:
+        return execution_decisions
+
+    template = max(
+        trigger_decisions,
+        key=lambda decision: float(decision.get("priority_score") or decision.get("predicted_probability") or 0.0),
+    )
+    source_pot_id = int(template["pot_id"])
+    source_sensor_id = int(template.get("sensor_id", source_pot_id))
+    for zone_pot in _valve_managed_zone_pots(zone_pots, zone, current_date):
+        pot_id = int(zone_pot["id"])
+        if pot_id in execution_decisions:
+            continue
+        passive = dict(template)
+        passive["pot_id"] = pot_id
+        passive["pot_code"] = zone_pot.get("pot_code")
+        passive["sensor_id"] = source_sensor_id
+        if source_sensor_id != pot_id:
+            passive["associated_pot_id"] = pot_id
+        else:
+            passive.pop("associated_pot_id", None)
+        passive["should_irrigate"] = False
+        passive["reason_code"] = "valve_zone_passive_delivery"
+        passive["reason_detail"] = (
+            f"Valve zone {zone} is controlled by sensor pot {template.get('pot_code') or source_pot_id}; "
+            "this pot receives physical valve delivery but is not used as an independent decision input."
+        )
+        passive["controller_source_pot_id"] = source_pot_id
+        passive["controller_source_sensor_id"] = source_sensor_id
+        passive["controller_input_policy"] = "sensor_locations_only"
+        execution_decisions[pot_id] = passive
+    return execution_decisions
 
 
 def _with_sensor_key(record: dict[str, Any], pot: dict[str, Any], sensor_context: dict[str, Any]) -> dict[str, Any]:
     sensor_id = _sensor_id_for_pot(sensor_context, pot)
     enriched = dict(record)
     enriched["sensor_id"] = sensor_id
+    threshold_overrides = _sensor_threshold_overrides(sensor_context, sensor_id)
+    if threshold_overrides:
+        enriched["sensor_threshold_override"] = dict(threshold_overrides)
     if sensor_id != int(pot["id"]):
         enriched["associated_pot_id"] = int(pot["id"])
     return enriched
@@ -1982,7 +2465,9 @@ def _with_sensor_key(record: dict[str, Any], pot: dict[str, Any], sensor_context
 
 def _with_event_sensor_key(event: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
     enriched = dict(event)
-    enriched["sensor_id"] = int(decision.get("sensor_id", event["pot_id"]))
+    sensor_id = int(decision.get("sensor_id", event["pot_id"]))
+    enriched["sensor_id"] = sensor_id
+    enriched["request_sensor_id"] = sensor_id
     if decision.get("associated_pot_id") is not None:
         enriched["associated_pot_id"] = int(decision["associated_pot_id"])
     return enriched
@@ -2346,7 +2831,7 @@ def _initialize_states_from_first_day_sensor_readings(
     for pot in pots:
         pot_id = int(pot["id"])
         for slot_time in candidate_slots:
-            reading = _lookup_sensor_reading(lookup, start_date, slot_time, pot_id)
+            reading = _sensor_reading_for_pot(sensor_context, pot, start_date, slot_time)
             if reading is None:
                 continue
             pot_states[pot_id].moisture = _clamp(
@@ -2407,6 +2892,7 @@ def _prime_future_states(
     end = datetime.combine(start_date, time.min, tzinfo=LOCAL_TZ)
     warmup_day_profiles: dict[date, dict[str, Any]] = {}
     zone_pots = _pots_by_valve_zone(pots)
+    control_pots = _sensor_control_pots(pots, sensor_context)
     while current < end:
         day_weather = weather_by_day.get(current.date(), [])
         hour_weather = _weather_for_hour(day_weather, current)
@@ -2436,30 +2922,51 @@ def _prime_future_states(
 
         decision_by_pot_id: dict[int, dict[str, Any]] = {}
         zone_trigger_decisions: dict[str, list[dict[str, Any]]] = {}
-        for pot in pots:
+        for pot in control_pots:
             state = pot_states[pot["id"]]
             decision = _make_baseline_irrigation_decision(state, pot, hour_weather, day_profile, slot)
+            decision = _with_sensor_key(decision, pot, sensor_context)
             decision = _apply_cold_month_indoor_skip(decision, pot, current_day)
             decision_by_pot_id[int(pot["id"])] = decision
             if decision["should_irrigate"] and _is_valve_managed_pot(pot, current_day):
                 zone_trigger_decisions.setdefault(pot["balcony_zone"], []).append(decision)
 
         for zone, trigger_decisions in zone_trigger_decisions.items():
+            trigger_pot_ids = _trigger_pot_ids(trigger_decisions)
+            trigger_sensor_ids = _trigger_sensor_ids(trigger_decisions)
+            trigger_pot_codes = _trigger_pot_codes(trigger_decisions)
             zone_dose_factor = _baseline_zone_dose_factor(trigger_decisions)
+            execution_decisions = _zone_execution_decision_map(
+                decision_by_pot_id,
+                zone_pots,
+                zone,
+                current_day,
+                trigger_decisions,
+            )
             _execute_valve_zone_distribution(
                 pot_states,
                 zone_pots,
                 zone,
                 current_day,
                 hour_weather,
-                decision_by_pot_id,
+                execution_decisions,
                 lambda zone_pot, zone_decision: {
                     **zone_decision,
                     "should_irrigate": True,
                     "dose_factor": zone_dose_factor,
                 },
                 DEFAULT_IRRIGATION_POLICY.irrigation_request,
-                {"zone_triggered": True, "zone_dose_factor": zone_dose_factor, "zone": zone},
+                {
+                    "zone_triggered": True,
+                    "zone_trigger_sensor_ids": trigger_sensor_ids,
+                    "zone_trigger_pot_ids": trigger_pot_ids,
+                    "zone_trigger_pot_codes": trigger_pot_codes,
+                    "runtime_request_sensor_ids": trigger_sensor_ids,
+                    "zone_dose_factor": zone_dose_factor,
+                    "zone": zone,
+                    "zone_activation_policy": "sensor_pot_trigger",
+                    "zone_runtime_policy": "sensor_trigger_zone_budget_runtime",
+                },
             )
         current += timedelta(hours=1)
 
@@ -2592,7 +3099,7 @@ def _make_anfis_execution_decision(
     observed_local = _local_observed_at(weather)
     target = pot["winter_moisture_target_pct"] if slot == "winter_check" else pot["moisture_target_pct"]
     reason_code = "anfis_probability_pending"
-    reason_detail = "Max valve ANFIS probability decides irrigation; ANFIS water-saving policy controls duration."
+    reason_detail = "Valve-zone average ANFIS probability decides irrigation; ANFIS water-saving policy controls duration."
     should_irrigate = False
 
     if _number(weather.get("temperature_c"), day_profile["avg_temperature_c"]) <= 3.0:
@@ -2798,13 +3305,13 @@ class _AnfisWaterSavingPolicy:
     light_deficit_pct: float = 4.0
     moderate_deficit_pct: float = 9.0
     severe_deficit_pct: float = 12.0
-    low_confidence_margin: float = 0.06
-    medium_confidence_margin: float = 0.14
-    light_rain_mm: float = 0.5
-    moderate_rain_mm: float = 2.5
+    low_confidence_margin: float = 0.08
+    medium_confidence_margin: float = 0.20
     safety_dose_floor: float = 0.75
-    cadence_high_confidence_probability: float = 0.92
-    cadence_deficit_escape_pct: float = 10.0
+    minimum_runtime_min: float = 2.0
+    safety_minimum_runtime_min: float = 0.5
+    cadence_days_after_irrigation: int = 2
+    cadence_escape_probability: float = 0.90
 
     def threshold(self, raw_threshold: float, forecast: bool = False) -> float:
         margin = self.forecast_decision_margin if forecast else self.decision_margin
@@ -2820,25 +3327,14 @@ class _AnfisWaterSavingPolicy:
         max_deficit = self._max_deficit(trigger_decisions)
         need_factor = self._need_factor(max_deficit)
         confidence_factor = self._confidence_factor(slot_probability, decision_threshold)
-        rain_factor = self._rain_factor(day_profile)
-        dose_factor = _anfis_allowed_dose_factor(min(need_factor, confidence_factor, rain_factor))
+        dose_factor = _anfis_allowed_dose_factor(min(need_factor, confidence_factor))
 
         if self._has_safety_override(trigger_decisions):
             dose_factor = max(dose_factor, self.safety_dose_floor)
-        if max_deficit >= self.severe_deficit_pct and rain_factor > 0.5:
-            dose_factor = max(dose_factor, 0.75)
         return _anfis_allowed_dose_factor(dose_factor)
 
     def cadence_days(self, day_profile: dict[str, Any]) -> int:
-        if day_profile.get("heatwave_day") or day_profile.get("dry_windy_day"):
-            return 1
-        avg_temp = _number(day_profile.get("avg_temperature_c"), 20.0)
-        rain_mm = _number(day_profile.get("precipitation_mm"), 0.0)
-        if avg_temp < 18.0:
-            return 4
-        if avg_temp < 24.0 or rain_mm >= self.light_rain_mm:
-            return 3
-        return 2
+        return self.cadence_days_after_irrigation
 
     def cadence_blocks(
         self,
@@ -2854,10 +3350,7 @@ class _AnfisWaterSavingPolicy:
             return False
         if self._has_safety_override(trigger_decisions):
             return False
-        if (
-            slot_probability >= self.cadence_high_confidence_probability
-            or self._max_deficit(trigger_decisions) >= self.cadence_deficit_escape_pct
-        ):
+        if slot_probability >= self.cadence_escape_probability:
             return False
         return (current_date - last_irrigated).days < self.cadence_days(day_profile)
 
@@ -2870,11 +3363,15 @@ class _AnfisWaterSavingPolicy:
             "dose_steps": [0.5, 0.75, 1.0],
             "light_deficit_pct": self.light_deficit_pct,
             "moderate_deficit_pct": self.moderate_deficit_pct,
-            "light_rain_mm": self.light_rain_mm,
-            "moderate_rain_mm": self.moderate_rain_mm,
             "safety_dose_floor": self.safety_dose_floor,
-            "cadence_high_confidence_probability": self.cadence_high_confidence_probability,
-            "cadence_deficit_escape_pct": self.cadence_deficit_escape_pct,
+            "minimum_valve_runtime_min": self.minimum_runtime_min,
+            "safety_minimum_valve_runtime_min": self.safety_minimum_runtime_min,
+            "cadence_days_after_irrigation": self.cadence_days_after_irrigation,
+            "cadence_escape_probability": self.cadence_escape_probability,
+            "dose_policy": "anfis_probability_confidence_and_moisture_deficit",
+            "rain_temperature_policy": "learned_through_anfis_inputs",
+            "zone_activation_policy": "sensor_pot_probability_with_safety_override",
+            "zone_runtime_policy": "sensor_trigger_zone_budget_runtime",
         }
 
     def _max_deficit(self, decisions: list[dict[str, Any]]) -> float:
@@ -2908,16 +3405,68 @@ class _AnfisWaterSavingPolicy:
             return 0.75
         return 1.0
 
-    def _rain_factor(self, day_profile: dict[str, Any]) -> float:
-        same_day_rain_mm = _number(day_profile.get("precipitation_mm"), 0.0)
-        if same_day_rain_mm >= self.moderate_rain_mm:
-            return 0.5
-        if same_day_rain_mm >= self.light_rain_mm:
-            return 0.75
-        return 1.0
-
 
 ANFIS_WATER_SAVING_POLICY = _AnfisWaterSavingPolicy()
+
+
+@dataclass(frozen=True)
+class _FuzzyActuationPolicy:
+    minimum_runtime_min: float = 2.0
+    safety_minimum_runtime_min: float = 0.5
+    heatwave_supplement_minimum_prescription_mm: float = 1.0
+
+    def has_safety_need(self, trigger_decisions: list[dict[str, Any]]) -> bool:
+        return any(
+            float(decision.get("current_moisture_pct") or 0.0)
+            <= float(decision.get("fuzzy_safety_floor_pct") or decision.get("target_moisture_pct") or 0.0)
+            for decision in trigger_decisions
+        )
+
+    def has_prescription_need(self, trigger_decisions: list[dict[str, Any]]) -> bool:
+        return any(
+            bool(decision.get("should_irrigate"))
+            or float(decision.get("prescription_mm") or 0.0)
+            >= self.heatwave_supplement_minimum_prescription_mm
+            for decision in trigger_decisions
+        )
+
+    def minimum_runtime(self, trigger_decisions: list[dict[str, Any]]) -> float:
+        if self.has_safety_need(trigger_decisions):
+            return self.safety_minimum_runtime_min
+        return self.minimum_runtime_min
+
+    def allows_heatwave_supplement(
+        self,
+        slot: str,
+        day_profile: dict[str, Any],
+        trigger_decisions: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        hot_evening = (
+            slot == "evening"
+            and (
+                bool(day_profile.get("heatwave_day"))
+                or _number(day_profile.get("max_temperature_c"), 20.0) >= 35.0
+            )
+        )
+        if not hot_evening:
+            return False
+        if trigger_decisions is None:
+            return True
+        return self.has_safety_need(trigger_decisions) or self.has_prescription_need(trigger_decisions)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "minimum_valve_runtime_min": self.minimum_runtime_min,
+            "safety_minimum_valve_runtime_min": self.safety_minimum_runtime_min,
+            "heatwave_supplement_minimum_prescription_mm": self.heatwave_supplement_minimum_prescription_mm,
+            "daily_execution_policy": "one_daily_prescription_plus_heatwave_evening_supplement",
+            "heatwave_supplement_policy": "safety_floor_or_fuzzy_prescription_signal",
+            "cadence_policy": "not_used",
+            "zone_runtime_policy": "sensor_trigger_zone_budget_runtime",
+        }
+
+
+FUZZY_ACTUATION_POLICY = _FuzzyActuationPolicy()
 
 
 def _anfis_zone_probability_summary(decisions: list[dict[str, Any]]) -> tuple[float, float]:
@@ -3024,6 +3573,7 @@ def _anfis_inputs(
     sensor_reading: dict[str, Any] | None,
     pot: dict[str, Any],
     day_profile: dict[str, Any],
+    prior_moisture_pct: float | None = None,
 ) -> dict[str, float]:
     observed_day = _local_observed_at(weather).date()
     rain = _number(day_profile.get("precipitation_mm"), _number(weather.get("precipitation_mm"), 0.0))
@@ -3093,6 +3643,7 @@ def _run_sparse_daily_irrigation(
     sample_interval_hours: int,
     persist: bool = False,
     snapshot: ExperimentSnapshot | None = None,
+    baseline_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return _SparseSamplingController(
         start_date=start_date,
@@ -3100,6 +3651,7 @@ def _run_sparse_daily_irrigation(
         sample_interval_hours=sample_interval_hours,
         persist=persist,
         snapshot=snapshot,
+        baseline_result=baseline_result,
     ).run()
 
 
@@ -3113,6 +3665,7 @@ class _SparseSamplingController:
         sample_interval_hours: int,
         persist: bool,
         snapshot: ExperimentSnapshot | None,
+        baseline_result: dict[str, Any] | None = None,
     ) -> None:
         if end_date < start_date:
             raise ValueError("end_date must not be before start_date")
@@ -3122,31 +3675,59 @@ class _SparseSamplingController:
         self.sample_interval_hours = max(1, int(sample_interval_hours))
         self.persist = persist
         self.selected_snapshot = _resolve_snapshot(start_date, end_date, snapshot)
-        self.simulation_start_date, self.simulation_snapshot = _resolve_simulation_snapshot(
-            start_date,
-            end_date,
-            self.selected_snapshot,
-        )
+        self.baseline_result = baseline_result or {}
+        baseline_start_states = self.baseline_result.get("stateAtExperimentStart")
+        if baseline_start_states:
+            self.simulation_start_date = start_date
+            self.simulation_snapshot = self.selected_snapshot
+            self.state_anchor_policy = "baseline_warmup_reuse"
+            self.warmup_reuse_policy = "baseline_start_state_reuse"
+        else:
+            self.simulation_start_date, self.simulation_snapshot = _resolve_simulation_snapshot(
+                start_date,
+                end_date,
+                self.selected_snapshot,
+            )
+            self.state_anchor_policy = "stable_daily_timeline"
+            self.warmup_reuse_policy = "independent_sparse_warmup"
         self.weather_rows = self.selected_snapshot.selected_weather_rows
         self.pots = self.simulation_snapshot.pots
         self.zone_pots = _pots_by_valve_zone(self.pots)
         self.sensor_context = self.simulation_snapshot.sensor_context
         self.selected_sensor_context = self.selected_snapshot.sensor_context
+        self.control_pots = _sensor_control_pots(self.pots, self.sensor_context)
+        self.control_pot_ids = {int(pot["id"]) for pot in self.control_pots}
         self.weather_by_day = self.simulation_snapshot.weather_by_day
-        self.states = _copy_pot_states(self.simulation_snapshot.initial_pot_states)
-        self.probe_states = _copy_pot_states(self.simulation_snapshot.initial_pot_states)
-        self.sensor_state_anchor = _initialize_states_from_first_day_sensor_readings(
-            self.states,
-            self.pots,
-            self.sensor_context,
-            self.simulation_start_date,
-        )
-        _initialize_states_from_first_day_sensor_readings(
-            self.probe_states,
-            self.pots,
-            self.sensor_context,
-            self.simulation_start_date,
-        )
+        if baseline_start_states:
+            self.states = _copy_pot_states_from_payload(
+                baseline_start_states,
+                self.simulation_snapshot.initial_pot_states,
+            )
+            self.probe_states = _copy_pot_states(self.states)
+            baseline_summary = self.baseline_result.get("summary", {})
+            self.sensor_state_anchor = {
+                "source": "baseline_warmup_reuse",
+                "anchor_date": start_date.isoformat(),
+                "anchored_pots": len(self.states),
+                "baseline_state_simulation_start_date": baseline_summary.get("stateSimulationStartDate"),
+                "baseline_state_lookback_days": baseline_summary.get("stateLookbackDays"),
+                "baseline_sensor_calibration_policy": baseline_summary.get("baselineSensorCalibrationPolicy"),
+            }
+        else:
+            self.states = _copy_pot_states(self.simulation_snapshot.initial_pot_states)
+            self.probe_states = _copy_pot_states(self.simulation_snapshot.initial_pot_states)
+            self.sensor_state_anchor = _initialize_states_from_first_day_sensor_readings(
+                self.states,
+                self.pots,
+                self.sensor_context,
+                self.simulation_start_date,
+            )
+            _initialize_states_from_first_day_sensor_readings(
+                self.probe_states,
+                self.pots,
+                self.sensor_context,
+                self.simulation_start_date,
+            )
         self.entries: list[dict[str, Any]] = []
         self.detail_entries: list[dict[str, Any]] = []
         self.decisions: list[dict[str, Any]] = []
@@ -3327,7 +3908,7 @@ class _SparseSamplingController:
         decision_by_pot_id: dict[int, dict[str, Any]] = {}
         zone_trigger_decisions: dict[str, list[dict[str, Any]]] = {}
 
-        for pot in self.pots:
+        for pot in self.control_pots:
             state = self.states[pot["id"]]
             if calibrate_now:
                 sensor_id = self._refresh_state_from_sensor(
@@ -3364,16 +3945,24 @@ class _SparseSamplingController:
             _record_daily_moisture_snapshot(daily_moisture_tracker, self.states, snapshot_label)
 
         for zone, trigger_decisions in zone_trigger_decisions.items():
-            trigger_pot_ids = [int(decision["pot_id"]) for decision in trigger_decisions]
-            trigger_pot_codes = [decision["pot_code"] for decision in trigger_decisions if decision.get("pot_code")]
+            trigger_pot_ids = _trigger_pot_ids(trigger_decisions)
+            trigger_sensor_ids = _trigger_sensor_ids(trigger_decisions)
+            trigger_pot_codes = _trigger_pot_codes(trigger_decisions)
             zone_dose_factor = _sparse_zone_dose_factor(trigger_decisions, self.sample_interval_hours, sample_now)
+            execution_decisions = _zone_execution_decision_map(
+                decision_by_pot_id,
+                self.zone_pots,
+                zone,
+                current_date,
+                trigger_decisions,
+            )
             zone_events = _execute_valve_zone_distribution(
                 self.states,
                 self.zone_pots,
                 zone,
                 current_date,
                 hour_weather,
-                decision_by_pot_id,
+                execution_decisions,
                 lambda zone_pot, zone_decision: {
                     **zone_decision,
                     "should_irrigate": True,
@@ -3382,10 +3971,14 @@ class _SparseSamplingController:
                 DEFAULT_IRRIGATION_POLICY.irrigation_request,
                 {
                     "zone_triggered": True,
+                    "zone_trigger_sensor_ids": trigger_sensor_ids,
                     "zone_trigger_pot_ids": trigger_pot_ids,
                     "zone_trigger_pot_codes": trigger_pot_codes,
+                    "runtime_request_sensor_ids": trigger_sensor_ids,
                     "zone_dose_factor": zone_dose_factor,
                     "zone": zone,
+                    "zone_activation_policy": "sensor_pot_trigger",
+                    "zone_runtime_policy": "sensor_trigger_zone_budget_runtime",
                 },
             )
             for event in zone_events:
@@ -3480,7 +4073,7 @@ class _SparseSamplingController:
         observed_local: datetime,
         day_profile: dict[str, Any],
     ) -> None:
-        for pot in self.pots:
+        for pot in self.control_pots:
             _apply_sensor_calibration_marker(
                 self.probe_states[pot["id"]],
                 pot,
@@ -3500,30 +4093,51 @@ class _SparseSamplingController:
         decision_by_pot_id: dict[int, dict[str, Any]] = {}
         zone_trigger_decisions: dict[str, list[dict[str, Any]]] = {}
 
-        for pot in self.pots:
+        for pot in self.control_pots:
             state = self.probe_states[pot["id"]]
             decision = _make_baseline_irrigation_decision(state, pot, hour_weather, day_profile, slot)
+            decision = _with_sensor_key(decision, pot, self.sensor_context)
             decision = _apply_cold_month_indoor_skip(decision, pot, current_date)
             decision_by_pot_id[int(pot["id"])] = decision
             if decision["should_irrigate"] and _is_valve_managed_pot(pot, current_date):
                 zone_trigger_decisions.setdefault(pot["balcony_zone"], []).append(decision)
 
         for zone, trigger_decisions in zone_trigger_decisions.items():
+            trigger_pot_ids = _trigger_pot_ids(trigger_decisions)
+            trigger_sensor_ids = _trigger_sensor_ids(trigger_decisions)
+            trigger_pot_codes = _trigger_pot_codes(trigger_decisions)
             zone_dose_factor = _baseline_zone_dose_factor(trigger_decisions)
+            execution_decisions = _zone_execution_decision_map(
+                decision_by_pot_id,
+                self.zone_pots,
+                zone,
+                current_date,
+                trigger_decisions,
+            )
             _execute_valve_zone_distribution(
                 self.probe_states,
                 self.zone_pots,
                 zone,
                 current_date,
                 hour_weather,
-                decision_by_pot_id,
+                execution_decisions,
                 lambda zone_pot, zone_decision: {
                     **zone_decision,
                     "should_irrigate": True,
                     "dose_factor": zone_dose_factor,
                 },
                 DEFAULT_IRRIGATION_POLICY.irrigation_request,
-                {"zone_triggered": True, "zone_dose_factor": zone_dose_factor, "zone": zone},
+                {
+                    "zone_triggered": True,
+                    "zone_trigger_sensor_ids": trigger_sensor_ids,
+                    "zone_trigger_pot_ids": trigger_pot_ids,
+                    "zone_trigger_pot_codes": trigger_pot_codes,
+                    "runtime_request_sensor_ids": trigger_sensor_ids,
+                    "zone_dose_factor": zone_dose_factor,
+                    "zone": zone,
+                    "zone_activation_policy": "sensor_pot_trigger",
+                    "zone_runtime_policy": "sensor_trigger_zone_budget_runtime",
+                },
             )
 
     def _summary(self, valve_rollup: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
@@ -3541,6 +4155,7 @@ class _SparseSamplingController:
         )
         sampling_estimation = _sampling_estimation_summary(self.sampling_stats)
         summary.update(sampling_estimation)
+        summary.update(_sensor_control_summary_fields(self.pots, self.selected_sensor_context))
         summary.update(
             {
                 "potIrrigationDecisions": self.total_irrigation_decisions,
@@ -3554,7 +4169,18 @@ class _SparseSamplingController:
                 "forecastSensorCalibrationPolicy": "sparse-sampling-fully-calibrates-to-default-strategy-at-sampling-points",
                 "stateSimulationStartDate": self.simulation_start_date.isoformat(),
                 "stateLookbackDays": (self.end_date - self.simulation_start_date).days + 1,
-                "stateAnchorPolicy": "stable_daily_timeline",
+                "stateAnchorPolicy": self.state_anchor_policy,
+                "samplingWarmupReusePolicy": self.warmup_reuse_policy,
+                "baselineWarmupStateSimulationStartDate": (
+                    self.sensor_state_anchor.get("baseline_state_simulation_start_date")
+                    if isinstance(self.sensor_state_anchor, dict)
+                    else None
+                ),
+                "baselineWarmupStateLookbackDays": (
+                    self.sensor_state_anchor.get("baseline_state_lookback_days")
+                    if isinstance(self.sensor_state_anchor, dict)
+                    else None
+                ),
                 "sparseSimulationGranularity": "hourly_state_decision_slot_control",
             }
         )
@@ -3570,12 +4196,15 @@ def _run_fuzzy_dt_daily_irrigation(
     snapshot: ExperimentSnapshot | None = None,
 ) -> dict[str, Any]:
     selected_snapshot = _resolve_snapshot(start_date, end_date, snapshot)
-    simulation_start_date, simulation_snapshot = _resolve_simulation_snapshot(start_date, end_date, selected_snapshot)
+    simulation_start_date = start_date
+    simulation_snapshot = selected_snapshot
     weather_rows = selected_snapshot.selected_weather_rows
     pots = simulation_snapshot.pots
     zone_pots = _pots_by_valve_zone(pots)
     sensor_context = simulation_snapshot.sensor_context
     selected_sensor_context = selected_snapshot.sensor_context
+    control_pots = _sensor_control_pots(pots, sensor_context)
+    control_pot_ids = {int(pot["id"]) for pot in control_pots}
     weather_by_day = simulation_snapshot.weather_by_day
     pot_states = _copy_pot_states(simulation_snapshot.initial_pot_states)
     sensor_state_anchor = _initialize_states_from_first_day_sensor_readings(
@@ -3612,6 +4241,7 @@ def _run_fuzzy_dt_daily_irrigation(
         daily_alerts = 0
         daily_prescription_sum = 0.0
         daily_prescription_count = 0
+        daily_prescribed_zones: set[str] = set()
 
         for hour_weather in day_weather:
             observed_local = _local_observed_at(hour_weather)
@@ -3635,57 +4265,91 @@ def _run_fuzzy_dt_daily_irrigation(
                     observed_local.date(),
                     rain_exposure_factor=_rain_exposure_factor(pot, observed_local.date()),
                 )
-                _apply_sensor_calibration_marker(state, pot, current_date, observed_local, sensor_context, day_profile)
 
                 if slot is None:
-                    if _is_emergency_dryness(state, pot, current_date, observed_local):
+                    if int(pot["id"]) in control_pot_ids and _is_emergency_dryness(state, pot, current_date, observed_local):
                         if record_date:
                             alerts.append(_alert_row(pot, hour_weather, "emergency_dryness", "warning", "Emergency dryness outside watering window"))
                             daily_alerts += 1
                             hourly_alerts += 1
-                    continue
+            if slot is not None:
+                for pot in control_pots:
+                    state = pot_states[pot["id"]]
+                    decision = _make_fuzzy_dt_decision(state, pot, hour_weather, day_profile, slot)
+                    decision = _with_sensor_key(decision, pot, sensor_context)
+                    decision = _apply_cold_month_indoor_skip(decision, pot, current_date)
+                    decision_by_pot_id[int(pot["id"])] = decision
 
-                decision = _make_fuzzy_dt_decision(state, pot, hour_weather, day_profile, slot)
-                decision = _with_sensor_key(decision, pot, sensor_context)
-                decision = _apply_cold_month_indoor_skip(decision, pot, current_date)
-                decision_by_pot_id[int(pot["id"])] = decision
+                    prescription_mm = float(decision.get("prescription_mm", 0.0))
+                    if record_date:
+                        decisions.append(decision)
+                        daily_decisions += 1
+                        hourly_decisions += 1
+                        total_irrigation_decisions += 1
+                        prescription_sum += prescription_mm
+                        prescription_count += 1
+                        daily_prescription_sum += prescription_mm
+                        daily_prescription_count += 1
+                        hourly_prescription_sum += prescription_mm
+                        hourly_prescription_count += 1
 
-                prescription_mm = float(decision.get("prescription_mm", 0.0))
-                if record_date:
-                    decisions.append(decision)
-                    daily_decisions += 1
-                    hourly_decisions += 1
-                    total_irrigation_decisions += 1
-                    prescription_sum += prescription_mm
-                    prescription_count += 1
-                    daily_prescription_sum += prescription_mm
-                    daily_prescription_count += 1
-                    hourly_prescription_sum += prescription_mm
-                    hourly_prescription_count += 1
-
-                if decision["should_irrigate"] and _is_valve_managed_pot(pot, current_date):
-                    zone_trigger_decisions.setdefault(pot["balcony_zone"], []).append(decision)
+                    if decision["should_irrigate"] and _is_valve_managed_pot(pot, current_date):
+                        zone_trigger_decisions.setdefault(pot["balcony_zone"], []).append(decision)
 
             if slot is not None:
                 for zone, trigger_decisions in zone_trigger_decisions.items():
-                    trigger_pot_ids = [int(decision["pot_id"]) for decision in trigger_decisions]
-                    trigger_pot_codes = [decision["pot_code"] for decision in trigger_decisions if decision.get("pot_code")]
+                    if (
+                        zone in daily_prescribed_zones
+                        and not FUZZY_ACTUATION_POLICY.allows_heatwave_supplement(
+                            slot,
+                            day_profile,
+                            trigger_decisions,
+                        )
+                    ):
+                        for decision in trigger_decisions:
+                            decision["should_irrigate"] = False
+                            decision["reason_code"] = "fuzzy_daily_prescription_already_sent"
+                            decision["reason_detail"] = (
+                                f"Valve zone {zone} already received its fuzzy daily prescription "
+                                f"on {current_date.isoformat()}."
+                            )
+                        continue
+
+                    trigger_pot_ids = _trigger_pot_ids(trigger_decisions)
+                    trigger_sensor_ids = _trigger_sensor_ids(trigger_decisions)
+                    trigger_pot_codes = _trigger_pot_codes(trigger_decisions)
                     trigger_prescriptions = [float(decision.get("prescription_mm") or 0.0) for decision in trigger_decisions]
                     zone_max_prescription_mm = max(trigger_prescriptions, default=0.0)
                     zone_average_prescription_mm = sum(trigger_prescriptions) / max(len(trigger_prescriptions), 1)
+                    execution_decisions = _zone_execution_decision_map(
+                        decision_by_pot_id,
+                        zone_pots,
+                        zone,
+                        current_date,
+                        trigger_decisions,
+                    )
 
                     def fuzzy_zone_decision(zone_pot: dict[str, Any], zone_decision: dict[str, Any]) -> dict[str, Any]:
+                        zone_state = pot_states[int(zone_pot["id"])]
+                        prescription_mm = float(zone_decision.get("prescription_mm") or zone_average_prescription_mm)
+                        planned_volume_ml = DEFAULT_FUZZY_POLICY.prescribed_volume_ml(
+                            zone_state,
+                            zone_pot,
+                            prescription_mm,
+                        )
+                        zone_decision["prescription_mm"] = round(prescription_mm, 2)
+                        zone_decision["planned_volume_ml"] = round(planned_volume_ml, 2)
                         if zone_decision.get("should_irrigate"):
                             zone_decision["reason_code"] = "valve_zone_prescription"
                             zone_decision["reason_detail"] = (
                                 f"Valve zone {zone} is triggered by {len(trigger_pot_ids)} pot(s); "
-                                "this pot keeps its own fuzzy prescription."
+                                "the fuzzy prescription is applied as a valve-zone runtime budget."
                             )
                         else:
                             zone_decision["reason_code"] = "valve_zone_passive_delivery"
                             zone_decision["reason_detail"] = (
                                 f"Valve zone {zone} is triggered by another pot; this pot keeps its own "
-                                "soft fuzzy prescription while the valve is open."
+                                "zone-scaled fuzzy prescription while the valve is open."
                             )
                         return zone_decision
 
@@ -3695,17 +4359,26 @@ def _run_fuzzy_dt_daily_irrigation(
                         zone,
                         current_date,
                         hour_weather,
-                        decision_by_pot_id,
+                        execution_decisions,
                         fuzzy_zone_decision,
                         DEFAULT_FUZZY_POLICY.irrigation_request,
                         {
                             "zone_triggered": True,
+                            "zone_trigger_sensor_ids": trigger_sensor_ids,
                             "zone_trigger_pot_ids": trigger_pot_ids,
                             "zone_trigger_pot_codes": trigger_pot_codes,
+                            "runtime_request_sensor_ids": trigger_sensor_ids,
                             "zone_prescription_mm": round(zone_average_prescription_mm, 2),
                             "zone_max_prescription_mm": round(zone_max_prescription_mm, 2),
                             "zone": zone,
-                            "minimum_valve_runtime_min": 0.5,
+                            "zone_activation_policy": "sensor_pot_trigger",
+                            "zone_runtime_policy": "sensor_trigger_zone_budget_runtime",
+                            "zone_daily_execution_policy": (
+                                "heatwave_evening_supplement"
+                                if zone in daily_prescribed_zones and slot == "evening"
+                                else "daily_zone_prescription"
+                            ),
+                            "minimum_valve_runtime_min": FUZZY_ACTUATION_POLICY.minimum_runtime(trigger_decisions),
                         },
                     )
                     for event in zone_events:
@@ -3716,6 +4389,8 @@ def _run_fuzzy_dt_daily_irrigation(
                             hourly_events += 1
                             hourly_water_ml += event["planned_volume_ml"]
                             total_irrigation_events += 1
+                    if zone_events:
+                        daily_prescribed_zones.add(zone)
 
                 for pot in pots:
                     state = pot_states[pot["id"]]
@@ -3729,6 +4404,11 @@ def _run_fuzzy_dt_daily_irrigation(
                         state.too_wet_hours = 0
 
             if record_date and _uses_hourly_chart(start_date, end_date):
+                hourly_avg_prescription_mm = (
+                    round(hourly_prescription_sum / hourly_prescription_count, 2)
+                    if hourly_prescription_count > 0
+                    else None
+                )
                 detail_entries.append(
                     _hourly_aggregate_entry(
                         observed_local,
@@ -3741,8 +4421,8 @@ def _run_fuzzy_dt_daily_irrigation(
                         hourly_alerts,
                         {
                             **_hourly_line_metadata(selected_sensor_context, current_date, observed_local, hour_weather),
-                            "fuzzy_prescription_mm": round(hourly_prescription_sum / max(hourly_prescription_count, 1), 2),
-                            "avg_prescription_mm": round(hourly_prescription_sum / max(hourly_prescription_count, 1), 2),
+                            "fuzzy_prescription_mm": hourly_avg_prescription_mm,
+                            "avg_prescription_mm": hourly_avg_prescription_mm,
                         },
                     )
                 )
@@ -3751,6 +4431,11 @@ def _run_fuzzy_dt_daily_irrigation(
             current_date += timedelta(days=1)
             continue
 
+        daily_avg_prescription_mm = (
+            round(daily_prescription_sum / daily_prescription_count, 2)
+            if daily_prescription_count > 0
+            else None
+        )
         entries.append(
             _daily_aggregate_entry(
                 current_date,
@@ -3762,8 +4447,8 @@ def _run_fuzzy_dt_daily_irrigation(
                 daily_alerts,
                 {
                     **_daily_line_metadata(selected_sensor_context, current_date, day_weather),
-                    "fuzzy_prescription_mm": round(daily_prescription_sum / max(daily_prescription_count, 1), 2),
-                    "avg_prescription_mm": round(daily_prescription_sum / max(daily_prescription_count, 1), 2),
+                    "fuzzy_prescription_mm": daily_avg_prescription_mm,
+                    "avg_prescription_mm": daily_avg_prescription_mm,
                 },
             )
         )
@@ -3790,10 +4475,13 @@ def _run_fuzzy_dt_daily_irrigation(
     summary["averagePrescriptionMm"] = round(prescription_sum / max(prescription_count, 1), 2)
     summary["fuzzyDataPolicy"] = "daily-fis-prescription"
     summary["fuzzyControllerPolicy"] = "fuzzy_dt_prescription_control"
-    summary["fuzzyDecisionPolicy"] = "owned_fuzzy_timing_threshold_skip_prescription"
+    summary["fuzzyDecisionPolicy"] = "daily_zone_prescription_with_heatwave_evening_supplement"
+    summary["fuzzyActuationPolicy"] = FUZZY_ACTUATION_POLICY.summary()
+    summary["fuzzySensorCalibrationPolicy"] = "initial_state_only"
     summary["stateSimulationStartDate"] = simulation_start_date.isoformat()
     summary["stateLookbackDays"] = (end_date - simulation_start_date).days + 1
-    summary["stateAnchorPolicy"] = "stable_historical_timeline"
+    summary["stateAnchorPolicy"] = "experiment_start_sensor_anchor"
+    summary.update(_sensor_control_summary_fields(pots, selected_sensor_context))
     if sensor_state_anchor is not None:
         summary["stateSensorAnchor"] = sensor_state_anchor
     chart_entries = _chart_entries_for_range(start_date, end_date, entries, detail_entries)
@@ -3824,15 +4512,22 @@ def _run_anfis_daily_irrigation(
     forecast_decision_threshold: float = ANFIS_FORECAST_DECISION_THRESHOLD,
 ) -> dict[str, Any]:
     selected_snapshot = _resolve_snapshot(start_date, end_date, snapshot)
-    simulation_start_date, simulation_snapshot = _resolve_simulation_snapshot(start_date, end_date, selected_snapshot)
+    simulation_start_date = start_date
+    simulation_snapshot = selected_snapshot
 
     weather_rows = selected_snapshot.selected_weather_rows
     pots = simulation_snapshot.pots
     zone_pots = _pots_by_valve_zone(pots)
     sensor_context = simulation_snapshot.sensor_context
     selected_sensor_context = selected_snapshot.sensor_context
+    control_pots = _sensor_control_pots(pots, sensor_context)
+    control_pot_ids = {int(pot["id"]) for pot in control_pots}
     weather_by_day = simulation_snapshot.weather_by_day
     pot_states = _copy_pot_states(simulation_snapshot.initial_pot_states)
+    previous_moisture_by_pot = {
+        int(pot_id): float(state.moisture)
+        for pot_id, state in pot_states.items()
+    }
 
     entries = []
     detail_entries = []
@@ -3897,9 +4592,13 @@ def _run_anfis_daily_irrigation(
             eligible_decisions_by_zone: dict[str, list[dict[str, Any]]] = {}
             safety_decisions_by_zone: dict[str, list[dict[str, Any]]] = {}
             zone_trigger_decisions: dict[str, list[dict[str, Any]]] = {}
+            prior_moisture_by_pot: dict[int, float | None] = {}
 
             for pot in pots:
                 state = pot_states[pot["id"]]
+                pot_id = int(pot["id"])
+                prior_moisture = previous_moisture_by_pot.get(pot_id)
+                prior_moisture_by_pot[pot_id] = prior_moisture
                 _apply_hourly_environment(
                     state,
                     pot,
@@ -3908,80 +4607,84 @@ def _run_anfis_daily_irrigation(
                     observed_local.date(),
                     rain_exposure_factor=_rain_exposure_factor(pot, observed_local.date()),
                 )
-                _apply_sensor_calibration_marker(state, pot, current_date, observed_local, sensor_context, day_profile)
 
                 if slot is None:
-                    if _is_emergency_dryness(state, pot, current_date, observed_local):
+                    if int(pot["id"]) in control_pot_ids and _is_emergency_dryness(state, pot, current_date, observed_local):
                         if record_date:
                             alerts.append(_alert_row(pot, hour_weather, "emergency_dryness", "warning", "Emergency dryness outside watering window"))
                             daily_alerts += 1
                             hourly_alerts += 1
+                    previous_moisture_by_pot[pot_id] = float(state.moisture)
                     continue
+                previous_moisture_by_pot[pot_id] = float(state.moisture)
 
-                anfis_input = _anfis_inputs(state, hour_weather, None, pot, day_profile)
-                rule_decision = _make_anfis_execution_decision(state, pot, hour_weather, day_profile, slot)
-                predicted_probability = _predict_anfis_probability(model, anfis_input, pot.get("balcony_zone"))
-                probability_sum += predicted_probability
-                probability_count += 1
-                probability_max = max(probability_max, predicted_probability)
-                hourly_probability_sum += predicted_probability
-                hourly_probability_count += 1
-                hourly_probability_max = max(hourly_probability_max, predicted_probability)
+            if slot is not None:
+                for pot in control_pots:
+                    state = pot_states[pot["id"]]
+                    prior_moisture = prior_moisture_by_pot.get(int(pot["id"]))
+                    anfis_input = _anfis_inputs(
+                        state,
+                        hour_weather,
+                        None,
+                        pot,
+                        day_profile,
+                        prior_moisture_pct=prior_moisture,
+                    )
+                    rule_decision = _make_anfis_execution_decision(state, pot, hour_weather, day_profile, slot)
+                    predicted_probability = _predict_anfis_probability(model, anfis_input, pot.get("balcony_zone"))
+                    probability_sum += predicted_probability
+                    probability_count += 1
+                    probability_max = max(probability_max, predicted_probability)
+                    hourly_probability_sum += predicted_probability
+                    hourly_probability_count += 1
+                    hourly_probability_max = max(hourly_probability_max, predicted_probability)
 
-                valve_managed = _is_valve_managed_pot(pot, current_date)
+                    valve_managed = _is_valve_managed_pot(pot, current_date)
 
-                decision = dict(rule_decision)
-                decision = _with_sensor_key(decision, pot, sensor_context)
-                decision["should_irrigate"] = False
-                decision["predicted_probability"] = round(predicted_probability, 4)
-                decision["anfis_decision_threshold"] = current_decision_threshold
-                decision["predicted_category"] = probability_category(predicted_probability)
-                decision["simulated_moisture_pct"] = decision["current_moisture_pct"]
-                decision["current_moisture_pct"] = round(anfis_input["moisture"], 2)
-                decision["anfis_input_moisture_pct"] = round(anfis_input["moisture"], 2)
-                decision["anfis_input_temperature_c"] = round(anfis_input["temperature"], 2)
-                decision["anfis_input_rain_mm"] = round(anfis_input["rain"], 2)
-                skip_reason = _three_input_irrigation_skip_reason(
-                    float(anfis_input["moisture"]),
-                    float(anfis_input["temperature"]),
-                    float(anfis_input["rain"]),
-                )
-                if skip_reason:
-                    decision["reason_code"] = f"anfis_{skip_reason['code']}"
-                    decision["reason_detail"] = skip_reason["detail"]
-                decision = _apply_cold_month_indoor_skip(decision, pot, current_date)
-                hard_stop = decision["reason_code"] in ANFIS_HARD_STOP_REASON_CODES
-                below_target = state.moisture < decision["target_moisture_pct"]
-                safety_threshold = _threshold_for_pot(pot, day_profile, slot)
-                trigger_threshold = DEFAULT_IRRIGATION_POLICY.trigger_threshold(pot, day_profile, slot)
-                below_trigger_threshold = state.moisture < trigger_threshold
-                decision["anfis_trigger_threshold_pct"] = round(trigger_threshold, 2)
-                below_safety_threshold = state.moisture < safety_threshold
-                decision["anfis_safety_threshold_pct"] = round(safety_threshold, 2)
-                decision["anfis_below_safety_threshold"] = below_safety_threshold
-                rain_policy = DEFAULT_IRRIGATION_POLICY.rain_policy(pot, current_date, day_profile)
-                covered_rain_need = (
-                    DEFAULT_IRRIGATION_POLICY.is_covered_rain_day(rain_policy, day_profile)
-                    and state.moisture < decision["target_moisture_pct"]
-                )
-                decision["anfis_covered_rain_need"] = covered_rain_need
+                    decision = dict(rule_decision)
+                    decision = _with_sensor_key(decision, pot, sensor_context)
+                    decision["should_irrigate"] = False
+                    decision["predicted_probability"] = round(predicted_probability, 4)
+                    decision["anfis_decision_threshold"] = current_decision_threshold
+                    decision["predicted_category"] = probability_category(predicted_probability)
+                    decision["simulated_moisture_pct"] = decision["current_moisture_pct"]
+                    decision["current_moisture_pct"] = round(anfis_input["moisture"], 2)
+                    decision["anfis_input_moisture_pct"] = round(anfis_input["moisture"], 2)
+                    decision["anfis_input_temperature_c"] = round(anfis_input["temperature"], 2)
+                    decision["anfis_input_rain_mm"] = round(anfis_input["rain"], 2)
+                    decision = _apply_cold_month_indoor_skip(decision, pot, current_date)
+                    hard_stop = decision["reason_code"] in ANFIS_HARD_STOP_REASON_CODES
+                    below_target = state.moisture < decision["target_moisture_pct"]
+                    safety_threshold = _threshold_for_pot(pot, day_profile, slot)
+                    trigger_threshold = DEFAULT_IRRIGATION_POLICY.trigger_threshold(pot, day_profile, slot)
+                    below_trigger_threshold = state.moisture < trigger_threshold
+                    decision["anfis_trigger_threshold_pct"] = round(trigger_threshold, 2)
+                    below_safety_threshold = state.moisture < safety_threshold
+                    decision["anfis_safety_threshold_pct"] = round(safety_threshold, 2)
+                    decision["anfis_below_safety_threshold"] = below_safety_threshold
+                    rain_policy = DEFAULT_IRRIGATION_POLICY.rain_policy(pot, current_date, day_profile)
+                    covered_rain_need = (
+                        DEFAULT_IRRIGATION_POLICY.is_covered_rain_day(rain_policy, day_profile)
+                        and state.moisture < decision["target_moisture_pct"]
+                    )
+                    decision["anfis_covered_rain_need"] = covered_rain_need
 
-                if record_date:
-                    decisions.append(decision)
-                    daily_decisions += 1
-                    hourly_decisions += 1
-                decision_by_pot_id[int(pot["id"])] = decision
-                slot_decisions.append(decision)
-                if valve_managed:
-                    slot_decisions_by_zone.setdefault(pot["balcony_zone"], []).append(decision)
+                    if record_date:
+                        decisions.append(decision)
+                        daily_decisions += 1
+                        hourly_decisions += 1
+                    decision_by_pot_id[int(pot["id"])] = decision
+                    slot_decisions.append(decision)
+                    if valve_managed:
+                        slot_decisions_by_zone.setdefault(pot["balcony_zone"], []).append(decision)
 
-                if not hard_stop and valve_managed and (
-                    (below_target and below_trigger_threshold)
-                    or covered_rain_need
-                ):
-                    eligible_decisions_by_zone.setdefault(pot["balcony_zone"], []).append(decision)
-                if not hard_stop and below_safety_threshold and valve_managed:
-                    safety_decisions_by_zone.setdefault(pot["balcony_zone"], []).append(decision)
+                    if not hard_stop and valve_managed and (
+                        (below_target and below_trigger_threshold)
+                        or covered_rain_need
+                    ):
+                        eligible_decisions_by_zone.setdefault(pot["balcony_zone"], []).append(decision)
+                    if not hard_stop and below_safety_threshold and valve_managed:
+                        safety_decisions_by_zone.setdefault(pot["balcony_zone"], []).append(decision)
 
             snapshot_label = _daily_moisture_snapshot_label(current_date, observed_local, day_profile)
             if record_date and snapshot_label:
@@ -4005,8 +4708,8 @@ def _run_anfis_daily_irrigation(
                     for zone, zone_decisions in slot_decisions_by_zone.items()
                 }
                 slot_zone_probabilities = [
-                    zone_max_probability
-                    for _, zone_max_probability in zone_probability_summary.values()
+                    zone_average_probability
+                    for zone_average_probability, _ in zone_probability_summary.values()
                 ]
                 if slot_zone_probabilities:
                     slot_zone_signal = sum(slot_zone_probabilities) / len(slot_zone_probabilities)
@@ -4024,16 +4727,19 @@ def _run_anfis_daily_irrigation(
                         decision["anfis_slot_average_probability_percent"] = round(zone_average_probability * 100.0, 2)
                         decision["anfis_slot_max_probability"] = round(zone_max_probability, 4)
                         decision["anfis_slot_max_probability_percent"] = round(zone_max_probability * 100.0, 2)
+                        decision["anfis_zone_activation_probability"] = round(zone_average_probability, 4)
+                        decision["anfis_zone_activation_probability_percent"] = round(zone_average_probability * 100.0, 2)
 
                     eligible_decisions = eligible_decisions_by_zone.get(zone, [])
                     safety_decisions = safety_decisions_by_zone.get(zone, [])
-                    if zone_max_probability >= current_decision_threshold:
+                    zone_activation_probability = zone_average_probability
+                    if zone_activation_probability >= current_decision_threshold:
                         for decision in eligible_decisions:
                             decision["should_irrigate"] = True
                             decision["reason_code"] = "anfis_zone_probability_high"
                             decision["reason_detail"] = (
-                                f"Valve-zone ANFIS probability {zone_max_probability:.2f} is above threshold "
-                                f"{current_decision_threshold:.2f}; zone average probability is {zone_average_probability:.2f}, "
+                                f"Valve-zone average ANFIS probability {zone_activation_probability:.2f} is above threshold "
+                                f"{current_decision_threshold:.2f}; max pot probability is {zone_max_probability:.2f}, "
                                 "and this pot is below target moisture."
                                 f"{_anfis_duration_policy_note(decision)}"
                             )
@@ -4048,11 +4754,11 @@ def _run_anfis_daily_irrigation(
                                     else "anfis_zone_probability_high_no_moisture_deficit"
                                 )
                                 decision["reason_detail"] = (
-                                    f"Valve-zone ANFIS probability {zone_max_probability:.2f} is above threshold "
+                                    f"Valve-zone average ANFIS probability {zone_activation_probability:.2f} is above threshold "
                                     f"{current_decision_threshold:.2f}, but this pot is not a managed below-target trigger."
                                     if eligible_decisions
                                     else (
-                                        f"Valve-zone ANFIS probability {zone_max_probability:.2f} is above threshold "
+                                        f"Valve-zone average ANFIS probability {zone_activation_probability:.2f} is above threshold "
                                         f"{current_decision_threshold:.2f}, but no managed pot in this valve zone "
                                         "is below target moisture."
                                     )
@@ -4063,8 +4769,8 @@ def _run_anfis_daily_irrigation(
                             decision["reason_code"] = "anfis_moisture_safety_threshold"
                             decision["reason_detail"] = (
                                 f"Moisture {decision['current_moisture_pct']:.1f}% is below safety threshold "
-                                f"{decision['anfis_safety_threshold_pct']:.1f}%; ANFIS probability "
-                                f"{zone_max_probability:.2f} is below threshold {current_decision_threshold:.2f}, "
+                                f"{decision['anfis_safety_threshold_pct']:.1f}%; valve-zone average ANFIS probability "
+                                f"{zone_activation_probability:.2f} is below threshold {current_decision_threshold:.2f}, "
                                 f"so a moisture safety override waters the valve zone."
                                 f"{_anfis_duration_policy_note(decision)}"
                             )
@@ -4074,7 +4780,7 @@ def _run_anfis_daily_irrigation(
                             if not decision.get("should_irrigate") and decision["reason_code"] not in ANFIS_HARD_STOP_REASON_CODES:
                                 decision["reason_code"] = "anfis_probability_low_safety_not_triggering"
                                 decision["reason_detail"] = (
-                                    f"Valve-zone ANFIS probability {zone_max_probability:.2f} is below threshold "
+                                    f"Valve-zone average ANFIS probability {zone_activation_probability:.2f} is below threshold "
                                     f"{current_decision_threshold:.2f}; another managed pot in the valve zone "
                                     "triggered the moisture safety override."
                                 )
@@ -4083,8 +4789,8 @@ def _run_anfis_daily_irrigation(
                             if decision["reason_code"] not in ANFIS_HARD_STOP_REASON_CODES:
                                 decision["reason_code"] = "anfis_zone_probability_low"
                                 decision["reason_detail"] = (
-                                    f"Valve-zone ANFIS probability {zone_max_probability:.2f} is below threshold "
-                                    f"{current_decision_threshold:.2f}; zone average probability is {zone_average_probability:.2f}."
+                                    f"Valve-zone average ANFIS probability {zone_activation_probability:.2f} is below threshold "
+                                    f"{current_decision_threshold:.2f}; max pot probability is {zone_max_probability:.2f}."
                                 )
 
                 for decision in slot_decisions:
@@ -4094,13 +4800,13 @@ def _run_anfis_daily_irrigation(
 
                 for zone in list(zone_trigger_decisions):
                     trigger_decisions = zone_trigger_decisions[zone]
-                    zone_max_probability = zone_probability_summary.get(zone, (slot_average_probability, slot_max_probability))[1]
+                    zone_activation_probability = zone_probability_summary.get(zone, (slot_average_probability, slot_max_probability))[0]
                     if not _anfis_zone_cadence_blocks(
                         last_irrigated_by_zone,
                         zone,
                         current_date,
                         trigger_decisions,
-                        zone_max_probability,
+                        zone_activation_probability,
                         day_profile,
                     ):
                         continue
@@ -4110,7 +4816,7 @@ def _run_anfis_daily_irrigation(
                         decision["should_irrigate"] = False
                         decision["reason_code"] = "anfis_water_saving_cadence"
                         decision["reason_detail"] = (
-                            f"Valve-zone ANFIS probability {zone_max_probability:.2f} is above threshold "
+                            f"Valve-zone average ANFIS probability {zone_activation_probability:.2f} is above threshold "
                             f"{current_decision_threshold:.2f}, but valve zone {zone} was watered on "
                             f"{last_irrigated.isoformat() if last_irrigated else 'a recent day'}; "
                             f"water-saving cadence waits {cadence_days} days unless moisture is unsafe."
@@ -4118,14 +4824,20 @@ def _run_anfis_daily_irrigation(
                     del zone_trigger_decisions[zone]
 
                 for zone, trigger_decisions in zone_trigger_decisions.items():
-                    trigger_pot_ids = [int(decision["pot_id"]) for decision in trigger_decisions]
-                    trigger_pot_codes = [decision["pot_code"] for decision in trigger_decisions if decision.get("pot_code")]
-                    zone_max_probability = zone_probability_summary.get(zone, (slot_average_probability, slot_max_probability))[1]
+                    trigger_pot_ids = _trigger_pot_ids(trigger_decisions)
+                    trigger_sensor_ids = _trigger_sensor_ids(trigger_decisions)
+                    trigger_pot_codes = _trigger_pot_codes(trigger_decisions)
+                    zone_activation_probability = zone_probability_summary.get(zone, (slot_average_probability, slot_max_probability))[0]
                     zone_dose_factor = _anfis_zone_dose_factor(
                         trigger_decisions,
-                        zone_max_probability,
+                        zone_activation_probability,
                         day_profile,
                         current_decision_threshold,
+                    )
+                    minimum_runtime_min = (
+                        ANFIS_WATER_SAVING_POLICY.safety_minimum_runtime_min
+                        if ANFIS_WATER_SAVING_POLICY._has_safety_override(trigger_decisions)
+                        else ANFIS_WATER_SAVING_POLICY.minimum_runtime_min
                     )
                     for decision in trigger_decisions:
                         decision["dose_factor"] = zone_dose_factor
@@ -4143,22 +4855,35 @@ def _run_anfis_daily_irrigation(
                         zone_decision["full_dose_start_moisture_pct"] = round(zone_state.moisture, 2)
                         return zone_decision
 
+                    execution_decisions = _zone_execution_decision_map(
+                        decision_by_pot_id,
+                        zone_pots,
+                        zone,
+                        current_date,
+                        trigger_decisions,
+                    )
                     zone_events = _execute_valve_zone_distribution(
                         pot_states,
                         zone_pots,
                         zone,
                         current_date,
                         hour_weather,
-                        decision_by_pot_id,
+                        execution_decisions,
                         anfis_zone_decision,
                         DEFAULT_IRRIGATION_POLICY.irrigation_request,
                         {
                             "zone_triggered": True,
+                            "zone_trigger_sensor_ids": trigger_sensor_ids,
                             "zone_trigger_pot_ids": trigger_pot_ids,
                             "zone_trigger_pot_codes": trigger_pot_codes,
+                            "runtime_request_sensor_ids": trigger_sensor_ids,
                             "zone_dose_factor": zone_dose_factor,
                             "zone": zone,
+                            "zone_activation_probability": round(zone_activation_probability, 4),
+                            "zone_activation_policy": "sensor_pot_probability_with_safety_override",
+                            "zone_runtime_policy": "sensor_trigger_zone_budget_runtime",
                             "dose_policy_source": "anfis_water_saving_policy",
+                            "minimum_valve_runtime_min": minimum_runtime_min,
                         },
                     )
                     for event in zone_events:
@@ -4168,7 +4893,8 @@ def _run_anfis_daily_irrigation(
                             daily_water_ml += event["planned_volume_ml"]
                             hourly_events += 1
                             hourly_water_ml += event["planned_volume_ml"]
-                    last_irrigated_by_zone[zone] = current_date
+                    if zone_events:
+                        last_irrigated_by_zone[zone] = current_date
 
                 for pot in pots:
                     state = pot_states[pot["id"]]
@@ -4267,7 +4993,9 @@ def _run_anfis_daily_irrigation(
     )
     summary["stateSimulationStartDate"] = simulation_start_date.isoformat()
     summary["stateLookbackDays"] = (end_date - simulation_start_date).days + 1
-    summary["stateAnchorPolicy"] = "stable_historical_timeline"
+    summary["stateAnchorPolicy"] = "experiment_start_sensor_anchor"
+    summary["anfisSensorCalibrationPolicy"] = "initial_state_only"
+    summary.update(_sensor_control_summary_fields(pots, selected_sensor_context))
     if sensor_state_anchor is not None:
         summary["anfisSensorStateAnchor"] = sensor_state_anchor
     summary["potIrrigationDecisions"] = total_irrigation_decisions
@@ -4305,6 +5033,46 @@ def _copy_pot_states(states: dict[int, PotState]) -> dict[int, PotState]:
         pot_id: PotState(moisture=state.moisture, too_wet_hours=state.too_wet_hours)
         for pot_id, state in states.items()
     }
+
+
+def _serialize_pot_states(states: dict[int, PotState]) -> dict[str, dict[str, float | int]]:
+    return {
+        str(pot_id): {
+            "moisture": round(float(state.moisture), 4),
+            "too_wet_hours": int(state.too_wet_hours),
+        }
+        for pot_id, state in states.items()
+    }
+
+
+def _copy_pot_states_from_payload(
+    payload: dict[str, Any],
+    fallback_states: dict[int, PotState],
+) -> dict[int, PotState]:
+    states = _copy_pot_states(fallback_states)
+    if not isinstance(payload, dict):
+        return states
+
+    for raw_pot_id, raw_state in payload.items():
+        try:
+            pot_id = int(raw_pot_id)
+        except (TypeError, ValueError):
+            continue
+        if pot_id not in states:
+            continue
+
+        fallback = states[pot_id]
+        if isinstance(raw_state, dict):
+            moisture = _number(raw_state.get("moisture"), fallback.moisture)
+            too_wet_hours = int(_number(raw_state.get("too_wet_hours"), fallback.too_wet_hours))
+        else:
+            moisture = _number(raw_state, fallback.moisture)
+            too_wet_hours = fallback.too_wet_hours
+        states[pot_id] = PotState(
+            moisture=_clamp(moisture, 0.0, 100.0),
+            too_wet_hours=max(0, too_wet_hours),
+        )
+    return states
 
 
 def _group_weather_by_day(weather_rows: list[dict[str, Any]]) -> dict[date, list[dict[str, Any]]]:
@@ -4472,6 +5240,7 @@ def _day_profile(day: date, day_weather: list[dict[str, Any]], weather_by_day: d
     temperatures = [_number(row["temperature_c"], 20.0) for row in day_weather]
     humidities = [_number(row["relative_humidity_pct"], 60.0) for row in day_weather]
     cloud_covers = [_weather_cloud_cover_pct(row, 0.0) for row in day_weather]
+    radiation_values = [_number(row.get("shortwave_radiation_w_m2"), 0.0) for row in day_weather]
     precipitation = sum(_number(row["precipitation_mm"], 0.0) for row in day_weather)
     reference_et = sum(_hourly_reference_et_mm(row) for row in day_weather)
     rain_probabilities = [_number(row.get("precipitation_probability_pct"), 0.0) for row in day_weather]
@@ -4495,6 +5264,7 @@ def _day_profile(day: date, day_weather: list[dict[str, Any]], weather_by_day: d
     max_gust = max(gusts)
     avg_humidity = sum(humidities) / max(len(humidities), 1)
     avg_cloud_cover = sum(cloud_covers) / max(len(cloud_covers), 1)
+    avg_radiation = sum(radiation_values) / max(len(radiation_values), 1)
 
     return {
         "season": _season(day),
@@ -4504,6 +5274,8 @@ def _day_profile(day: date, day_weather: list[dict[str, Any]], weather_by_day: d
         "min_temperature_c": min(temperatures),
         "avg_humidity_pct": avg_humidity,
         "avg_cloud_cover_pct": avg_cloud_cover,
+        "avg_shortwave_radiation_w_m2": avg_radiation,
+        "max_shortwave_radiation_w_m2": max(radiation_values) if radiation_values else 0.0,
         "precipitation_mm": precipitation,
         "precipitation_next_14_days_mm": lookahead_precipitation,
         "reference_evapotranspiration_mm": reference_et,
@@ -4840,7 +5612,19 @@ def _anfis_training_example(
         return None
 
     state = PotState(moisture=_clamp(float(moisture), 0.0, 100.0))
-    inputs = _anfis_inputs(state, weather, sensor_reading, pot, day_profile)
+    prior_moisture = (
+        _number(prior_reading.get("soil_moisture_pct"), None)
+        if prior_reading
+        else None
+    )
+    inputs = _anfis_inputs(
+        state,
+        weather,
+        sensor_reading,
+        pot,
+        day_profile,
+        prior_moisture_pct=prior_moisture,
+    )
     probability = _anfis_training_target_probability(inputs)
     signals, weight = _anfis_training_signals(pot, sensor_reading, day_profile, prior_reading, slot_time)
     return {

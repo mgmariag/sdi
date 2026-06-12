@@ -43,6 +43,10 @@
             this._chartOverlayObservers = {};
             this._chartOverlayListenerCleanups = {};
             this._appliedChartWindowSignatures = {};
+            this._chartWindowSyncTimers = {};
+            this._chartWindowSyncObservers = {};
+            this._chartWindowSyncListenerCleanups = {};
+            this._syncedChartWindowSignatures = {};
             this._overviewRefreshTimer = null;
             this._overviewRefreshHandler = null;
             this._sensorPlacementDialog = null;
@@ -134,6 +138,9 @@
         },
 
         onExit() {
+            if (typeof this._destroyChartRuntime === "function") {
+                this._destroyChartRuntime();
+            }
             if (this._overviewRefreshTimer) {
                 clearInterval(this._overviewRefreshTimer);
                 this._overviewRefreshTimer = null;
@@ -562,7 +569,7 @@
             const cacheKey = this._experimentClientCacheKey(
                 model,
                 "anfis",
-                `all_available|${scenarioSeed}`
+                `all_available|${scenarioSeed}|auto_model`
             );
             if (this._loadExperimentResultFromCache(model, cacheKey, (result, clientCacheHit) => this._applyAnfisResult(model, result, clientCacheHit))) {
                 return;

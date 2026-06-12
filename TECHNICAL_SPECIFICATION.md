@@ -155,7 +155,7 @@ The default location is Cluj-Napoca, Romania, with timezone `Europe/Bucharest`.
 | `irrigation_events` | Planned/running/completed irrigation event rows generated from prescriptions. |
 | `irrigation_actuations` | Physical or simulated actuator work items linked to events and pots. |
 | `irrigation_prescriptions` | Daily dispatched prescription payloads per experiment type. |
-| `experiment_runs` | Optional experiment result snapshots for reproducing reported figures, summaries, and payloads. |
+| `experiment_runs` | Optional experiment result snapshots with range, execution timing, parameters, summaries, and payloads for reproducibility. |
 | `weather_refresh_runs` | Forecast/archive refresh audit rows with inserted/updated/unchanged counts and errors. |
 
 The schema intentionally drops legacy `irrigation_decisions` and `alerts` tables. Experiment decisions and alerts are returned as computed outputs and can be preserved inside selected `experiment_runs` snapshots rather than persisted as normalized primary database tables.
@@ -291,7 +291,7 @@ The simulation result contains entries, chart entries, pot details, sample event
 ### 10.5 Prescription and Actuation
 
 Experiment outputs can be converted into runtime prescriptions. The prescription store keeps the latest in-memory prescription per experiment and can persist daily prescription rows.
-Executed experiments can also be saved as append-only `experiment_runs` snapshots. These snapshots store parameters, summary metrics, and the JSON result payload so thesis figures and tables can be traced back to the exact application output without reintroducing normalized per-decision tables.
+Executed experiments can also be saved as append-only `experiment_runs` snapshots. These snapshots store the experiment range, runtime start/end timestamps, parameters, summary metrics, and the JSON result payload so thesis figures and tables can be traced back to the exact application output without reintroducing normalized per-decision tables.
 
 The actuation service then:
 
@@ -334,13 +334,20 @@ Key metrics include:
 
 ### 11.3 Fuzzy Digital Twin Experiment
 
-The fuzzy experiment computes irrigation prescriptions from three inputs:
+The fuzzy experiment computes irrigation prescriptions from three primary inputs:
 
 - Soil moisture percentage.
 - Temperature.
 - Rain amount.
 
-It uses fuzzy membership functions and defuzzification to produce an irrigation depth in millimeters. A dedicated `FuzzyIrrigationPolicy` owns fuzzy timing, trigger threshold, skip, prescription, and request-conversion semantics. The physical state, sensor, weather, and valve-zone mechanics remain shared simulation infrastructure.
+It also applies derived Digital Twin context indices as prescription modifiers:
+
+- `drying_demand_index`, derived from temperature, humidity, wind, and radiation.
+- `container_retention_index`, derived from pot size, container material, and soil retention.
+- `plant_water_need_index`, derived from plant type, moisture target, and heat sensitivity.
+- `moisture_trend`, derived from recent moisture history when available.
+
+It uses fuzzy membership functions and defuzzification to produce a base irrigation depth in millimeters, then adjusts that prescription using the derived context indices. A dedicated `FuzzyIrrigationPolicy` owns fuzzy timing, trigger threshold, skip, prescription, and request-conversion semantics. The physical state, sensor, weather, and valve-zone mechanics remain shared simulation infrastructure.
 
 The fuzzy policy is tuned as a comfort-preserving water saver. It uses a fuzzy comfort band near `moisture_target_pct - 6` while still staying above `moisture_min_pct + 3`, raises that band for heat/wind-sensitive cases, lets meaningful rain suppress only near-comfort non-critical watering, and scales fuzzy prescription volume toward the comfort band rather than the full target. Fuzzy can keep a small soft prescription above the trigger threshold so zone-level valve activation can include nearby pots when another pot opens the valve. Summary metrics report water savings together with comfort-preserved and moisture-safe savings values, using the fuzzy comfort band as the displayed threshold for the fuzzy experiment.
 
@@ -348,7 +355,7 @@ The fuzzy policy is tuned as a comfort-preserving water saver. It uses a fuzzy c
 
 The ANFIS implementation is a compact local approximation, not a validated agronomic model. It:
 
-- Uses moisture, temperature, and rain as inputs.
+- Uses moisture, temperature, effective rain, drying-demand index, container-retention index, plant-water-need index, and moisture trend as inputs.
 - Trains membership parameters and rule outputs from generated or recorded examples.
 - Produces irrigation probability and category outputs.
 - Applies operating thresholds and water-saving policy logic.
@@ -634,6 +641,7 @@ docker compose config
 | `digital_twin/simulation/irrigation_controller.py:267` | `FuzzyIrrigationPolicy` | Fuzzy-owned timing, trigger, skip, prescription, and request-conversion policy. |
 | `digital_twin/simulation/irrigation_controller.py:456` | `_make_baseline_irrigation_decision()` | Baseline rule decision logic. |
 | `digital_twin/simulation/irrigation_controller.py:529` | `_make_fuzzy_dt_decision()` | Fuzzy decision wrapper. |
+| `digital_twin/simulation/feature_indices.py` | Derived irrigation indices | Normalized drying-demand, container-retention, plant-water-need, and moisture-trend features. |
 | `digital_twin/simulation/soil_model.py` | Soil helpers | Season, sun, wind, clamp, and local weather helpers. |
 | `digital_twin/simulation/weather_model.py` | Weather helpers | Stored/estimated weather loading. |
 | `digital_twin/experiments/anfis.py:109` | `ANFIS` | Compact ANFIS-style model. |

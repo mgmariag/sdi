@@ -51,10 +51,52 @@
             "Baseline Water Usage (L)": "Water Usage"
         }
     };
+    const CHART_WINDOW_SYNC_GROUPS = [
+        ["samplingMoistureChart", "samplingContextChart"],
+        ["anfisMoistureChart", "anfisContextChart"],
+        ["fuzzyMoistureChart", "fuzzyContextChart"]
+    ];
 
     return {
         onAfterRendering() {
             this._styleCharts();
+        },
+
+        _destroyChartRuntime() {
+            this._clearChartRuntimeTimers(this._chartWindowTimers, true);
+            this._clearChartRuntimeTimers(this._chartOverlayTimers, true);
+            this._clearChartRuntimeTimers(this._chartWindowSyncTimers, false);
+            this._destroyChartRuntimeObservers(this._chartOverlayObservers);
+            this._destroyChartRuntimeObservers(this._chartWindowSyncObservers);
+            this._runChartRuntimeCleanups(this._chartOverlayListenerCleanups);
+            this._runChartRuntimeCleanups(this._chartWindowSyncListenerCleanups);
+        },
+
+        _clearChartRuntimeTimers(timerMap, valuesAreArrays) {
+            Object.keys(timerMap || {}).forEach((key) => {
+                const timers = valuesAreArrays ? timerMap[key] : [timerMap[key]];
+                timers.filter(Boolean).forEach((timerId) => clearTimeout(timerId));
+                delete timerMap[key];
+            });
+        },
+
+        _destroyChartRuntimeObservers(observerMap) {
+            Object.keys(observerMap || {}).forEach((key) => {
+                const entry = observerMap[key];
+                if (entry && entry.observer) {
+                    entry.observer.disconnect();
+                }
+                delete observerMap[key];
+            });
+        },
+
+        _runChartRuntimeCleanups(cleanupMap) {
+            Object.keys(cleanupMap || {}).forEach((key) => {
+                if (typeof cleanupMap[key] === "function") {
+                    cleanupMap[key]();
+                }
+                delete cleanupMap[key];
+            });
         },
 
         _styleCharts() {
@@ -70,6 +112,14 @@
             const formatString = CHART_FORMATS[chartId] || {};
             const visibility = this._chartVisibility();
             const dataShapes = visibleChartDataShapesByAxis(chartId, visibility);
+            const valueAxis = {
+                label: { style: { color: "#5d7187" } },
+                title: { visible: false }
+            };
+            const primaryAxisScale = this._primaryAxisScale(chartId);
+            if (primaryAxisScale) {
+                valueAxis.scale = primaryAxisScale;
+            }
 
             this._applyChartFeedVisibility(chart, chartId, visibility);
 
@@ -109,10 +159,7 @@
                 title: {
                     visible: false
                 },
-                valueAxis: {
-                    label: { style: { color: "#5d7187" } },
-                    title: { visible: false }
-                },
+                valueAxis,
                 valueAxis2: {
                     label: { style: { color: "#5d7187" } },
                     title: this._secondaryAxisTitle(chartId),
@@ -148,6 +195,21 @@
                 fuzzyContextChart: "Weather (mm / °C)"
             };
             return titles[chartId] ? this._axisTitle(titles[chartId]) : { visible: false };
+        },
+
+        _primaryAxisScale(chartId) {
+            if (!this._isMoistureChart(chartId)) {
+                return null;
+            }
+            const domain = this._moistureAxisDomain(chartId, this._moistureThresholdPct(chartId));
+            if (!domain) {
+                return null;
+            }
+            return {
+                fixedRange: true,
+                minValue: domain.min,
+                maxValue: domain.max
+            };
         },
 
         _axisTitle(text) {
@@ -364,6 +426,11 @@
                 }
             });
             this._appliedChartWindowSignatures[chartId] = signature;
+            this._setupChartWindowSyncState();
+            const initialRange = this._chartWindowRangeFromConfig(chartId, this._initialChartWindow(chartId));
+            if (initialRange) {
+                this._syncedChartWindowSignatures[chartId] = initialRange.signature;
+            }
         },
 
         _scheduleInitialChartWindow(chartId) {
@@ -376,6 +443,346 @@
             this._chartWindowTimers[chartId] = [0, 100, 300].map((delay) => setTimeout(() => {
                 this._applyInitialChartWindow(chartId);
             }, delay));
+        },
+
+        _setupChartWindowSyncState() {
+            this._chartWindowSyncTimers = this._chartWindowSyncTimers || {};
+            this._chartWindowSyncObservers = this._chartWindowSyncObservers || {};
+            this._chartWindowSyncListenerCleanups = this._chartWindowSyncListenerCleanups || {};
+            this._syncedChartWindowSignatures = this._syncedChartWindowSignatures || {};
+        },
+
+        _chartWindowSyncGroup(chartId) {
+            return CHART_WINDOW_SYNC_GROUPS.find((group) => group.includes(chartId)) || [];
+        },
+
+        _chartWindowSyncPeers(chartId) {
+            return this._chartWindowSyncGroup(chartId).filter((peerId) => peerId !== chartId && this.byId(peerId));
+        },
+
+        _trackChartWindowSync(chart, chartId) {
+            if (!this._chartWindowSyncPeers(chartId).length) {
+                return;
+            }
+            const chartDom = chart && chart.getDomRef && chart.getDomRef();
+            if (!chartDom) {
+                return;
+            }
+
+            this._setupChartWindowSyncState();
+            this._replaceChartWindowSyncListeners(chartDom, chartId);
+            this._observeChartWindowSyncSvg(chartDom, chartId);
+        },
+
+        _replaceChartWindowSyncListeners(chartDom, chartId) {
+            if (this._chartWindowSyncListenerCleanups[chartId]) {
+                this._chartWindowSyncListenerCleanups[chartId]();
+            }
+
+            const cleanupFns = [];
+            const schedule = () => {
+                this._scheduleChartOverlay(chartId);
+                this._scheduleChartWindowSyncFrom(chartId, 60);
+            };
+            const eventNames = ["wheel", "mouseup", "pointerup", "touchend", "keyup", "dblclick"];
+            eventNames.forEach((eventName) => {
+                chartDom.addEventListener(eventName, schedule, { passive: true });
+                cleanupFns.push(() => chartDom.removeEventListener(eventName, schedule));
+            });
+
+            this._chartHorizontalScrollNodes(chartDom).forEach((node, index) => {
+                const onScroll = () => {
+                    this._syncChartScrollPosition(chartId, node, index);
+                    schedule();
+                };
+                node.addEventListener("scroll", onScroll, { passive: true });
+                cleanupFns.push(() => node.removeEventListener("scroll", onScroll));
+            });
+
+            this._chartWindowSyncListenerCleanups[chartId] = () => cleanupFns.forEach((cleanup) => cleanup());
+        },
+
+        _observeChartWindowSyncSvg(chartDom, chartId) {
+            const svg = chartDom.querySelector("svg");
+            const existing = this._chartWindowSyncObservers[chartId];
+            if (!svg || (existing && existing.svg === svg)) {
+                return;
+            }
+            if (existing && existing.observer) {
+                existing.observer.disconnect();
+            }
+
+            let scheduled = false;
+            const observer = new MutationObserver(() => {
+                if (scheduled) {
+                    return;
+                }
+                scheduled = true;
+                requestAnimationFrame(() => {
+                    scheduled = false;
+                    this._scheduleChartWindowSyncFrom(chartId, 60);
+                });
+            });
+            observer.observe(svg, {
+                attributes: true,
+                childList: true,
+                subtree: true
+            });
+            this._chartWindowSyncObservers[chartId] = { observer, svg };
+        },
+
+        _scheduleChartWindowSyncFrom(chartId, delay) {
+            this._setupChartWindowSyncState();
+            if (this._isApplyingSyncedChartWindow || this._chartWindowSyncMuted()) {
+                return;
+            }
+
+            clearTimeout(this._chartWindowSyncTimers[chartId]);
+            this._chartWindowSyncTimers[chartId] = setTimeout(() => {
+                this._syncChartWindowFrom(chartId);
+            }, delay || 0);
+        },
+
+        _chartWindowSyncMuted() {
+            return this._chartWindowSyncMuteUntil && Date.now() < this._chartWindowSyncMuteUntil;
+        },
+
+        _syncChartWindowFrom(chartId) {
+            if (this._isApplyingSyncedChartWindow || !this._chartWindowSyncPeers(chartId).length) {
+                return;
+            }
+
+            const range = this._visibleChartWindowRange(chartId);
+            if (!range || !range.signature || this._syncedChartWindowSignatures[chartId] === range.signature) {
+                return;
+            }
+
+            this._syncedChartWindowSignatures[chartId] = range.signature;
+            this._isApplyingSyncedChartWindow = true;
+            this._chartWindowSyncMuteUntil = Date.now() + 180;
+            try {
+                this._chartWindowSyncPeers(chartId).forEach((peerId) => {
+                    this._applySyncedChartWindow(peerId, range);
+                });
+            } finally {
+                this._isApplyingSyncedChartWindow = false;
+            }
+        },
+
+        _applySyncedChartWindow(chartId, sourceRange) {
+            const chart = this.byId(chartId);
+            const range = this._chartWindowRangeForChart(chartId, sourceRange);
+            if (!chart || !range || !range.window) {
+                return;
+            }
+
+            chart.setVizProperties({
+                plotArea: {
+                    window: range.window
+                }
+            });
+            this._syncedChartWindowSignatures[chartId] = range.signature;
+            this._scheduleChartOverlay(chartId);
+        },
+
+        _visibleChartWindowRange(chartId) {
+            const domRange = this._visibleChartWindowRangeFromDom(chartId);
+            if (domRange) {
+                return domRange;
+            }
+
+            const chart = this.byId(chartId);
+            const properties = chart && chart.getVizProperties && chart.getVizProperties();
+            const windowConfig = properties && properties.plotArea && properties.plotArea.window;
+            return this._chartWindowRangeFromConfig(chartId, windowConfig);
+        },
+
+        _visibleChartWindowRangeFromDom(chartId) {
+            const chart = this.byId(chartId);
+            const chartDom = chart && chart.getDomRef && chart.getDomRef();
+            const rows = this.getView().getModel().getProperty(this._chartDataPath(chartId)) || [];
+            if (!chartDom || !Array.isArray(rows) || rows.length < 2) {
+                return null;
+            }
+
+            const plotBounds = this._renderedPlotBounds(chartDom);
+            if (!plotBounds) {
+                return null;
+            }
+
+            const points = this._visibleAxisLabelPoints(chartDom, rows, plotBounds)
+                .filter((point) => Number.isFinite(point.rowIndex) && Number.isFinite(point.x))
+                .sort((a, b) => a.x - b.x);
+            if (points.length < 2) {
+                return null;
+            }
+
+            const first = points[0];
+            const last = points[points.length - 1];
+            if (last.x <= first.x || last.rowIndex <= first.rowIndex) {
+                return null;
+            }
+
+            const indexPerPixel = (last.rowIndex - first.rowIndex) / (last.x - first.x);
+            const startIndex = this._clampChartRowIndex(
+                Math.round(first.rowIndex - ((first.x - plotBounds.left) * indexPerPixel)),
+                rows
+            );
+            const endIndex = this._clampChartRowIndex(
+                Math.round(last.rowIndex + ((plotBounds.right - last.x) * indexPerPixel)),
+                rows
+            );
+            if (endIndex <= startIndex) {
+                return null;
+            }
+
+            return this._chartWindowRangeFromIndexes(chartId, startIndex, endIndex);
+        },
+
+        _chartWindowRangeFromConfig(chartId, windowConfig) {
+            const rows = this.getView().getModel().getProperty(this._chartDataPath(chartId)) || [];
+            if (!windowConfig || !Array.isArray(rows) || rows.length < 2) {
+                return null;
+            }
+
+            const startLabel = this._chartWindowBoundaryLabel(windowConfig.start, rows[0]);
+            const endLabel = this._chartWindowBoundaryLabel(windowConfig.end, rows[rows.length - 1]);
+            const startIndex = this._chartRowIndexByLabel(rows, startLabel);
+            const endIndex = this._chartRowIndexByLabel(rows, endLabel);
+            if (startIndex < 0 || endIndex <= startIndex) {
+                return null;
+            }
+
+            return this._chartWindowRangeFromIndexes(chartId, startIndex, endIndex);
+        },
+
+        _chartWindowBoundaryLabel(boundary, fallbackRow) {
+            if (boundary === "firstDataPoint" || boundary === "lastDataPoint") {
+                return this._chartRowLabel(fallbackRow);
+            }
+            return boundary
+                && boundary.categoryAxis
+                && boundary.categoryAxis["Date/Time"];
+        },
+
+        _chartWindowRangeForChart(chartId, sourceRange) {
+            const rows = this.getView().getModel().getProperty(this._chartDataPath(chartId)) || [];
+            if (!Array.isArray(rows) || rows.length < 2) {
+                return null;
+            }
+
+            let startIndex = this._clampChartRowIndex(sourceRange.startIndex, rows);
+            let endIndex = this._clampChartRowIndex(sourceRange.endIndex, rows);
+            const labelStartIndex = this._chartRowIndexByLabel(rows, sourceRange.startLabel);
+            const labelEndIndex = this._chartRowIndexByLabel(rows, sourceRange.endLabel);
+            if (labelStartIndex >= 0) {
+                startIndex = labelStartIndex;
+            }
+            if (labelEndIndex >= 0) {
+                endIndex = labelEndIndex;
+            }
+            if (endIndex <= startIndex) {
+                return null;
+            }
+
+            return this._chartWindowRangeFromIndexes(chartId, startIndex, endIndex);
+        },
+
+        _chartWindowRangeFromIndexes(chartId, startIndex, endIndex) {
+            const rows = this.getView().getModel().getProperty(this._chartDataPath(chartId)) || [];
+            const startRow = rows[startIndex];
+            const endRow = rows[endIndex];
+            const startLabel = this._chartRowLabel(startRow);
+            const endLabel = this._chartRowLabel(endRow);
+            if (!startLabel || !endLabel) {
+                return null;
+            }
+
+            const windowConfig = startIndex === 0 && endIndex === rows.length - 1
+                ? {
+                    start: "firstDataPoint",
+                    end: "lastDataPoint"
+                }
+                : {
+                    start: {
+                        categoryAxis: {
+                            "Date/Time": startLabel
+                        }
+                    },
+                    end: {
+                        categoryAxis: {
+                            "Date/Time": endLabel
+                        }
+                    }
+                };
+
+            return {
+                startIndex,
+                endIndex,
+                startLabel,
+                endLabel,
+                window: windowConfig,
+                signature: [
+                    this._chartWindowSyncGroup(chartId).join(","),
+                    rows.length,
+                    startIndex,
+                    endIndex,
+                    startLabel,
+                    endLabel
+                ].join("|")
+            };
+        },
+
+        _chartRowIndexByLabel(rows, label) {
+            return rows.findIndex((row) => this._chartRowLabel(row) === label);
+        },
+
+        _clampChartRowIndex(index, rows) {
+            const numericIndex = Number(index);
+            if (!Number.isFinite(numericIndex)) {
+                return 0;
+            }
+            return Math.max(0, Math.min(rows.length - 1, Math.round(numericIndex)));
+        },
+
+        _chartHorizontalScrollNodes(chartDom) {
+            const nodes = [chartDom].concat(Array.from(chartDom.querySelectorAll("*")));
+            return nodes.filter((node) => {
+                if (!node || node.nodeType !== 1 || node.scrollWidth <= node.clientWidth + 1) {
+                    return false;
+                }
+                const style = getComputedStyle(node);
+                return style.overflowX !== "hidden" && style.overflowX !== "clip";
+            }).slice(0, 6);
+        },
+
+        _syncChartScrollPosition(chartId, sourceNode, sourceIndex) {
+            if (this._chartScrollSyncing) {
+                return;
+            }
+            const sourceMax = sourceNode.scrollWidth - sourceNode.clientWidth;
+            if (sourceMax <= 0) {
+                return;
+            }
+
+            const ratio = sourceNode.scrollLeft / sourceMax;
+            this._chartScrollSyncing = true;
+            this._chartWindowSyncPeers(chartId).forEach((peerId) => {
+                const peerChart = this.byId(peerId);
+                const peerDom = peerChart && peerChart.getDomRef && peerChart.getDomRef();
+                if (!peerDom) {
+                    return;
+                }
+                const peerNodes = this._chartHorizontalScrollNodes(peerDom);
+                const peerNode = peerNodes[sourceIndex] || peerNodes[0];
+                const peerMax = peerNode && (peerNode.scrollWidth - peerNode.clientWidth);
+                if (peerMax > 0) {
+                    peerNode.scrollLeft = ratio * peerMax;
+                }
+            });
+            setTimeout(() => {
+                this._chartScrollSyncing = false;
+            }, 0);
         },
 
         _chartRowLabel(row) {
@@ -516,11 +923,17 @@
                 ],
                 "ANFIS Moisture": [
                     ["ANFIS moisture", this._formatPopoverPercent(row.anfis_moisture)],
+                    ["Watered pots before", this._formatPopoverPercent(row.anfis_irrigated_pre_moisture)],
+                    ["Watered pots after", this._formatPopoverPercent(row.anfis_irrigated_post_moisture)],
+                    ["Watered-pot gain", this._formatPopoverPercent(row.anfis_irrigated_moisture_gain)],
                     ["ANFIS valves", this._formatPopoverValves(row, "anfis")],
                     ["ANFIS water", `${this._formatPopoverNumber(row.anfis_water_usage_l)} L`]
                 ],
                 "Fuzzy Moisture": [
                     ["Fuzzy moisture", this._formatPopoverPercent(row.fuzzy_moisture)],
+                    ["Watered pots before", this._formatPopoverPercent(row.fuzzy_irrigated_pre_moisture)],
+                    ["Watered pots after", this._formatPopoverPercent(row.fuzzy_irrigated_post_moisture)],
+                    ["Watered-pot gain", this._formatPopoverPercent(row.fuzzy_irrigated_moisture_gain)],
                     ["Fuzzy valves", this._formatPopoverValves(row, "fuzzy")],
                     ["Fuzzy water", `${this._formatPopoverNumber(row.fuzzy_water_usage_l)} L`]
                 ],
@@ -556,10 +969,10 @@
                 ],
                 [ANFIS_SCORE_MEASURE]: [
                     ["Zone signal", this._formatPopoverPercent(row.predicted_probability_percent)],
-                    ["Max valve probability", this._formatPopoverPercent(row.trigger_probability_percent)],
+                    ["Valve activation signal", this._formatPopoverPercent(row.trigger_probability_percent)],
                     ["Decision threshold", this._formatPopoverPercent(row.anfis_decision_threshold_percent)],
                     ["Average category", row.predicted_category || "N/A"],
-                    ["Max valve category", row.trigger_predicted_category || "N/A"],
+                    ["Activation category", row.trigger_predicted_category || "N/A"],
                     ["ANFIS valves", this._formatPopoverValves(row, "anfis")]
                 ],
                 [FUZZY_SCORE_MEASURE]: [
@@ -859,6 +1272,9 @@
         },
 
         _formatPopoverNumber(value) {
+            if (value === null || value === undefined || value === "") {
+                return "N/A";
+            }
             const numberValue = Number(value);
             return Number.isFinite(numberValue) ? numberValue.toFixed(2) : "N/A";
         },
@@ -886,6 +1302,7 @@
             const localChartId = chart.getId().split("--").pop();
             this._connectChartPopover(chart, localChartId);
             this._trackChartOverlay(chart, localChartId);
+            this._trackChartWindowSync(chart, localChartId);
             this._scheduleInitialChartWindow(localChartId);
             this._scheduleChartOverlay(localChartId);
         },
@@ -896,6 +1313,7 @@
                 setTimeout(() => {
                     this._styleChart(chart, chartId);
                     this._trackChartOverlay(chart, chartId);
+                    this._trackChartWindowSync(chart, chartId);
                     this._scheduleInitialChartWindow(chartId);
                     this._scheduleChartOverlay(chartId);
                 }, 0);
@@ -1217,6 +1635,13 @@
                 return null;
             }
 
+            const domain = this._moistureAxisDomain(chartId, thresholdPct);
+            if (domain && domain.max > domain.min) {
+                const clampedThreshold = Math.max(domain.min, Math.min(domain.max, thresholdPct));
+                const ratio = (clampedThreshold - domain.min) / (domain.max - domain.min);
+                return plotBounds.bottom - ratio * (plotBounds.bottom - plotBounds.top);
+            }
+
             const points = this._valueAxisLabelPoints(chartDom, plotBounds);
             if (points.length >= 2) {
                 const byValue = points.sort((a, b) => a.value - b.value);
@@ -1229,6 +1654,53 @@
             }
 
             return plotBounds.bottom - ((thresholdPct / 100) * (plotBounds.bottom - plotBounds.top));
+        },
+
+        _moistureAxisDomain(chartId, thresholdPct) {
+            if (!this._isMoistureChart(chartId)) {
+                return null;
+            }
+
+            const model = this.getView().getModel();
+            const rows = model ? model.getProperty(this._chartDataPath(chartId)) : [];
+            const keys = this._moistureAxisValueKeys(chartId);
+            const values = [];
+            (Array.isArray(rows) ? rows : []).forEach((row) => {
+                keys.forEach((key) => {
+                    const value = Number(row && row[key]);
+                    if (Number.isFinite(value)) {
+                        values.push(value);
+                    }
+                });
+            });
+            if (Number.isFinite(thresholdPct)) {
+                values.push(Number(thresholdPct));
+            }
+            if (!values.length) {
+                return { min: 0, max: 50 };
+            }
+
+            const minValue = Math.min(...values);
+            const maxValue = Math.max(...values);
+            const min = Math.min(0, Math.floor(minValue / 10) * 10);
+            const max = Math.max(50, Math.ceil(maxValue / 10) * 10);
+            return {
+                min,
+                max: max > min ? max : min + 10
+            };
+        },
+
+        _moistureAxisValueKeys(chartId) {
+            if (chartId === "samplingMoistureChart") {
+                return ["baseline_moisture", "sparse_moisture"];
+            }
+            if (chartId === "anfisMoistureChart") {
+                return ["baseline_moisture", "anfis_moisture"];
+            }
+            if (chartId === "fuzzyMoistureChart") {
+                return ["baseline_moisture", "fuzzy_moisture"];
+            }
+            return ["baseline_moisture"];
         },
 
         _moistureThresholdPct(chartId) {
@@ -1336,11 +1808,11 @@
 
         _visibleAxisLabelPoints(chartDom, rows, plotBounds) {
             const labelRows = new Map();
-            rows.forEach((row) => {
+            rows.forEach((row, rowIndex) => {
                 const label = this._chartRowLabel(row);
                 const timestamp = entryTimestamp(row);
                 if (label && timestamp) {
-                    labelRows.set(label, row);
+                    labelRows.set(label, { row, rowIndex });
                 }
             });
             if (!labelRows.size) {
@@ -1351,10 +1823,11 @@
             const pointsByTime = new Map();
             chartDom.querySelectorAll("svg text").forEach((node) => {
                 const label = (node.textContent || "").trim();
-                const row = labelRows.get(label);
-                if (!row || !node.getBoundingClientRect) {
+                const labelEntry = labelRows.get(label);
+                if (!labelEntry || !node.getBoundingClientRect) {
                     return;
                 }
+                const { row, rowIndex } = labelEntry;
                 const rect = node.getBoundingClientRect();
                 if (!rect.width || !rect.height) {
                     return;
@@ -1375,7 +1848,7 @@
                     return;
                 }
                 const time = timestamp.getTime();
-                const existing = pointsByTime.get(time) || { date: timestamp, xValues: [] };
+                const existing = pointsByTime.get(time) || { date: timestamp, rowIndex, xValues: [] };
                 existing.xValues.push(centerX);
                 pointsByTime.set(time, existing);
             });
@@ -1383,6 +1856,7 @@
             return Array.from(pointsByTime.values())
                 .map((point) => ({
                     date: point.date,
+                    rowIndex: point.rowIndex,
                     x: point.xValues.reduce((sum, value) => sum + value, 0) / point.xValues.length
                 }))
                 .sort((a, b) => a.date - b.date);

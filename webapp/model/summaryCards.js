@@ -379,6 +379,16 @@ sap.ui.define([
             return summary;
         }
 
+        const mismatches = rows.filter((row) => rowIrrigated(row, "baseline") !== rowIrrigated(row, "anfis"));
+        const baselineOnlyRows = rows.filter((row) => rowIrrigated(row, "baseline") && !rowIrrigated(row, "anfis"));
+        const anfisOnlyRows = rows.filter((row) => rowIrrigated(row, "anfis") && !rowIrrigated(row, "baseline"));
+        const missedValveRuns = rows.reduce((total, row) => (
+            total + Math.max(0, Math.round(numberValue(row && row.baseline_valve_runs)) - Math.round(numberValue(row && row.anfis_valve_runs)))
+        ), 0);
+        const extraValveRuns = rows.reduce((total, row) => (
+            total + Math.max(0, Math.round(numberValue(row && row.anfis_valve_runs)) - Math.round(numberValue(row && row.baseline_valve_runs)))
+        ), 0);
+
         const output = Object.assign({}, summary);
         setSummaryValue(output, "totalEntries", rows.length);
         setSummaryValue(output, "daysAnalyzed", rows.length);
@@ -386,6 +396,12 @@ sap.ui.define([
         setSummaryValue(output, "anfis_total_water_usage_l", sumRows(rows, "anfis_water_usage_l"));
         setSummaryValue(output, "baseline_irrigation_event_count", sumIntegerRows(rows, "baseline_irrigation_events"));
         setSummaryValue(output, "anfis_irrigation_event_count", sumIntegerRows(rows, "anfis_irrigation_events"));
+        setSummaryValue(output, "baseline_agreement_percent", rows.length ? roundedTotal((rows.length - mismatches.length) / rows.length * 100) : numberValue(summary.baseline_agreement_percent));
+        setSummaryValue(output, "baseline_mismatch_days", mismatches.length);
+        setSummaryValue(output, "baseline_only_irrigation_days", baselineOnlyRows.length);
+        setSummaryValue(output, "anfis_only_irrigation_days", anfisOnlyRows.length);
+        setSummaryValue(output, "missed_valve_run_delta", missedValveRuns);
+        setSummaryValue(output, "anfis_extra_valve_run_delta", extraValveRuns);
         if (rowsHaveKey(rows, "baseline_valve_runs") || rowsHaveKey(rows, "anfis_valve_runs")) {
             setSummaryValue(output, "baseline_valve_run_count", sumIntegerRows(rows, "baseline_valve_runs"));
             setSummaryValue(output, "anfis_valve_run_count", sumIntegerRows(rows, "anfis_valve_runs"));
@@ -399,6 +415,14 @@ sap.ui.define([
         }
 
         const mismatches = rows.filter((row) => rowIrrigated(row, "baseline") !== rowIrrigated(row, "fuzzy"));
+        const baselineOnlyRows = rows.filter((row) => rowIrrigated(row, "baseline") && !rowIrrigated(row, "fuzzy"));
+        const fuzzyOnlyRows = rows.filter((row) => rowIrrigated(row, "fuzzy") && !rowIrrigated(row, "baseline"));
+        const missedValveRuns = rows.reduce((total, row) => (
+            total + Math.max(0, Math.round(numberValue(row && row.baseline_valve_runs)) - Math.round(numberValue(row && row.fuzzy_valve_runs)))
+        ), 0);
+        const extraValveRuns = rows.reduce((total, row) => (
+            total + Math.max(0, Math.round(numberValue(row && row.fuzzy_valve_runs)) - Math.round(numberValue(row && row.baseline_valve_runs)))
+        ), 0);
         const baselineWater = sumRows(rows, "baseline_water_usage_l");
         const fuzzyWater = sumRows(rows, "fuzzy_water_usage_l");
         const waterSavings = roundedTotal(baselineWater - fuzzyWater);
@@ -411,6 +435,12 @@ sap.ui.define([
         setSummaryValue(output, "water_savings_percent", baselineWater > 0 ? roundedTotal(waterSavings / baselineWater * 100) : 0);
         setSummaryValue(output, "accuracy_percent", rows.length ? roundedTotal((rows.length - mismatches.length) / rows.length * 100) : numberValue(summary.accuracy_percent));
         setSummaryValue(output, "mismatch_days", mismatches.length);
+        setSummaryValue(output, "baseline_agreement_percent", rows.length ? roundedTotal((rows.length - mismatches.length) / rows.length * 100) : numberValue(summary.baseline_agreement_percent));
+        setSummaryValue(output, "baseline_mismatch_days", mismatches.length);
+        setSummaryValue(output, "baseline_only_irrigation_days", baselineOnlyRows.length);
+        setSummaryValue(output, "fuzzy_only_irrigation_days", fuzzyOnlyRows.length);
+        setSummaryValue(output, "missed_valve_run_delta", missedValveRuns);
+        setSummaryValue(output, "fuzzy_extra_valve_run_delta", extraValveRuns);
         setSummaryValue(output, "baseline_irrigation_event_count", sumIntegerRows(rows, "baseline_irrigation_events"));
         setSummaryValue(output, "fuzzy_irrigation_event_count", sumIntegerRows(rows, "fuzzy_irrigation_events"));
         setSummaryValue(output, "baseline_valve_run_count", sumIntegerRows(rows, "baseline_valve_runs"));

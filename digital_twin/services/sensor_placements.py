@@ -8,6 +8,8 @@ from digital_twin.domain.irrigation_methods import VALVE_COUNT, VALVE_ZONE_DESIG
 
 MIN_SENSOR_COUNT = VALVE_COUNT
 DEFAULT_SENSOR_COUNT = MIN_SENSOR_COUNT
+PLACEMENT_POLICY_VERSION = 2
+PLACEMENT_POLICY_NAME = "zone_fast_drying_representative"
 
 
 class SensorPlacementService:
@@ -67,7 +69,11 @@ def _current_placement_is_valid(current: dict[str, Any]) -> bool:
 
     selected_zones = {str(item.get("balcony_zone") or "") for item in items}
     required_zones = {item["zone"] for item in VALVE_ZONE_DESIGN}
-    return required_zones.issubset(selected_zones)
+    has_current_policy = all(
+        int((item.get("criteria") or {}).get("placement_policy_version") or 0) == PLACEMENT_POLICY_VERSION
+        for item in items
+    )
+    return required_zones.issubset(selected_zones) and has_current_policy
 
 
 def _score_pot(pot: dict[str, Any]) -> dict[str, Any]:
@@ -139,8 +145,7 @@ def _select_diverse_locations(scored: list[dict[str, Any]], sensor_count: int) -
         zone_candidates = [item for item in remaining if item["pot"]["balcony_zone"] == design["zone"]]
         if not zone_candidates:
             continue
-        representative_candidates = _dominant_plant_type_candidates(zone_candidates)
-        best = max(representative_candidates, key=lambda item: item["base_score"])
+        best = max(zone_candidates, key=lambda item: item["base_score"])
         selected.append(_selection_item(best, selected, role="valve_representative"))
         remaining.remove(best)
 
@@ -149,21 +154,6 @@ def _select_diverse_locations(scored: list[dict[str, Any]], sensor_count: int) -
         selected.append(_selection_item(best, selected, role="extra_coverage"))
         remaining.remove(best)
     return selected
-
-
-def _dominant_plant_type_candidates(zone_candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not zone_candidates:
-        return zone_candidates
-
-    counts: dict[str, int] = {}
-    for item in zone_candidates:
-        plant_type = str(item["pot"].get("plant_type_code") or "")
-        counts[plant_type] = counts.get(plant_type, 0) + 1
-
-    dominant_type, dominant_count = max(counts.items(), key=lambda item: (item[1], item[0]))
-    if dominant_count / max(len(zone_candidates), 1) < 0.30:
-        return zone_candidates
-    return [item for item in zone_candidates if item["pot"].get("plant_type_code") == dominant_type]
 
 
 def _selection_item(best: dict[str, Any], selected: list[dict[str, Any]], role: str) -> dict[str, Any]:
@@ -184,6 +174,8 @@ def _selection_item(best: dict[str, Any], selected: list[dict[str, Any]], role: 
             "diversity_penalty": penalty,
             "components": best["components"],
             "role": role,
+            "placement_policy": PLACEMENT_POLICY_NAME,
+            "placement_policy_version": PLACEMENT_POLICY_VERSION,
             "valve_number": valve_number,
             "valve_zone": pot["balcony_zone"],
         },
@@ -230,5 +222,11 @@ def _size_label(pot: dict[str, Any]) -> str:
     return pot["size_class"]
 
 
-__all__ = ["DEFAULT_SENSOR_COUNT", "MIN_SENSOR_COUNT", "SensorPlacementService"]
+__all__ = [
+    "DEFAULT_SENSOR_COUNT",
+    "MIN_SENSOR_COUNT",
+    "PLACEMENT_POLICY_NAME",
+    "PLACEMENT_POLICY_VERSION",
+    "SensorPlacementService",
+]
 

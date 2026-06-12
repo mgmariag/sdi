@@ -44,6 +44,13 @@ def _first_int(values: Any) -> int | None:
     return None
 
 
+def _float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _representative_pot_id(event: dict[str, Any]) -> int | None:
     return (
         _first_int(event.get("affected_pot_ids"))
@@ -74,12 +81,19 @@ def _experiment_run_row(
     parameters: dict[str, Any] | None,
     result: dict[str, Any],
 ) -> dict[str, Any]:
+    summary = result.get("summary") or {}
+    completed_at = now_local()
+    execution_seconds = max(0.0, _float(summary.get("execution_time_seconds"), 0.0))
+    started_at = completed_at - timedelta(seconds=execution_seconds)
     return {
         "experiment_type": experiment_type,
         "start_date": start_date,
         "end_date": end_date,
+        "computed_at": completed_at,
+        "started_at": started_at,
+        "completed_at": completed_at,
         "parameters": Jsonb(_json_ready(parameters or {})),
-        "summary": Jsonb(_json_ready(result.get("summary") or {})),
+        "summary": Jsonb(_json_ready(summary)),
         "payload": Jsonb(_json_ready(result)),
     }
 
@@ -145,13 +159,15 @@ class ExperimentRunRepository:
             saved = conn.execute(
                 """
                 INSERT INTO experiment_runs (
-                    experiment_type, start_date, end_date, parameters, summary, payload
+                    experiment_type, start_date, end_date, computed_at, started_at, completed_at,
+                    parameters, summary, payload
                 )
                 VALUES (
                     %(experiment_type)s, %(start_date)s, %(end_date)s,
+                    %(computed_at)s, %(started_at)s, %(completed_at)s,
                     %(parameters)s, %(summary)s, %(payload)s
                 )
-                RETURNING id, experiment_type, start_date, end_date, computed_at, parameters, summary, created_at
+                RETURNING id, experiment_type, start_date, end_date, computed_at, started_at, completed_at, parameters, summary, created_at
                 """,
                 row,
             ).fetchone()
@@ -169,7 +185,7 @@ class ExperimentRunRepository:
             if experiment_type:
                 return conn.execute(
                     """
-                    SELECT id, experiment_type, start_date, end_date, computed_at, parameters, summary, created_at
+                    SELECT id, experiment_type, start_date, end_date, computed_at, started_at, completed_at, parameters, summary, created_at
                     FROM experiment_runs
                     WHERE experiment_type = %(experiment_type)s
                     ORDER BY created_at DESC, id DESC
@@ -179,7 +195,7 @@ class ExperimentRunRepository:
                 ).fetchall()
             return conn.execute(
                 """
-                SELECT id, experiment_type, start_date, end_date, computed_at, parameters, summary, created_at
+                SELECT id, experiment_type, start_date, end_date, computed_at, started_at, completed_at, parameters, summary, created_at
                 FROM experiment_runs
                 ORDER BY created_at DESC, id DESC
                 LIMIT %(limit)s

@@ -169,6 +169,18 @@ def _schema_is_current(conn) -> bool:
                 WHERE table_name = 'experiment_runs'
                   AND column_name = 'payload'
             ) AS has_experiment_run_payload,
+            EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'experiment_runs'
+                  AND column_name = 'started_at'
+            ) AS has_experiment_run_started_at,
+            EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'experiment_runs'
+                  AND column_name = 'completed_at'
+            ) AS has_experiment_run_completed_at,
             EXISTS (SELECT 1 FROM pots LIMIT 1) AS has_seeded_pots
         """
     ).fetchone()
@@ -429,11 +441,15 @@ def create_schema(conn) -> None:
             start_date DATE NOT NULL,
             end_date DATE NOT NULL,
             computed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            completed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             parameters JSONB NOT NULL DEFAULT '{}'::jsonb,
             summary JSONB NOT NULL DEFAULT '{}'::jsonb,
             payload JSONB NOT NULL DEFAULT '{}'::jsonb,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+        ALTER TABLE experiment_runs ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ NOT NULL DEFAULT now();
+        ALTER TABLE experiment_runs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
         CREATE TABLE IF NOT EXISTS weather_refresh_runs (
             id BIGSERIAL PRIMARY KEY,

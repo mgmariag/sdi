@@ -46,16 +46,17 @@ class BaselineIrrigationControllerTests(unittest.TestCase):
         self.assertGreater(event["planned_volume_ml"], 0.0)
         self.assertEqual(event["slot"], "morning")
 
-    def test_fuzzy_keeps_soft_prescription_above_trigger_threshold(self) -> None:
+    def test_fuzzy_prescription_signal_can_activate_above_fixed_threshold(self) -> None:
         decision = _make_fuzzy_dt_decision(
             PotState(moisture=38.0),
             _pot(),
-            {"id": 1, "observed_local_at": datetime(2026, 5, 21, 8, 0, tzinfo=LOCAL_TZ), "temperature_c": 20.0},
-            _day_profile(),
+            {"id": 1, "observed_local_at": datetime(2026, 5, 21, 8, 0, tzinfo=LOCAL_TZ), "temperature_c": 32.0},
+            _day_profile(max_temperature_c=32.0),
         )
 
-        self.assertFalse(decision["should_irrigate"])
-        self.assertEqual(decision["reason_code"], "fuzzy_soft_zone_need")
+        self.assertTrue(decision["should_irrigate"])
+        self.assertEqual(decision["reason_code"], "fuzzy_prescription_signal")
+        self.assertGreater(decision["current_moisture_pct"], decision["fuzzy_trigger_threshold_pct"])
         self.assertGreater(decision["planned_volume_ml"], 0.0)
 
     def test_fuzzy_prescribes_when_moisture_is_below_trigger_threshold(self) -> None:
@@ -79,7 +80,7 @@ class BaselineIrrigationControllerTests(unittest.TestCase):
         )
 
         self.assertTrue(decision["should_irrigate"])
-        self.assertEqual(decision["reason_code"], "fuzzy_comfort_preserving_prescription")
+        self.assertEqual(decision["reason_code"], "fuzzy_low_moisture_prescription")
         self.assertGreaterEqual(decision["fuzzy_comfort_floor_pct"], 29.0)
 
     def test_fuzzy_does_not_treat_rain_as_comfort_when_moisture_is_low(self) -> None:
@@ -92,17 +93,56 @@ class BaselineIrrigationControllerTests(unittest.TestCase):
         )
 
         self.assertTrue(decision["should_irrigate"])
-        self.assertEqual(decision["reason_code"], "fuzzy_comfort_preserving_prescription")
+        self.assertEqual(decision["reason_code"], "fuzzy_low_moisture_prescription")
+
+    def test_fuzzy_rain_reduces_prescription_without_hard_skip(self) -> None:
+        weather = {"id": 1, "observed_local_at": datetime(2026, 5, 21, 6, 0, tzinfo=LOCAL_TZ), "temperature_c": 22.0}
+        dry_decision = DEFAULT_FUZZY_POLICY.make_decision(
+            PotState(moisture=34.0),
+            _pot(),
+            weather,
+            _day_profile(max_temperature_c=22.0),
+            "morning",
+        )
+        rainy_decision = DEFAULT_FUZZY_POLICY.make_decision(
+            PotState(moisture=34.0),
+            _pot(),
+            weather,
+            {**_day_profile(max_temperature_c=22.0), "precipitation_mm": 8.0},
+            "morning",
+        )
+
+        self.assertFalse(rainy_decision["should_irrigate"])
+        self.assertNotIn("rain_sufficient", rainy_decision["reason_code"])
+        self.assertLess(rainy_decision["prescription_mm"], dry_decision["prescription_mm"])
+        self.assertLess(rainy_decision["planned_volume_ml"], dry_decision["planned_volume_ml"])
+
+    def test_fuzzy_cold_remains_physical_hard_stop(self) -> None:
+        decision = DEFAULT_FUZZY_POLICY.make_decision(
+            PotState(moisture=15.0),
+            _pot(),
+            {"id": 1, "observed_local_at": datetime(2026, 2, 21, 10, 0, tzinfo=LOCAL_TZ), "temperature_c": 2.0},
+            _day_profile(max_temperature_c=2.0),
+            "winter_check",
+        )
+
+        self.assertFalse(decision["should_irrigate"])
+        self.assertEqual(decision["reason_code"], "fuzzy_cold_skip")
+        self.assertEqual(decision["prescription_mm"], 0.0)
+        self.assertEqual(decision["planned_volume_ml"], 0.0)
 
     def test_fuzzy_policy_owns_slot_decision_and_request_conversion(self) -> None:
         pot = _pot()
-        weather = {"id": 1, "observed_local_at": datetime(2026, 7, 21, 18, 0, tzinfo=LOCAL_TZ), "temperature_c": 36.0}
+        morning_weather = {"id": 1, "observed_local_at": datetime(2026, 7, 21, 6, 0, tzinfo=LOCAL_TZ), "temperature_c": 28.0}
+        weather = {"id": 2, "observed_local_at": datetime(2026, 7, 21, 18, 0, tzinfo=LOCAL_TZ), "temperature_c": 36.0}
         day_profile = _day_profile(max_temperature_c=36.0)
+        morning_slot = DEFAULT_FUZZY_POLICY.decision_slot(datetime(2026, 7, 21).date(), morning_weather["observed_local_at"], day_profile)
         slot = DEFAULT_FUZZY_POLICY.decision_slot(datetime(2026, 7, 21).date(), weather["observed_local_at"], day_profile)
 
         decision = DEFAULT_FUZZY_POLICY.make_decision(PotState(moisture=15.0), pot, weather, day_profile, slot or "morning")
         event = DEFAULT_FUZZY_POLICY.irrigation_request(pot, weather, decision)
 
+        self.assertEqual(morning_slot, "daily_prescription")
         self.assertEqual(slot, "evening")
         self.assertEqual(decision["slot"], "evening")
         self.assertEqual(event["slot"], "evening")

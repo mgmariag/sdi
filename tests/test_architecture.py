@@ -82,6 +82,8 @@ class ArchitectureTests(unittest.TestCase):
         self.assertIn("DROP TABLE IF EXISTS irrigation_decisions", schema)
         self.assertIn("DROP TABLE IF EXISTS alerts", schema)
         self.assertIn("CREATE TABLE IF NOT EXISTS experiment_runs", schema)
+        self.assertIn("started_at TIMESTAMPTZ", schema)
+        self.assertIn("completed_at TIMESTAMPTZ", schema)
 
     def test_consolidated_sensor_repositories_import(self) -> None:
         from digital_twin.db.repositories.sensor_repository import (

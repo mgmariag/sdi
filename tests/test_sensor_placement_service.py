@@ -4,7 +4,11 @@ import unittest
 from typing import Any
 
 from digital_twin.domain.irrigation_methods import VALVE_ZONE_DESIGN
-from digital_twin.services.sensor_placements import MIN_SENSOR_COUNT, SensorPlacementService
+from digital_twin.services.sensor_placements import (
+    MIN_SENSOR_COUNT,
+    PLACEMENT_POLICY_VERSION,
+    SensorPlacementService,
+)
 
 
 class SensorPlacementServiceTests(unittest.TestCase):
@@ -35,7 +39,13 @@ class SensorPlacementServiceTests(unittest.TestCase):
     def test_ensure_keeps_valid_valve_zone_plan(self) -> None:
         current = {
             "sensor_count": MIN_SENSOR_COUNT,
-            "items": [{"balcony_zone": item["zone"]} for item in VALVE_ZONE_DESIGN],
+            "items": [
+                {
+                    "balcony_zone": item["zone"],
+                    "criteria": {"placement_policy_version": PLACEMENT_POLICY_VERSION},
+                }
+                for item in VALVE_ZONE_DESIGN
+            ],
             "active_pot_count": 200,
         }
         repository = _FakePlacementRepository(current=current, pots=_pots_by_valve_zone())
@@ -46,16 +56,60 @@ class SensorPlacementServiceTests(unittest.TestCase):
         self.assertFalse(result["changed"])
         self.assertIsNone(repository.replaced_count)
 
-    def test_recommendation_prefers_dominant_plant_type_per_valve_zone(self) -> None:
+    def test_recommendation_prefers_fast_drying_zone_sentinel(self) -> None:
         pots = _pots_by_valve_zone()
         west_zone = VALVE_ZONE_DESIGN[0]["zone"]
         pots = [pot for pot in pots if pot["balcony_zone"] != west_zone]
         pots.extend(
             [
-                _pot(101, west_zone, plant_type_code="ornamentals", plant_type_label="Ornamentals", water_need_level="medium", heat_sensitive=False),
-                _pot(102, west_zone, plant_type_code="ornamentals", plant_type_label="Ornamentals", water_need_level="medium", heat_sensitive=False),
-                _pot(103, west_zone, plant_type_code="ornamentals", plant_type_label="Ornamentals", water_need_level="medium", heat_sensitive=False),
-                _pot(104, west_zone, plant_type_code="vegetables", plant_type_label="Vegetables", water_need_level="high", heat_sensitive=True),
+                _pot(
+                    101,
+                    west_zone,
+                    plant_type_code="ornamentals",
+                    plant_type_label="Ornamentals",
+                    water_need_level="medium",
+                    heat_sensitive=False,
+                    sun_exposure="partial",
+                    size_class="large",
+                    wind_exposure="sheltered",
+                    retention_factor=1.2,
+                ),
+                _pot(
+                    102,
+                    west_zone,
+                    plant_type_code="ornamentals",
+                    plant_type_label="Ornamentals",
+                    water_need_level="medium",
+                    heat_sensitive=False,
+                    sun_exposure="partial",
+                    size_class="large",
+                    wind_exposure="sheltered",
+                    retention_factor=1.2,
+                ),
+                _pot(
+                    103,
+                    west_zone,
+                    plant_type_code="ornamentals",
+                    plant_type_label="Ornamentals",
+                    water_need_level="medium",
+                    heat_sensitive=False,
+                    sun_exposure="partial",
+                    size_class="large",
+                    wind_exposure="sheltered",
+                    retention_factor=1.2,
+                ),
+                _pot(
+                    104,
+                    west_zone,
+                    plant_type_code="vegetables",
+                    plant_type_label="Vegetables",
+                    water_need_level="high",
+                    heat_sensitive=True,
+                    sun_exposure="reflected_heat",
+                    size_class="small",
+                    wind_exposure="gusty",
+                    retention_factor=0.75,
+                ),
             ]
         )
         repository = _FakePlacementRepository(pots=pots)
@@ -64,7 +118,8 @@ class SensorPlacementServiceTests(unittest.TestCase):
         result = service.recommend(sensor_count=MIN_SENSOR_COUNT)
 
         west_sensor = next(item for item in result["items"] if item["pot"]["balcony_zone"] == west_zone)
-        self.assertEqual(west_sensor["pot"]["plant_type_code"], "ornamentals")
+        self.assertEqual(west_sensor["pot"]["id"], 104)
+        self.assertEqual(west_sensor["criteria"]["placement_policy_version"], PLACEMENT_POLICY_VERSION)
 
 
 class _FakePlacementRepository:
@@ -118,12 +173,16 @@ def _pot(
     plant_type_label: str = "Basil",
     water_need_level: str = "medium",
     heat_sensitive: bool = False,
+    sun_exposure: str = "full",
+    size_class: str = "medium",
+    wind_exposure: str = "moderate",
+    retention_factor: float = 1.0,
 ) -> dict[str, Any]:
     return {
         "id": index,
         "pot_code": f"P{index}",
         "label": f"Pot {index}",
-        "size_class": "medium",
+        "size_class": size_class,
         "small_subtype": None,
         "plant_type_code": plant_type_code,
         "plant_type_label": plant_type_label,
@@ -131,11 +190,11 @@ def _pot(
         "heat_sensitive": heat_sensitive,
         "balcony_zone": zone,
         "rain_exposure": "partially_exposed",
-        "sun_exposure": "full",
-        "wind_exposure": "moderate",
+        "sun_exposure": sun_exposure,
+        "wind_exposure": wind_exposure,
         "container_material": "plastic",
         "evaporation_factor": 1.0,
-        "retention_factor": 1.0,
+        "retention_factor": retention_factor,
     }
 
 

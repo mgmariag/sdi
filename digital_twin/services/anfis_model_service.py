@@ -12,6 +12,7 @@ from digital_twin.db.repositories.anfis_model_repository import (
 )
 from digital_twin.db.connection import get_connection
 from digital_twin.db.schema import initialize_database
+from digital_twin.experiments.anfis import DEFAULT_INPUTS as ANFIS_INPUT_FEATURES
 from digital_twin.simulation.engine import (
     ANFIS_TRAINING_DATASET_VERSION,
     deserialize_trained_anfis_model,
@@ -20,8 +21,9 @@ from digital_twin.simulation.engine import (
 )
 
 
-DEFAULT_ANFIS_GENERATIONS = 12
-DEFAULT_ANFIS_POPULATION = 12
+DEFAULT_ANFIS_GENERATIONS = 50
+DEFAULT_ANFIS_POPULATION = 32
+DEFAULT_ANFIS_TRAINING_MONTHS = 12
 
 logger = logging.getLogger("digital_twin.anfis_model")
 
@@ -41,6 +43,8 @@ class AnfisModelService:
             return None
         payload = row.get("model_payload") or {}
         metrics = dict(row.get("metrics") or {})
+        model = deserialize_trained_anfis_model(payload)
+        actual_input_features = list(getattr(model.global_model, "input_names", []) or [])
         metadata = {
             **metrics,
             "model_id": row.get("id"),
@@ -60,9 +64,11 @@ class AnfisModelService:
             "population": row.get("population"),
             "training_start_date": row.get("training_start_date") or metrics.get("training_start_date"),
             "training_end_date": row.get("training_end_date") or metrics.get("training_end_date"),
+            "anfis_input_features": actual_input_features,
+            "expected_anfis_input_features": list(ANFIS_INPUT_FEATURES),
         }
         return {
-            "model": deserialize_trained_anfis_model(payload),
+            "model": model,
             "metadata": metadata,
             "row": row,
         }
@@ -98,6 +104,7 @@ class AnfisModelService:
             "generations": int(generations),
             "population": int(population),
             "training_dataset_version": ANFIS_TRAINING_DATASET_VERSION,
+            "anfis_input_features": list(ANFIS_INPUT_FEATURES),
         }
         if not force and latest and not self._needs_training(latest, sensor_watermark, config):
             return {
@@ -132,6 +139,7 @@ class AnfisModelService:
             **training_result.metadata,
             "evaluation": training_result.evaluation,
             "sensor_watermark": sensor_watermark,
+            "anfis_input_features": list(training_result.model.global_model.input_names),
         }
         saved = self.repository.upsert(
             model_key=model_key,
@@ -183,10 +191,26 @@ class AnfisModelService:
             return True
         if int(metrics.get("training_dataset_version") or 0) != int(config.get("training_dataset_version") or 0):
             return True
+        if AnfisModelService._stored_input_features(latest) != list(config.get("anfis_input_features") or []):
+            return True
         for field in ("seed", "generations", "population"):
             if latest.get(field) != config.get(field):
                 return True
         return False
+
+    @staticmethod
+    def _stored_input_features(latest: dict[str, Any]) -> list[str]:
+        metrics = latest.get("metrics") or {}
+        metric_features = metrics.get("anfis_input_features")
+        if isinstance(metric_features, list) and metric_features:
+            return [str(item) for item in metric_features]
+
+        payload = latest.get("model_payload") or {}
+        global_model = payload.get("global_model") or {}
+        payload_features = global_model.get("input_names")
+        if isinstance(payload_features, list) and payload_features:
+            return [str(item) for item in payload_features]
+        return []
 
     @staticmethod
     def _resolve_training_range(start_date: date | None, end_date: date | None) -> tuple[date, date]:
@@ -194,7 +218,7 @@ class AnfisModelService:
             with get_connection() as conn:
                 end_date = conn.execute("SELECT max(observed_date) FROM weather_hourly").fetchone()[0]
         end_date = end_date or date.today()
-        return start_date or _add_months(end_date, -1), end_date
+        return start_date or _add_months(end_date, -DEFAULT_ANFIS_TRAINING_MONTHS), end_date
 
 
 def _add_months(value: date, months: int) -> date:

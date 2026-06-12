@@ -10,7 +10,11 @@ from digital_twin.experiments.base import EngineBackedExperiment
 from digital_twin.simulation.dto import ExperimentSnapshot
 
 
-DEFAULT_INPUTS = ["moisture", "temperature", "rain"]
+DEFAULT_INPUTS = [
+    "moisture",
+    "temperature",
+    "rain",
+]
 DEFAULT_RANGES = {
     "moisture": (0.0, 100.0),
     "temperature": (-5.0, 40.0),
@@ -40,29 +44,53 @@ def probability_category(probability: float) -> str:
         return "medium"
     return "high"
 
+def _compact_rule_indices(input_names: list[str]) -> tuple[tuple[int, ...], ...]:
+    """Build a tractable ANFIS rule base for the selected feature set."""
+    if len(input_names) <= 3:
+        return tuple(product(range(3), repeat=len(input_names)))
 
-def category_probability(category: str) -> float:
-    return {
-        "low": 0.15,
-        "medium": 0.45,
-        "high": 0.80,
-    }[category]
+    input_index = {name: index for index, name in enumerate(input_names)}
+    neutral = tuple(1 for _ in input_names)
+    rules: set[tuple[int, ...]] = {neutral}
 
+    primary_names = [
+        name
+        for name in ("moisture", "temperature", "rain")
+        if name in input_index
+    ]
+    for levels in product(range(3), repeat=len(primary_names)):
+        rule = list(neutral)
+        for name, level in zip(primary_names, levels):
+            rule[input_index[name]] = level
+        rules.add(tuple(rule))
 
-def irrigation_requirement_class(
-    moisture: float,
-    temperature: float,
-    rain: float,
-) -> str:
-    return probability_category(target_probability(moisture, temperature, rain))
+    moisture_index = input_index.get("moisture")
+    context_names = [name for name in input_names if name not in primary_names]
+    if moisture_index is not None:
+        for context_name in context_names:
+            context_index = input_index[context_name]
+            for moisture_level in range(3):
+                for context_level in range(3):
+                    rule = list(neutral)
+                    rule[moisture_index] = moisture_level
+                    rule[context_index] = context_level
+                    rules.add(tuple(rule))
 
+    for context_name in context_names:
+        context_index = input_index[context_name]
+        for context_level in range(3):
+            rule = list(neutral)
+            rule[context_index] = context_level
+            rules.add(tuple(rule))
+
+    return tuple(sorted(rules))
 
 def target_probability(
     moisture: float,
     temperature: float,
     rain: float,
 ) -> float:
-    """Three-input irrigation probability target used for ANFIS supervision."""
+    """Irrigation probability target used for ANFIS supervision."""
     dryness_score = clamp((64.0 - moisture) / 40.0, 0.0, 1.0)
     heat_score = clamp((temperature - 24.0) / 12.0, 0.0, 1.0)
     rain_score = clamp(rain / 6.0, 0.0, 1.0)
@@ -86,26 +114,6 @@ def target_probability(
     return clamp(probability, 0.02, 0.98)
 
 
-def generate_anfis_dataset(samples: int = 500, seed: int | None = None) -> list[dict[str, float | str]]:
-    rng = random.Random(seed)
-    dataset: list[dict[str, float | str]] = []
-    for _ in range(samples):
-        moisture = rng.uniform(0.0, 100.0)
-        temperature = rng.uniform(5.0, 38.0)
-        rain = rng.uniform(0.0, 15.0)
-        probability = target_probability(moisture, temperature, rain)
-        dataset.append(
-            {
-                "moisture": moisture,
-                "temperature": temperature,
-                "rain": rain,
-                "target_probability": probability,
-                "target_category": probability_category(probability),
-            }
-        )
-    return dataset
-
-
 class ANFIS:
     """Compact first-order ANFIS classifier trained from recorded sensor examples."""
 
@@ -116,7 +124,7 @@ class ANFIS:
         input_names: list[str] | None = None,
     ):
         self.input_names = list(input_names or DEFAULT_INPUTS)
-        self.rule_indices = tuple(product(range(3), repeat=len(self.input_names)))
+        self.rule_indices = _compact_rule_indices(self.input_names)
         self.membership_params = membership_params or self._initial_membership_params()
         self.rule_outputs = rule_outputs or self._initial_rule_outputs()
 

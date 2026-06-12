@@ -16,14 +16,21 @@ from digital_twin.core.exceptions import ExperimentConfigurationError, InvalidDa
 from digital_twin.control import run_default_dt_control
 from digital_twin.control.prescriptions import runtime_prescription_store
 from digital_twin.db.connection import get_connection
+from digital_twin.db.repositories.anfis_model_repository import DEFAULT_MODEL_KEY
 from digital_twin.db.repositories.experiment_repository import ExperimentRunRepository
+from digital_twin.experiments.anfis import DEFAULT_INPUTS as ANFIS_INPUT_FEATURES
 from digital_twin.experiments import (
     load_experiment_snapshot,
     run_daily_anfis_experiment,
     run_daily_fuzzy_dt_experiment,
     run_daily_sampling_experiment,
 )
-from digital_twin.services.anfis_model_service import AnfisModelService
+from digital_twin.services.anfis_model_service import (
+    DEFAULT_ANFIS_GENERATIONS,
+    DEFAULT_ANFIS_POPULATION,
+    AnfisModelService,
+)
+from digital_twin.simulation.engine import ANFIS_TRAINING_DATASET_VERSION
 from digital_twin.services.irrigation_service import IrrigationActuationService
 
 
@@ -32,6 +39,9 @@ logger = logging.getLogger("digital_twin.experiments")
 DEFAULT_SCENARIO_SEED = 2026
 DEFAULT_SAMPLING_INTERVAL_DAYS = 3
 DEFAULT_SNAPSHOT_CACHE_TTL_SECONDS = 15 * 60
+ANFIS_MODEL_KEY_BY_START_YEAR = {
+    2023: "anfis-2023-simulated",
+}
 
 _experiment_cache = SingleFlightCache()
 _snapshot_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -136,7 +146,18 @@ def run_anfis_experiment(
         persist=True,
     )
     result.setdefault("summary", {})["cacheHit"] = False
-    _store_experiment_run("anfis", start, end, {"seed": seed}, result)
+    resolved_model_key = _resolve_anfis_model_key(start, end)
+    _store_experiment_run(
+        "anfis",
+        start,
+        end,
+        {
+            "seed": seed,
+            "model_key": resolved_model_key,
+            "model_selection_policy": "start_year_auto",
+        },
+        result,
+    )
     # schedule_related_precompute(
     #     "anfis",
     #     start,
@@ -357,18 +378,22 @@ def _anfis_payload(
 ) -> dict[str, Any]:
     snapshot, snapshot_cache_hit = get_cached_snapshot(start, end)
     baseline = _shared_baseline_result(start, end)
-    persisted_model = AnfisModelService().load_latest_model()
+    resolved_model_key = _resolve_anfis_model_key(start, end)
+    persisted_model = AnfisModelService().load_latest_model(resolved_model_key)
     if not persisted_model:
         raise ExperimentConfigurationError(
-            "No persisted ANFIS model is available. Run "
-            "`docker compose --profile anfis-training up --build anfis-trainer` first."
+            f"No persisted ANFIS model is available for key '{resolved_model_key}'. Run "
+            "`docker compose --profile anfis-training up --build anfis-trainer` first, "
+            "or add a trained model for the requested date range."
         )
     if not _persisted_anfis_model_matches(
         persisted_model["metadata"],
         seed,
+        strict_training_config=resolved_model_key == DEFAULT_MODEL_KEY,
     ):
         raise ExperimentConfigurationError(
-            "The persisted ANFIS model was trained with different ANFIS seed or sample-policy settings. "
+            "The persisted ANFIS model was trained with different ANFIS seed, input-feature, "
+            "sample-policy, or default training settings. "
             "Run the ANFIS trainer with matching parameters or use the default endpoint parameters."
         )
     result = run_daily_anfis_experiment(
@@ -382,6 +407,9 @@ def _anfis_payload(
         training_metadata=persisted_model["metadata"],
     )
     result = _annotate_snapshot_cache(result, snapshot, snapshot_cache_hit)
+    result.setdefault("summary", {})["anfisModelKey"] = resolved_model_key
+    result.setdefault("summary", {})["anfisModelSelectionPolicy"] = "start_year_auto"
+    result.setdefault("summary", {})["anfisModelSelectionYear"] = start.year
     if persist:
         _store_runtime_prescription("anfis", start, end, result)
     return result
@@ -390,8 +418,27 @@ def _anfis_payload(
 def _persisted_anfis_model_matches(
     metadata: dict[str, Any],
     seed: int | None,
+    strict_training_config: bool = True,
 ) -> bool:
-    return metadata.get("training_sample_policy") == "all_available_sensor_readings" and metadata.get("seed") == seed
+    base_match = (
+        metadata.get("training_sample_policy") == "all_available_sensor_readings"
+        and int(metadata.get("training_dataset_version") or 0) == ANFIS_TRAINING_DATASET_VERSION
+        and metadata.get("seed") == seed
+        and list(metadata.get("anfis_input_features") or []) == list(ANFIS_INPUT_FEATURES)
+    )
+    if not base_match:
+        return False
+    if not strict_training_config:
+        return True
+    return (
+        int(metadata.get("generations") or 0) == DEFAULT_ANFIS_GENERATIONS
+        and int(metadata.get("population") or 0) == DEFAULT_ANFIS_POPULATION
+    )
+
+
+def _resolve_anfis_model_key(start: date, end: date) -> str:
+    """Select the persisted ANFIS model from the range lower bound."""
+    return ANFIS_MODEL_KEY_BY_START_YEAR.get(start.year, DEFAULT_MODEL_KEY)
 
 
 def _fuzzy_dt_payload(start: date, end: date, persist: bool = True) -> dict[str, Any]:
@@ -439,6 +486,8 @@ def _store_experiment_run(
         return
     result.setdefault("summary", {})["experimentRunId"] = row["id"]
     result["summary"]["experimentRunSavedAt"] = row["created_at"].isoformat()
+    result["summary"]["experimentRunStartedAt"] = row["started_at"].isoformat()
+    result["summary"]["experimentRunCompletedAt"] = row["completed_at"].isoformat()
 
 
 def list_experiment_runs(experiment_type: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
@@ -457,6 +506,8 @@ def _format_experiment_run(row: dict[str, Any], include_payload: bool = False) -
         "startDate": row["start_date"].isoformat(),
         "endDate": row["end_date"].isoformat(),
         "computedAt": row["computed_at"].isoformat(),
+        "startedAt": row["started_at"].isoformat(),
+        "completedAt": row["completed_at"].isoformat(),
         "createdAt": row["created_at"].isoformat(),
         "parameters": row.get("parameters") or {},
         "summary": row.get("summary") or {},
@@ -617,6 +668,7 @@ def _anfis_cache_key(
         start,
         end,
         seed,
+        _resolve_anfis_model_key(start, end),
         persist,
         _sensor_placement_cache_token(),
     )
