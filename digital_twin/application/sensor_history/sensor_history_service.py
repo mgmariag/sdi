@@ -8,10 +8,10 @@ from digital_twin.application.sensor_history.readings.core import (
     ensure_tiered_sensor_readings,
     generate_due_sensor_readings,
     generate_sensor_readings_at,
-    get_sensor_availability,
     ingest_actual_sensor_readings,
     seed_historical_sensor_readings,
 )
+from digital_twin.application.sensor_history.readings.availability import get_sensor_availability
 from digital_twin.core.exceptions import InvalidDateRange
 from digital_twin.domain.sensors import ACTUAL_SENSOR_SOURCE
 from digital_twin.infrastructure.database.repositories.sensors import SensorRepository

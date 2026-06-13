@@ -3,12 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import date
 
-from digital_twin.application.sensor_history.readings.core import (
-    indoor_hourly_moisture_loss as sensor_indoor_loss,
-)
-from digital_twin.simulation.soil_model import (
-    indoor_hourly_moisture_loss as simulation_indoor_loss,
-)
+from digital_twin.simulation.soil_model import indoor_hourly_moisture_loss
 
 
 class IndoorMoistureLossTests(unittest.TestCase):
@@ -16,12 +11,8 @@ class IndoorMoistureLossTests(unittest.TestCase):
         pot = {"plant_type_code": "herbs"}
 
         self.assertLess(
-            simulation_indoor_loss(pot, date(2026, 1, 15)),
-            simulation_indoor_loss(pot, date(2026, 4, 15)),
-        )
-        self.assertEqual(
-            simulation_indoor_loss(pot, date(2026, 1, 15)),
-            sensor_indoor_loss(pot, date(2026, 1, 15)),
+            indoor_hourly_moisture_loss(pot, date(2026, 1, 15)),
+            indoor_hourly_moisture_loss(pot, date(2026, 4, 15)),
         )
 
 

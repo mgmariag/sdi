@@ -18,8 +18,7 @@ from digital_twin.simulation.metrics import (
 from digital_twin.simulation.result_helpers import (
     chart_entries_for_range,
     daily_summary,
-    event_water_usage_l_by_pot,
-    pot_info_entries,
+    experiment_result,
 )
 from digital_twin.simulation.shared.types import ExperimentSnapshot
 from digital_twin.simulation.soil_model import (
@@ -40,7 +39,7 @@ from digital_twin.simulation.state.lookback import (
     hourly_line_metadata,
 )
 from digital_twin.simulation.state.projection import initialize_states_from_first_day_sensor_readings
-from digital_twin.simulation.state.sensor_context import (
+from digital_twin.simulation.sensors.context import (
     sensor_control_pots,
     sensor_control_summary_fields,
     with_sensor_key,
@@ -438,17 +437,13 @@ def run_fuzzy_dt_daily_irrigation(
         summary["stateSensorAnchor"] = sensor_state_anchor
     chart_entries = chart_entries_for_range(start_date, end_date, entries, detail_entries)
     add_chart_summary(summary, chart_entries, start_date, end_date)
-    return {
-        "entries": entries,
-        "chartEntries": chart_entries,
-        "summary": summary,
-        "pots": pot_info_entries(
-            pots,
-            {"period_water_usage_l": event_water_usage_l_by_pot(events)},
-        ),
-        "sampleDecisions": valve_rollup["decisions"][:200],
-        "sampleEvents": valve_rollup["events"][:200],
-        "samplePotDecisions": decisions[:200],
-        "samplePotEvents": events[:200],
-        "sampleAlerts": alerts[:200],
-    }
+    return experiment_result(
+        entries=entries,
+        chart_entries=chart_entries,
+        summary=summary,
+        pots=pots,
+        valve_rollup=valve_rollup,
+        decisions=decisions,
+        events=events,
+        alerts=alerts,
+    )

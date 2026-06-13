@@ -1,16 +1,24 @@
 ﻿from __future__ import annotations
 
 import argparse
-import random
 import time as sleep_time
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from psycopg.rows import dict_row
-from psycopg.types.json import Jsonb
 
+import digital_twin.application.sensor_history.readings.state_rows as sensor_rows
+import digital_twin.application.sensor_history.readings.shared as reading_shared
+from digital_twin.application.sensor_history.readings.shared import (
+    DAILY_READING_TIMES,
+    DAILY_RETENTION_DAYS,
+    DEFAULT_HISTORY_START,
+    HOURLY_RETENTION_DAYS,
+    LOCAL_TZ,
+    RAW_RETENTION_HOURS,
+    query_sources as _query_sources,
+)
 from digital_twin.application.sensor_placement.sensor_placement_service import (
     SensorPlacementService,
 )
@@ -18,35 +26,26 @@ from digital_twin.core.config import get_settings
 from digital_twin.domain.sensors import (
     ACTUAL_READING_INTERVAL_MINUTES,
     ACTUAL_SENSOR_SOURCE,
-    ACTUATOR_FEEDBACK_SOURCE,
     DAILY_RESOLUTION,
     DEFAULT_SENSOR_SOURCE,
     HOURLY_RESOLUTION,
     RAW_RESOLUTION,
 )
-from digital_twin.domain.valves import VALVE_ZONE_DESIGN
-from digital_twin.domain.weather import (
-    DEFAULT_LOCAL_TIMEZONE,
-    DEFAULT_WEATHER_LOCATION_NAME,
-)
 from digital_twin.infrastructure.database.connection import get_connection
 from digital_twin.infrastructure.database.schema.lifecycle import initialize_database
 from digital_twin.simulation.soil_model import (
-    apply_hourly_environment_moisture,
-    clamp,
     local_observed_at,
-    minimum_realistic_moisture,
     number,
 )
 
-LOCATION_NAME = DEFAULT_WEATHER_LOCATION_NAME
-LOCAL_TZ = ZoneInfo(DEFAULT_LOCAL_TIMEZONE)
-DEFAULT_HISTORY_START = date(2025, 5, 22)
-RAW_RETENTION_HOURS = 24
-HOURLY_RETENTION_DAYS = 7
-DAILY_RETENTION_DAYS = 366
-DAILY_READING_TIMES = (time(1, 0), time(5, 30), time(14, 0), time(17, 30))
-DAILY_READING_SLOTS_PER_DAY = len(DAILY_READING_TIMES)
+_align_to_reading_interval = reading_shared.align_to_reading_interval
+_as_local = reading_shared.as_local
+_db_timestamp = reading_shared.db_timestamp
+_next_scheduled_datetime = reading_shared.next_scheduled_datetime
+_reading_interval_minutes = reading_shared.reading_interval_minutes
+_scheduled_datetimes = reading_shared.scheduled_datetimes
+_tiered_periods = reading_shared.tiered_periods
+_today_local = reading_shared.today_local
 
 
 def seed_historical_sensor_readings(
@@ -63,12 +62,12 @@ def seed_historical_sensor_readings(
         raise ValueError("end_date must not be before start_date")
 
     initialize_database()
-    pots = _load_pots()
-    weather_rows = load_weather(start_date, end_date)
+    pots = sensor_rows.load_pots()
+    weather_rows = sensor_rows.load_weather(start_date, end_date)
     weather_index = 0
     latest_weather: dict[str, Any] | None = None
 
-    states = _initial_sensor_states(pots)
+    states = sensor_rows.initial_sensor_states(pots)
     pending_rows: list[dict[str, Any]] = []
     inserted_or_updated = 0
     total_readings = 0
@@ -83,24 +82,24 @@ def seed_historical_sensor_readings(
             while weather_index < len(weather_rows) and local_observed_at(weather_rows[weather_index]) <= current:
                 latest_weather = weather_rows[weather_index]
                 weather_index += 1
-            weather = latest_weather or _fallback_weather(current)
+            weather = latest_weather or sensor_rows.fallback_weather(current)
             for pot in pots:
-                apply_hourly_environment(states[pot["id"]], pot, weather, current.date(), hours=interval_hours)
+                sensor_rows.apply_hourly_environment(states[pot["id"]], pot, weather, current.date(), hours=interval_hours)
 
             for pot in pots:
-                row = _sensor_row(pot, states[pot["id"]], weather, current, source)
+                row = sensor_rows.sensor_row(pot, states[pot["id"]], weather, current, source)
                 pending_rows.append(row)
-                _apply_virtual_irrigation_if_due(states[pot["id"]], pot, weather, current)
+                sensor_rows.apply_virtual_irrigation_if_due(states[pot["id"]], pot, weather, current)
                 total_readings += 1
 
             if len(pending_rows) >= batch_size:
-                inserted_or_updated += _upsert_sensor_rows(conn, pending_rows)
+                inserted_or_updated += sensor_rows.upsert_sensor_rows(conn, pending_rows)
                 pending_rows.clear()
 
             current += timedelta(minutes=interval_minutes)
 
         if pending_rows:
-            inserted_or_updated += _upsert_sensor_rows(conn, pending_rows)
+            inserted_or_updated += sensor_rows.upsert_sensor_rows(conn, pending_rows)
             pending_rows.clear()
 
         conn.commit()
@@ -133,11 +132,11 @@ def seed_tiered_sensor_readings(
     if end_at < start_at:
         raise ValueError("end_at must not be before start_date")
 
-    pots = _load_pots()
-    weather_rows = load_weather(start_date, end_at.date())
+    pots = sensor_rows.load_pots()
+    weather_rows = sensor_rows.load_weather(start_date, end_at.date())
     weather_index = 0
     latest_weather: dict[str, Any] | None = None
-    states = _initial_sensor_states(pots)
+    states = sensor_rows.initial_sensor_states(pots)
     for state in states.values():
         state["last_recorded_at"] = start_at
 
@@ -168,32 +167,32 @@ def seed_tiered_sensor_readings(
             while weather_index < len(weather_rows) and local_observed_at(weather_rows[weather_index]) <= current:
                 latest_weather = weather_rows[weather_index]
                 weather_index += 1
-            weather = latest_weather or _fallback_weather(current)
+            weather = latest_weather or sensor_rows.fallback_weather(current)
 
             for pot in pots:
-                apply_hourly_environment(states[pot["id"]], pot, weather, current.date(), hours=0.25)
+                sensor_rows.apply_hourly_environment(states[pot["id"]], pot, weather, current.date(), hours=0.25)
 
             resolution = _tiered_resolution_for_time(current, period)
             if resolution:
                 sample_count = _sample_count_for_resolution(resolution)
                 for pot in pots:
-                    row = _sensor_row(pot, states[pot["id"]], weather, current, source)
+                    row = sensor_rows.sensor_row(pot, states[pot["id"]], weather, current, source)
                     row["reading_resolution"] = resolution
                     row["sample_count"] = sample_count
                     pending_rows.append(row)
                     by_resolution[resolution] += 1
 
                 if len(pending_rows) >= batch_size:
-                    inserted_or_updated += _upsert_sensor_rows(conn, pending_rows)
+                    inserted_or_updated += sensor_rows.upsert_sensor_rows(conn, pending_rows)
                     pending_rows.clear()
 
             for pot in pots:
-                _apply_virtual_irrigation_if_due(states[pot["id"]], pot, weather, current)
+                sensor_rows.apply_virtual_irrigation_if_due(states[pot["id"]], pot, weather, current)
 
             current += timedelta(minutes=15)
 
         if pending_rows:
-            inserted_or_updated += _upsert_sensor_rows(conn, pending_rows)
+            inserted_or_updated += sensor_rows.upsert_sensor_rows(conn, pending_rows)
             pending_rows.clear()
 
         conn.commit()
@@ -221,6 +220,8 @@ def ensure_tiered_sensor_readings(
     cleanup: bool = True,
 ) -> dict[str, Any]:
     """Ensure simulated tiered readings cover the current local calendar periods."""
+    from digital_twin.application.sensor_history.readings.availability import get_tiered_sensor_coverage
+
     initialize_database()
     end_at = _align_to_reading_interval(_as_local(end_at or datetime.now(LOCAL_TZ)))
     placement = SensorPlacementService().ensure_default_if_missing()
@@ -307,9 +308,9 @@ def generate_sensor_readings_at(
     initialize_database()
     SensorPlacementService().ensure_default_if_missing()
     recorded_at = _align_to_reading_interval(_as_local(recorded_at))
-    pots = _load_pots()
-    previous = _load_latest_sensor_states(recorded_at, source)
-    weather = _load_latest_weather_at(recorded_at) or _fallback_weather(recorded_at)
+    pots = sensor_rows.load_pots()
+    previous = sensor_rows.load_latest_sensor_states(recorded_at, source)
+    weather = sensor_rows.load_latest_weather_at(recorded_at) or sensor_rows.fallback_weather(recorded_at)
 
     rows = []
     for pot in pots:
@@ -319,19 +320,19 @@ def generate_sensor_readings_at(
                 "moisture": number(previous_row["soil_moisture_pct"], float(pot["moisture_target_pct"])),
                 "last_recorded_at": _as_local(previous_row["recorded_at"]),
             }
-            previous_weather = _load_latest_weather_at(state["last_recorded_at"]) or _fallback_weather(state["last_recorded_at"])
-            _apply_virtual_irrigation_if_due(state, pot, previous_weather, state["last_recorded_at"])
+            previous_weather = sensor_rows.load_latest_weather_at(state["last_recorded_at"]) or sensor_rows.fallback_weather(state["last_recorded_at"])
+            sensor_rows.apply_virtual_irrigation_if_due(state, pot, previous_weather, state["last_recorded_at"])
         else:
-            state = _initial_state_for_pot(pot)
+            state = sensor_rows.initial_state_for_pot(pot)
 
         interval_minutes = _reading_interval_minutes()
         intervals_elapsed = max(1, min(24 * 60 // interval_minutes, int((recorded_at - state["last_recorded_at"]).total_seconds() // (interval_minutes * 60))))
         for _ in range(intervals_elapsed):
-            apply_hourly_environment(state, pot, weather, recorded_at.date(), hours=interval_minutes / 60.0)
-        rows.append(_sensor_row(pot, state, weather, recorded_at, source))
+            sensor_rows.apply_hourly_environment(state, pot, weather, recorded_at.date(), hours=interval_minutes / 60.0)
+        rows.append(sensor_rows.sensor_row(pot, state, weather, recorded_at, source))
 
     with get_connection() as conn:
-        upserted = _upsert_sensor_rows(conn, rows, update_changed_at=source == ACTUAL_SENSOR_SOURCE)
+        upserted = sensor_rows.upsert_sensor_rows(conn, rows, update_changed_at=source == ACTUAL_SENSOR_SOURCE)
         conn.commit()
 
     return {
@@ -355,11 +356,11 @@ def generate_due_sensor_readings(
         if not due_times:
             return []
         latest_due = due_times[-1]
-        return [] if _reading_exists(latest_due, source) else [generate_sensor_readings_at(latest_due, source=source)]
+        return [] if sensor_rows.reading_exists(latest_due, source) else [generate_sensor_readings_at(latest_due, source=source)]
 
     results = []
     for scheduled_at in due_times:
-        if not _reading_exists(scheduled_at, source):
+        if not sensor_rows.reading_exists(scheduled_at, source):
             results.append(generate_sensor_readings_at(scheduled_at, source=source))
     return results
 
@@ -385,7 +386,7 @@ def ingest_actual_sensor_readings(
             rows.append(
                 {
                     "sensor_id": int(sensor_id),
-                    "recorded_at": _closest_actual_recorded_at(conn, int(sensor_id), item_recorded_at),
+                    "recorded_at": sensor_rows.closest_actual_recorded_at(conn, int(sensor_id), item_recorded_at),
                     "soil_moisture_pct": _required_number(item, "soil_moisture_pct"),
                     "air_temperature_c": _optional_number(item.get("air_temperature_c")),
                     "air_humidity_pct": _optional_number(item.get("air_humidity_pct")),
@@ -395,7 +396,7 @@ def ingest_actual_sensor_readings(
                     "sample_count": 1,
                 }
             )
-        upserted = _upsert_sensor_rows(conn, rows, update_changed_at=True)
+        upserted = sensor_rows.upsert_sensor_rows(conn, rows, update_changed_at=True)
         conn.commit()
 
     slots = sorted({row["recorded_at"].isoformat() for row in rows})
@@ -408,375 +409,6 @@ def ingest_actual_sensor_readings(
         "stored_slots": slots,
     }
 
-
-class ActuationFeedbackService:
-    """Projects completed actuator delivery back into the soil-state read model."""
-
-    corrective_experiment_type = "corrective"
-    corrective_delay_minutes = 30
-
-    def apply_completed_actuation(self, actuation: dict[str, Any] | None) -> dict[str, Any]:
-        if not actuation:
-            return self._empty_result()
-
-        deliveries = self._delivery_items(actuation)
-        if not deliveries:
-            return self._empty_result(actuation)
-
-        feedback_at = self._feedback_recorded_at(actuation)
-        scheduled_start = self._actuation_datetime(actuation.get("scheduled_start_at"), feedback_at)
-        scheduled_end = self._actuation_datetime(actuation.get("scheduled_end_at"), feedback_at)
-        pot_ids = sorted({item["pot_id"] for item in deliveries})
-        pots_by_id = _load_pots_by_ids(pot_ids)
-        previous_states = _load_latest_sensor_states(feedback_at, DEFAULT_SENSOR_SOURCE)
-
-        rows = []
-        below_minimum = []
-        for delivery in deliveries:
-            pot = pots_by_id.get(delivery["pot_id"])
-            if not pot:
-                continue
-            state = self._state_before_actuation(pot, previous_states.get(delivery["pot_id"]), scheduled_start)
-            self._apply_delivery(state, pot, delivery["delivered_volume_ml"], scheduled_end)
-            self._advance_state(state, pot, feedback_at)
-            rows.append(self._feedback_row(pot, state, feedback_at, delivery))
-            min_moisture = float(pot["moisture_min_pct"])
-            if state["moisture"] < min_moisture:
-                below_minimum.append(
-                    {
-                        "pot": pot,
-                        "moisture_pct": round(state["moisture"], 2),
-                        "moisture_min_pct": round(min_moisture, 2),
-                    }
-                )
-
-        if not rows:
-            return self._empty_result(actuation)
-
-        with get_connection() as conn:
-            upserted = _upsert_sensor_rows(conn, rows)
-            corrective = self._schedule_corrective_actuations(conn, below_minimum, feedback_at)
-            conn.commit()
-
-        return {
-            "actuationId": actuation.get("id"),
-            "source": ACTUATOR_FEEDBACK_SOURCE,
-            "feedbackAt": feedback_at.isoformat(),
-            "feedbackRows": upserted,
-            "belowMinimumCount": len(below_minimum),
-            "correctiveCount": len(corrective),
-            "corrective": corrective,
-        }
-
-    def _empty_result(self, actuation: dict[str, Any] | None = None) -> dict[str, Any]:
-        return {
-            "actuationId": actuation.get("id") if actuation else None,
-            "source": ACTUATOR_FEEDBACK_SOURCE,
-            "feedbackRows": 0,
-            "belowMinimumCount": 0,
-            "correctiveCount": 0,
-            "corrective": [],
-        }
-
-    def _delivery_items(self, actuation: dict[str, Any]) -> list[dict[str, Any]]:
-        payload = _payload_dict(actuation.get("payload"))
-        distribution = payload.get("per_pot_distribution") if isinstance(payload, dict) else None
-        actual_delivered_ml = number(
-            actuation.get("delivered_volume_ml"),
-            number(actuation.get("planned_volume_ml"), 0.0),
-        )
-        if isinstance(distribution, list) and distribution:
-            base_items = [
-                {
-                    "pot_id": int(item["pot_id"]),
-                    "delivered_volume_ml": max(
-                        0.0,
-                        number(item.get("delivered_volume_ml"), item.get("planned_volume_ml", 0.0)),
-                    ),
-                }
-                for item in distribution
-                if item and item.get("pot_id") is not None
-            ]
-            base_total = sum(item["delivered_volume_ml"] for item in base_items)
-            scale = actual_delivered_ml / base_total if base_total > 0 and actual_delivered_ml > 0 else 1.0
-            return [
-                {
-                    "pot_id": item["pot_id"],
-                    "delivered_volume_ml": round(item["delivered_volume_ml"] * scale, 2),
-                }
-                for item in base_items
-            ]
-
-        pot_id = actuation.get("pot_id") or payload.get("pot_id") if isinstance(payload, dict) else None
-        if pot_id is None:
-            return []
-        return [
-            {
-                "pot_id": int(pot_id),
-                "delivered_volume_ml": round(max(0.0, actual_delivered_ml), 2),
-            }
-        ]
-
-    def _feedback_recorded_at(self, actuation: dict[str, Any]) -> datetime:
-        completed_at = self._optional_actuation_datetime(actuation.get("completed_at"))
-        scheduled_end = self._optional_actuation_datetime(actuation.get("scheduled_end_at"))
-        fallback = _as_local(datetime.now(LOCAL_TZ))
-        if completed_at and scheduled_end:
-            return max(completed_at, scheduled_end)
-        return completed_at or scheduled_end or fallback
-
-    def _optional_actuation_datetime(self, value: Any) -> datetime | None:
-        if value is None:
-            return None
-        if isinstance(value, datetime):
-            return _as_local(value)
-        try:
-            return _as_local(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
-        except ValueError:
-            return None
-
-    def _actuation_datetime(self, value: Any, fallback: datetime) -> datetime:
-        return self._optional_actuation_datetime(value) or fallback
-
-    def _state_before_actuation(
-        self,
-        pot: dict[str, Any],
-        previous_row: dict[str, Any] | None,
-        scheduled_start: datetime,
-    ) -> dict[str, Any]:
-        if previous_row:
-            state = {
-                "moisture": number(previous_row["soil_moisture_pct"], float(pot["moisture_target_pct"])),
-                "last_recorded_at": _as_local(previous_row["recorded_at"]),
-            }
-        else:
-            state = _initial_state_for_pot(pot)
-        self._advance_state(state, pot, scheduled_start)
-        return state
-
-    def _advance_state(self, state: dict[str, Any], pot: dict[str, Any], target_at: datetime) -> None:
-        target_at = _as_local(target_at)
-        current_at = _as_local(state["last_recorded_at"])
-        if target_at <= current_at:
-            return
-        hours = (target_at - current_at).total_seconds() / 3600.0
-        weather = _load_latest_weather_at(target_at) or _fallback_weather(target_at)
-        apply_hourly_environment(state, pot, weather, target_at.date(), hours=hours)
-        state["last_recorded_at"] = target_at
-
-    def _apply_delivery(
-        self,
-        state: dict[str, Any],
-        pot: dict[str, Any],
-        delivered_volume_ml: float,
-        scheduled_end: datetime,
-    ) -> None:
-        volume_l = float(pot["volume_l"])
-        retention = max(float(pot["retention_factor"]), 0.1)
-        moisture_gain = max(0.0, delivered_volume_ml) * retention / max(volume_l * 10.0, 1.0)
-        state["moisture"] = clamp(state["moisture"] + moisture_gain, 0.0, 100.0)
-        if _as_local(scheduled_end) > _as_local(state["last_recorded_at"]):
-            state["last_recorded_at"] = _as_local(scheduled_end)
-
-    def _feedback_row(
-        self,
-        pot: dict[str, Any],
-        state: dict[str, Any],
-        recorded_at: datetime,
-        delivery: dict[str, Any],
-    ) -> dict[str, Any]:
-        weather = _load_latest_weather_at(recorded_at) or _fallback_weather(recorded_at)
-        air_temperature = _microclimate_temperature(pot, weather, recorded_at)
-        humidity = number(weather.get("relative_humidity_pct"), 60.0)
-        return {
-            "sensor_id": pot["id"],
-            "recorded_at": _db_timestamp(recorded_at),
-            "soil_moisture_pct": round(state["moisture"], 2),
-            "air_temperature_c": round(air_temperature, 2),
-            "air_humidity_pct": round(humidity, 2),
-            "substrate_temperature_c": round(air_temperature + _substrate_delta(pot, recorded_at), 2),
-            "source": ACTUATOR_FEEDBACK_SOURCE,
-            "reading_resolution": RAW_RESOLUTION,
-            "sample_count": 1,
-        }
-
-    def _schedule_corrective_actuations(
-        self,
-        conn,
-        below_minimum: list[dict[str, Any]],
-        feedback_at: datetime,
-    ) -> list[dict[str, Any]]:
-        corrective_rows = []
-        for item in below_minimum:
-            pot = item["pot"]
-            prescription = self._corrective_prescription(conn, pot, item["moisture_pct"], feedback_at)
-            if not prescription:
-                continue
-            event_row = conn.execute(
-                """
-                INSERT INTO irrigation_events (
-                    experiment_type, sensor_id, scheduled_start_at, scheduled_end_at,
-                    flow_rate_ml_min, planned_volume_ml, valve_number, valve_zone,
-                    payload, cycle_count, soak_pause_min, status
-                )
-                VALUES (
-                    %(experiment_type)s, %(pot_id)s, %(scheduled_start_at)s,
-                    %(scheduled_end_at)s, %(flow_rate_ml_min)s, %(planned_volume_ml)s,
-                    %(valve_number)s, %(valve_zone)s, %(payload)s, 1, 0, 'planned'
-                )
-                ON CONFLICT (experiment_type, sensor_id, scheduled_start_at) DO UPDATE SET
-                    scheduled_end_at = EXCLUDED.scheduled_end_at,
-                    flow_rate_ml_min = EXCLUDED.flow_rate_ml_min,
-                    planned_volume_ml = EXCLUDED.planned_volume_ml,
-                    valve_number = EXCLUDED.valve_number,
-                    valve_zone = EXCLUDED.valve_zone,
-                    payload = EXCLUDED.payload,
-                    status = CASE
-                        WHEN irrigation_events.status IN ('completed', 'running') THEN irrigation_events.status
-                        ELSE EXCLUDED.status
-                    END,
-                    changed_at = now()
-                RETURNING id, status
-                """,
-                prescription,
-            ).fetchone()
-            if not event_row:
-                continue
-            actuation_row = conn.execute(
-                """
-                INSERT INTO irrigation_actuations (
-                    event_id, experiment_type, pot_id, scheduled_start_at, scheduled_end_at,
-                    flow_rate_ml_min, planned_volume_ml, valve_number, valve_zone,
-                    payload, cycle_count, soak_pause_min, status
-                )
-                VALUES (
-                    %(event_id)s, %(experiment_type)s, %(pot_id)s, %(scheduled_start_at)s,
-                    %(scheduled_end_at)s, %(flow_rate_ml_min)s, %(planned_volume_ml)s,
-                    %(valve_number)s, %(valve_zone)s, %(payload)s, 1, 0, 'planned'
-                )
-                ON CONFLICT (experiment_type, pot_id, scheduled_start_at) DO UPDATE SET
-                    event_id = EXCLUDED.event_id,
-                    scheduled_end_at = EXCLUDED.scheduled_end_at,
-                    flow_rate_ml_min = EXCLUDED.flow_rate_ml_min,
-                    planned_volume_ml = EXCLUDED.planned_volume_ml,
-                    valve_number = EXCLUDED.valve_number,
-                    valve_zone = EXCLUDED.valve_zone,
-                    payload = EXCLUDED.payload,
-                    status = CASE
-                        WHEN irrigation_actuations.status IN ('completed', 'running') THEN irrigation_actuations.status
-                        ELSE EXCLUDED.status
-                    END,
-                    changed_at = now()
-                RETURNING id, status
-                """,
-                {**prescription, "event_id": event_row["id"]},
-            ).fetchone()
-            if actuation_row:
-                corrective_rows.append(
-                    {
-                        "potId": pot["id"],
-                        "potCode": pot["pot_code"],
-                        "valveNumber": prescription["valve_number"],
-                        "scheduledStartAt": prescription["scheduled_start_at"].isoformat(),
-                        "plannedVolumeMl": prescription["planned_volume_ml"],
-                    }
-                )
-        return corrective_rows
-
-    def _corrective_prescription(
-        self,
-        conn,
-        pot: dict[str, Any],
-        current_moisture: float,
-        feedback_at: datetime,
-    ) -> dict[str, Any] | None:
-        if self._has_same_day_corrective(conn, int(pot["id"]), feedback_at):
-            return None
-        planned_volume_ml = self._corrective_volume_ml(pot, current_moisture)
-        if planned_volume_ml < 10.0:
-            return None
-        flow_rate = max(float(pot["drip_flow_ml_min"]), 1.0)
-        duration_min = max(1.0, planned_volume_ml / flow_rate)
-        start_at = self._corrective_start_at(conn, pot, feedback_at, duration_min)
-        if not start_at:
-            return None
-        end_at = start_at + timedelta(minutes=duration_min)
-        valve_number = valve_number_for_zone(str(pot["balcony_zone"]))
-        payload = {
-            "reason": "post_actuation_below_minimum",
-            "pot_id": int(pot["id"]),
-            "pot_code": pot["pot_code"],
-            "current_moisture_pct": round(current_moisture, 2),
-            "moisture_min_pct": round(float(pot["moisture_min_pct"]), 2),
-            "target_moisture_pct": round(float(pot["moisture_target_pct"]), 2),
-            "physical_distribution_policy": "corrective_pot_refill",
-        }
-        return {
-            "experiment_type": self.corrective_experiment_type,
-            "pot_id": int(pot["id"]),
-            "scheduled_start_at": start_at,
-            "scheduled_end_at": end_at,
-            "flow_rate_ml_min": round(flow_rate, 2),
-            "planned_volume_ml": round(planned_volume_ml, 2),
-            "valve_number": valve_number,
-            "valve_zone": pot["balcony_zone"],
-            "payload": Jsonb(payload),
-        }
-
-    def _corrective_volume_ml(self, pot: dict[str, Any], current_moisture: float) -> float:
-        target = float(pot["moisture_target_pct"])
-        need_pct = max(0.0, target - current_moisture)
-        volume_l = float(pot["volume_l"])
-        retention = max(float(pot["retention_factor"]), 0.1)
-        flow_rate = max(float(pot["drip_flow_ml_min"]), 1.0)
-        max_minutes = {"huge": 90, "large": 60, "medium": 35, "small": 20}.get(str(pot["size_class"]), 35)
-        return min(need_pct * volume_l * 10.0 / retention, flow_rate * max_minutes)
-
-    def _corrective_start_at(
-        self,
-        conn,
-        pot: dict[str, Any],
-        feedback_at: datetime,
-        duration_min: float,
-    ) -> datetime | None:
-        start_after = _ceil_to_interval(_as_local(feedback_at) + timedelta(minutes=self.corrective_delay_minutes), 15)
-        hot_day = _is_hot_irrigation_day(conn, start_after.date())
-        windows = [
-            (pot["morning_window_start"], pot["morning_window_end"], True),
-            (pot["evening_window_start"], pot["evening_window_end"], hot_day or bool(pot.get("allows_second_watering"))),
-        ]
-        for start_time, end_time, allowed in windows:
-            if not allowed:
-                continue
-            window_start = datetime.combine(start_after.date(), start_time, tzinfo=LOCAL_TZ)
-            window_end = datetime.combine(start_after.date(), end_time, tzinfo=LOCAL_TZ)
-            candidate = max(start_after, window_start)
-            if candidate + timedelta(minutes=duration_min) <= window_end:
-                return candidate
-        return None
-
-    def _has_same_day_corrective(self, conn, pot_id: int, feedback_at: datetime) -> bool:
-        day_start = datetime.combine(_as_local(feedback_at).date(), time.min, tzinfo=LOCAL_TZ)
-        day_end = day_start + timedelta(days=1)
-        row = conn.execute(
-            """
-            SELECT 1
-            FROM irrigation_actuations
-            WHERE experiment_type = %(experiment_type)s
-              AND pot_id = %(pot_id)s
-              AND scheduled_start_at >= %(day_start)s
-              AND scheduled_start_at < %(day_end)s
-              AND status IN ('planned', 'running', 'completed')
-            LIMIT 1
-            """,
-            {
-                "experiment_type": self.corrective_experiment_type,
-                "pot_id": pot_id,
-                "day_start": day_start,
-                "day_end": day_end,
-            },
-        ).fetchone()
-        return bool(row)
 
 
 def run_sensor_service() -> None:
@@ -1111,706 +743,6 @@ def aggregate_and_cleanup_sensor_readings(
     }
 
 
-def map_experiment_date_to_sensor_date(
-    experiment_date: date,
-    first_sensor_date: date,
-    last_sensor_date: date,
-) -> date:
-    """Map any experiment date onto the latest available same month/day sensor date."""
-    for year in range(last_sensor_date.year, first_sensor_date.year - 1, -1):
-        candidate = _same_month_day(year, experiment_date)
-        if first_sensor_date <= candidate <= last_sensor_date:
-            return candidate
-    raise ValueError("No compatible sensor date is available")
-
-
-def map_experiment_date_to_available_sensor_date(
-    experiment_date: date,
-    available_dates: set[date],
-) -> date:
-    """Map an experiment date to an exact reading date when possible, otherwise same month/day."""
-    if experiment_date in available_dates:
-        return experiment_date
-    if not available_dates:
-        raise ValueError("No sensor date is available")
-    first_sensor_date = min(available_dates)
-    last_sensor_date = max(available_dates)
-    for year in range(last_sensor_date.year, first_sensor_date.year - 1, -1):
-        candidate = _same_month_day(year, experiment_date)
-        if candidate in available_dates:
-            return candidate
-    raise ValueError("No compatible sensor date is available")
-
-
-def get_sensor_availability(
-    source: str = DEFAULT_SENSOR_SOURCE,
-    sensor_ids: list[int] | None = None,
-) -> dict[str, Any] | None:
-    initialize_database()
-    now = datetime.now(LOCAL_TZ)
-    sensor_filter = ""
-    params: dict[str, Any] = {
-        "source": source,
-        "sources": _query_sources(source),
-        "timezone": LOCAL_TZ.key,
-        "now": _db_timestamp(now),
-        "resolutions": [RAW_RESOLUTION, HOURLY_RESOLUTION, DAILY_RESOLUTION],
-    }
-    if sensor_ids:
-        sensor_filter = "AND sensor_id = ANY(%(sensor_ids)s)"
-        params["sensor_ids"] = sensor_ids
-    with get_connection(row_factory=dict_row) as conn:
-        row = conn.execute(
-            f"""
-            SELECT
-                count(*) AS row_count,
-                count(DISTINCT sensor_id) AS sensor_count,
-                min(recorded_at::date) AS first_date,
-                max(recorded_at::date) AS last_date
-            FROM sensor_readings
-            WHERE source = ANY(%(sources)s)
-              AND reading_resolution = ANY(%(resolutions)s)
-              AND recorded_at <= %(now)s
-              {sensor_filter}
-            """,
-            params,
-        ).fetchone()
-    if not row or row["row_count"] == 0:
-        return None
-    return row
-
-
-def _complete_sensor_dates_for_range(
-    start_date: date,
-    end_date: date,
-    source: str,
-    sensor_ids: list[int],
-) -> set[date]:
-    if not sensor_ids:
-        return set()
-    with get_connection(row_factory=dict_row) as conn:
-        rows = conn.execute(
-            """
-            SELECT recorded_at::date AS local_date
-            FROM sensor_readings
-            WHERE source = ANY(%(sources)s)
-              AND sensor_id = ANY(%(sensor_ids)s)
-              AND reading_resolution = ANY(%(resolutions)s)
-              AND recorded_at::date >= %(start_date)s
-              AND recorded_at::date <= %(end_date)s
-            GROUP BY recorded_at::date
-            HAVING count(DISTINCT sensor_id) >= %(sensor_count)s
-               AND count(*) >= %(sensor_count)s * %(daily_slots_per_day)s
-            """,
-            {
-                "sources": _query_sources(source),
-                "sensor_ids": sensor_ids,
-                "resolutions": [RAW_RESOLUTION, HOURLY_RESOLUTION, DAILY_RESOLUTION],
-                "start_date": start_date,
-                "end_date": end_date,
-                "sensor_count": len(sensor_ids),
-                "daily_slots_per_day": DAILY_READING_SLOTS_PER_DAY,
-            },
-        ).fetchall()
-    return {row["local_date"] for row in rows}
-
-
-def _available_sensor_dates(
-    source: str,
-    sensor_ids: list[int],
-) -> set[date]:
-    if not sensor_ids:
-        return set()
-    with get_connection(row_factory=dict_row) as conn:
-        rows = conn.execute(
-            """
-            SELECT DISTINCT recorded_at::date AS local_date
-            FROM sensor_readings
-            WHERE source = ANY(%(sources)s)
-              AND sensor_id = ANY(%(sensor_ids)s)
-              AND reading_resolution = ANY(%(resolutions)s)
-              AND recorded_at <= %(now)s
-            ORDER BY local_date
-            """,
-            {
-                "sources": _query_sources(source),
-                "sensor_ids": sensor_ids,
-                "resolutions": [RAW_RESOLUTION, HOURLY_RESOLUTION, DAILY_RESOLUTION],
-                "now": _db_timestamp(datetime.now(LOCAL_TZ)),
-            },
-        ).fetchall()
-    return {row["local_date"] for row in rows}
-
-
-def get_tiered_sensor_coverage(
-    end_at: datetime | None = None,
-    source: str = DEFAULT_SENSOR_SOURCE,
-    sensor_ids: list[int] | None = None,
-) -> dict[str, Any]:
-    initialize_database()
-    end_at = _align_to_reading_interval(_as_local(end_at or datetime.now(LOCAL_TZ)))
-    period = _tiered_periods(end_at)
-    sensor_ids = sensor_ids or _sensor_equipped_pot_ids()
-    sensor_count = len(sensor_ids)
-    raw_slots = _slot_count(period["raw_start"], end_at, minutes=15)
-    hourly_slots = _slot_count(period["hourly_start"], period["raw_start"] - timedelta(hours=1), minutes=60)
-    daily_days = max(0, (period["hourly_start"].date() - period["daily_start"].date()).days)
-    daily_slots = daily_days * DAILY_READING_SLOTS_PER_DAY
-    expected = {
-        RAW_RESOLUTION: raw_slots * sensor_count,
-        HOURLY_RESOLUTION: hourly_slots * sensor_count,
-        DAILY_RESOLUTION: daily_slots * sensor_count,
-    }
-    params: dict[str, Any] = {
-        "source": source,
-        "sources": _query_sources(source),
-        "sensor_ids": sensor_ids,
-        "raw_resolution": RAW_RESOLUTION,
-        "hourly_resolution": HOURLY_RESOLUTION,
-        "daily_resolution": DAILY_RESOLUTION,
-        "raw_start": _db_timestamp(period["raw_start"]),
-        "end_at": _db_timestamp(end_at),
-        "hourly_start": _db_timestamp(period["hourly_start"]),
-        "daily_start_date": period["daily_start"].date(),
-    }
-    if not sensor_ids:
-        return {
-            "complete": False,
-            "source": source,
-            "sensor_count": 0,
-            "daily_start": period["daily_start"].date(),
-            "hourly_start": period["hourly_start"],
-            "raw_start": period["raw_start"],
-            "end_at": end_at,
-            "expected": expected,
-            "actual": {RAW_RESOLUTION: 0, HOURLY_RESOLUTION: 0, DAILY_RESOLUTION: 0},
-        }
-
-    with get_connection(row_factory=dict_row) as conn:
-        rows = conn.execute(
-            """
-            SELECT reading_resolution, count(*)::int AS row_count
-            FROM sensor_readings
-            WHERE source = ANY(%(sources)s)
-              AND sensor_id = ANY(%(sensor_ids)s)
-              AND (
-                    (
-                        reading_resolution = %(raw_resolution)s
-                        AND recorded_at >= %(raw_start)s
-                        AND recorded_at <= %(end_at)s
-                    )
-                 OR (
-                        reading_resolution = %(hourly_resolution)s
-                        AND recorded_at >= %(hourly_start)s
-                        AND recorded_at < %(raw_start)s
-                    )
-                 OR (
-                        reading_resolution = %(daily_resolution)s
-                        AND recorded_at::date >= %(daily_start_date)s
-                        AND recorded_at < %(hourly_start)s
-                    )
-              )
-            GROUP BY reading_resolution
-            """,
-            params,
-        ).fetchall()
-
-    actual = {RAW_RESOLUTION: 0, HOURLY_RESOLUTION: 0, DAILY_RESOLUTION: 0}
-    for row in rows:
-        actual[row["reading_resolution"]] = int(row["row_count"])
-
-    return {
-        "complete": all(actual[resolution] >= expected[resolution] for resolution in expected),
-        "source": source,
-        "sensor_count": sensor_count,
-        "daily_start": period["daily_start"].date(),
-        "hourly_start": period["hourly_start"],
-        "raw_start": period["raw_start"],
-        "end_at": end_at,
-        "expected": expected,
-        "actual": actual,
-    }
-
-
-def load_sensor_readings_for_experiment(
-    start_date: date,
-    end_date: date,
-    sensor_ids: list[int],
-    source: str = DEFAULT_SENSOR_SOURCE,
-) -> dict[str, Any]:
-    if not sensor_ids:
-        return {
-            "available": False,
-            "source": source,
-            "lookup": {},
-            "mapped_dates": {},
-            "future_dates": [],
-            "sensor_reading_dates": set(),
-            "latest_states": {},
-            "row_count": 0,
-            "sensor_ids": [],
-        }
-    sensor_ids = _sensor_equipped_pot_ids(sensor_ids)
-    if not sensor_ids:
-        return {
-            "available": False,
-            "source": source,
-            "lookup": {},
-            "mapped_dates": {},
-            "future_dates": [],
-            "sensor_reading_dates": set(),
-            "latest_states": {},
-            "row_count": 0,
-            "sensor_ids": [],
-        }
-
-    availability = get_sensor_availability(source, sensor_ids)
-    if not availability:
-        return {
-            "available": False,
-            "source": source,
-            "lookup": {},
-            "mapped_dates": {},
-            "future_dates": [],
-            "sensor_reading_dates": set(),
-            "latest_states": {},
-            "row_count": 0,
-            "sensor_ids": sensor_ids,
-        }
-
-    first_sensor_date = availability["first_date"]
-    last_sensor_date = availability["last_date"]
-    available_dates = _available_sensor_dates(source, sensor_ids)
-    sensor_reading_dates = _sensor_reading_dates_for_range(start_date, end_date, sensor_ids)
-    today = _today_local()
-    mapped_dates: dict[date, date] = {}
-    future_dates: list[date] = []
-    current = start_date
-    while current <= end_date:
-        if current > today:
-            future_dates.append(current)
-        else:
-            mapped_dates[current] = map_experiment_date_to_available_sensor_date(current, available_dates)
-        current += timedelta(days=1)
-
-    sensor_dates = sorted(set(mapped_dates.values()))
-    with get_connection(row_factory=dict_row) as conn:
-        rows = []
-        if sensor_dates:
-            now = datetime.now(LOCAL_TZ)
-            rows = conn.execute(
-                """
-                WITH tiered AS (
-                    SELECT
-                        sensor_id,
-                        recorded_at::date AS local_date,
-                        recorded_at::time AS local_time,
-                        max(recorded_at) AS recorded_at,
-                        round(avg(soil_moisture_pct), 2) AS soil_moisture_pct,
-                        round(avg(air_temperature_c), 2) AS air_temperature_c,
-                        round(avg(air_humidity_pct), 2) AS air_humidity_pct,
-                        round(avg(substrate_temperature_c), 2) AS substrate_temperature_c,
-                        CASE
-                            WHEN bool_or(source = %(actual_source)s) THEN %(actual_source)s
-                            ELSE %(source)s
-                        END AS source,
-                        %(raw_resolution)s AS resolution,
-                        sum(sample_count)::int AS sample_count,
-                        1 AS tier_priority
-                    FROM sensor_readings
-                    WHERE source = ANY(%(sources)s)
-                      AND sensor_id = ANY(%(sensor_ids)s)
-                      AND reading_resolution = %(raw_resolution)s
-                      AND recorded_at::date = ANY(%(sensor_dates)s)
-                      AND recorded_at <= %(now)s
-                    GROUP BY sensor_id, local_date, local_time
-                    UNION ALL
-                    SELECT
-                        sensor_id,
-                        recorded_at::date AS local_date,
-                        recorded_at::time AS local_time,
-                        recorded_at,
-                        soil_moisture_pct,
-                        air_temperature_c,
-                        air_humidity_pct,
-                        substrate_temperature_c,
-                        source,
-                        %(hourly_resolution)s AS resolution,
-                        sample_count,
-                        2 AS tier_priority
-                    FROM sensor_readings
-                    WHERE source = ANY(%(sources)s)
-                      AND sensor_id = ANY(%(sensor_ids)s)
-                      AND reading_resolution = %(hourly_resolution)s
-                      AND recorded_at::date = ANY(%(sensor_dates)s)
-                      AND recorded_at <= %(now)s
-                    UNION ALL
-                    SELECT
-                        sensor_id,
-                        recorded_at::date AS local_date,
-                        recorded_at::time AS local_time,
-                        recorded_at,
-                        soil_moisture_pct,
-                        air_temperature_c,
-                        air_humidity_pct,
-                        substrate_temperature_c,
-                        source,
-                        %(daily_resolution)s AS resolution,
-                        sample_count,
-                        3 AS tier_priority
-                    FROM sensor_readings
-                    WHERE source = ANY(%(sources)s)
-                      AND sensor_id = ANY(%(sensor_ids)s)
-                      AND reading_resolution = %(daily_resolution)s
-                      AND recorded_at::date = ANY(%(sensor_dates)s)
-                      AND recorded_at <= %(now)s
-                )
-                SELECT DISTINCT ON (sensor_id, local_date, local_time)
-                    sensor_id,
-                    local_date,
-                    local_time,
-                    recorded_at,
-                    soil_moisture_pct,
-                    air_temperature_c,
-                    air_humidity_pct,
-                    substrate_temperature_c,
-                    source,
-                    resolution,
-                    sample_count
-                FROM tiered
-                ORDER BY sensor_id, local_date, local_time, tier_priority, recorded_at DESC
-                """,
-                {
-                    "timezone": LOCAL_TZ.key,
-                    "source": source,
-                    "sources": _query_sources(source),
-                    "actual_source": ACTUAL_SENSOR_SOURCE,
-                    "sensor_ids": sensor_ids,
-                    "raw_resolution": RAW_RESOLUTION,
-                    "hourly_resolution": HOURLY_RESOLUTION,
-                    "daily_resolution": DAILY_RESOLUTION,
-                    "sensor_dates": sensor_dates,
-                    "now": _db_timestamp(now),
-                },
-            ).fetchall()
-        latest_rows = conn.execute(
-            """
-            SELECT DISTINCT ON (sensor_id)
-                sensor_id,
-                recorded_at,
-                soil_moisture_pct,
-                air_temperature_c,
-                air_humidity_pct,
-                substrate_temperature_c,
-                source,
-                reading_resolution AS resolution,
-                sample_count
-            FROM sensor_readings
-            WHERE source = ANY(%(sources)s)
-              AND sensor_id = ANY(%(sensor_ids)s)
-              AND reading_resolution = ANY(%(resolutions)s)
-              AND recorded_at <= %(now)s
-            ORDER BY
-                sensor_id,
-                recorded_at DESC,
-                CASE reading_resolution
-                    WHEN %(raw_resolution)s THEN 1
-                    WHEN %(hourly_resolution)s THEN 2
-                    ELSE 3
-                END
-            """,
-            {
-                "timezone": LOCAL_TZ.key,
-                "sources": _query_sources(source),
-                "sensor_ids": sensor_ids,
-                "resolutions": [RAW_RESOLUTION, HOURLY_RESOLUTION, DAILY_RESOLUTION],
-                "raw_resolution": RAW_RESOLUTION,
-                "hourly_resolution": HOURLY_RESOLUTION,
-                "now": _db_timestamp(datetime.now(LOCAL_TZ)),
-            },
-        ).fetchall()
-
-    rows_by_sensor_key = {
-        (row["local_date"], _time_key(row["local_time"]), row["sensor_id"]): row
-        for row in rows
-    }
-    lookup = {}
-    for experiment_date, sensor_date in mapped_dates.items():
-        for row in rows:
-            if row["local_date"] == sensor_date:
-                _put_sensor_lookup_row(lookup, experiment_date, row)
-
-    return {
-        "available": True,
-        "source": source,
-        "lookup": lookup,
-        "mapped_dates": mapped_dates,
-        "future_dates": future_dates,
-        "sensor_reading_dates": sensor_reading_dates,
-        "latest_states": {row["sensor_id"]: row for row in latest_rows},
-        "latest_state_at": max((_as_local(row["recorded_at"]) for row in latest_rows), default=None),
-        "sensor_dates": sensor_dates,
-        "sensor_ids": sensor_ids,
-        "first_sensor_date": first_sensor_date,
-        "last_sensor_date": last_sensor_date,
-        "row_count": len(rows_by_sensor_key),
-    }
-
-
-def _sensor_reading_dates_for_range(
-    start_date: date,
-    end_date: date,
-    sensor_ids: list[int],
-) -> set[date]:
-    if end_date < start_date:
-        return set()
-    with get_connection(row_factory=dict_row) as conn:
-        rows = conn.execute(
-            """
-            SELECT DISTINCT recorded_at::date AS local_date
-            FROM sensor_readings
-            WHERE recorded_at::date >= %(start_date)s
-              AND recorded_at::date <= %(end_date)s
-            ORDER BY local_date
-            """,
-            {
-                "start_date": start_date,
-                "end_date": end_date,
-            },
-        ).fetchall()
-    return {row["local_date"] for row in rows}
-
-
-def _load_pots() -> list[dict[str, Any]]:
-    sensor_pot_ids = _sensor_equipped_pot_ids()
-    if not sensor_pot_ids:
-        return []
-    with get_connection(row_factory=dict_row) as conn:
-        return conn.execute(
-            """
-            SELECT
-                p.*,
-                pt.water_need_level,
-                pt.heat_sensitive,
-                pt.allows_second_watering,
-                ps.volume_l,
-                ps.evaporation_factor,
-                ps.retention_factor
-            FROM pots p
-            JOIN plant_types pt ON pt.code = p.plant_type_code
-            JOIN pot_size_profiles ps
-              ON ps.code = CASE
-                    WHEN p.size_class = 'small' THEN 'small_' || p.small_subtype
-                    ELSE p.size_class
-                 END
-            WHERE p.active = true
-              AND p.id = ANY(%(sensor_pot_ids)s)
-            ORDER BY p.id
-            """,
-            {"sensor_pot_ids": sensor_pot_ids},
-        ).fetchall()
-
-
-def _load_pots_by_ids(pot_ids: list[int]) -> dict[int, dict[str, Any]]:
-    if not pot_ids:
-        return {}
-    with get_connection(row_factory=dict_row) as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                p.*,
-                pt.water_need_level,
-                pt.heat_sensitive,
-                pt.allows_second_watering,
-                ps.volume_l,
-                ps.evaporation_factor,
-                ps.retention_factor
-            FROM pots p
-            JOIN plant_types pt ON pt.code = p.plant_type_code
-            JOIN pot_size_profiles ps
-              ON ps.code = CASE
-                    WHEN p.size_class = 'small' THEN 'small_' || p.small_subtype
-                    ELSE p.size_class
-                 END
-            WHERE p.active = true
-              AND p.id = ANY(%(pot_ids)s)
-            ORDER BY p.id
-            """,
-            {"pot_ids": pot_ids},
-        ).fetchall()
-    return {int(row["id"]): row for row in rows}
-
-
-def load_weather(start_date: date, end_date: date) -> list[dict[str, Any]]:
-    start_ts = datetime.combine(start_date, time.min, tzinfo=LOCAL_TZ)
-    end_ts = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=LOCAL_TZ)
-    with get_connection(row_factory=dict_row) as conn:
-        return conn.execute(
-            """
-            WITH ranked_weather AS (
-                SELECT
-                    *,
-                    row_number() OVER (
-                        PARTITION BY observed_local_at
-                        ORDER BY
-                            CASE
-                                WHEN source = 'open-meteo-archive' THEN 0
-                                WHEN source = 'open-meteo-forecast' THEN 1
-                                ELSE 2
-                            END,
-                            id DESC
-                    ) AS source_rank
-                FROM weather_hourly
-                WHERE location_name = %(location)s
-                  AND observed_local_at >= %(start_ts)s
-                  AND observed_local_at < %(end_ts)s
-            )
-            SELECT *
-            FROM ranked_weather
-            WHERE source_rank = 1
-            ORDER BY observed_local_at
-            """,
-            {"location": LOCATION_NAME, "start_ts": start_ts.replace(tzinfo=None), "end_ts": end_ts.replace(tzinfo=None)},
-        ).fetchall()
-
-
-def _load_latest_weather_at(recorded_at: datetime) -> dict[str, Any] | None:
-    with get_connection(row_factory=dict_row) as conn:
-        return conn.execute(
-            """
-            WITH ranked_weather AS (
-                SELECT
-                    *,
-                    row_number() OVER (
-                        PARTITION BY observed_local_at
-                        ORDER BY
-                            CASE
-                                WHEN source = 'open-meteo-archive' THEN 0
-                                WHEN source = 'open-meteo-forecast' THEN 1
-                                ELSE 2
-                            END,
-                            id DESC
-                    ) AS source_rank
-                FROM weather_hourly
-                WHERE location_name = %(location)s
-                  AND observed_local_at <= %(recorded_at)s
-            )
-            SELECT *
-            FROM ranked_weather
-            WHERE source_rank = 1
-            ORDER BY observed_local_at DESC
-            LIMIT 1
-            """,
-            {"location": LOCATION_NAME, "recorded_at": _db_timestamp(recorded_at)},
-        ).fetchone()
-
-
-def _load_latest_sensor_states(recorded_at: datetime, source: str) -> dict[int, dict[str, Any]]:
-    with get_connection(row_factory=dict_row) as conn:
-        rows = conn.execute(
-            """
-            SELECT DISTINCT ON (sensor_id)
-                sensor_id,
-                recorded_at,
-                soil_moisture_pct
-            FROM sensor_readings
-            WHERE source = ANY(%(sources)s)
-              AND reading_resolution = ANY(%(resolutions)s)
-              AND recorded_at < %(recorded_at)s
-            ORDER BY sensor_id, recorded_at DESC
-            """,
-            {
-                "sources": _query_sources(source),
-                "recorded_at": _db_timestamp(recorded_at),
-                "resolutions": [RAW_RESOLUTION, HOURLY_RESOLUTION, DAILY_RESOLUTION],
-            },
-        ).fetchall()
-    return {row["sensor_id"]: row for row in rows}
-
-
-def _closest_actual_recorded_at(conn, sensor_id: int, recorded_at: datetime) -> datetime:
-    aligned_recorded_at = _db_timestamp(_align_to_interval(recorded_at, ACTUAL_READING_INTERVAL_MINUTES))
-    requested_at = _db_timestamp(recorded_at)
-    row = conn.execute(
-        """
-        SELECT recorded_at
-        FROM sensor_readings
-        WHERE sensor_id = %(sensor_id)s
-          AND reading_resolution = %(raw_resolution)s
-          AND recorded_at BETWEEN %(start_at)s AND %(end_at)s
-        ORDER BY abs(extract(epoch FROM (recorded_at - %(requested_at)s::timestamp)))
-        LIMIT 1
-        """,
-        {
-            "sensor_id": sensor_id,
-            "raw_resolution": RAW_RESOLUTION,
-            "requested_at": requested_at,
-            "start_at": requested_at - timedelta(minutes=ACTUAL_READING_INTERVAL_MINUTES / 2),
-            "end_at": requested_at + timedelta(minutes=ACTUAL_READING_INTERVAL_MINUTES / 2),
-        },
-    ).fetchone()
-    return row[0] if row else aligned_recorded_at
-
-
-def _upsert_sensor_rows(conn, rows: list[dict[str, Any]], update_changed_at: bool = False) -> int:
-    changed_at_value = "now() AT TIME ZONE 'Europe/Bucharest'" if update_changed_at else "NULL"
-    conflict_filter = "" if update_changed_at else f"WHERE sensor_readings.source <> '{ACTUAL_SENSOR_SOURCE}'"
-    with conn.cursor() as cur:
-        cur.executemany(
-            f"""
-            INSERT INTO sensor_readings (
-                sensor_id,
-                recorded_at,
-                soil_moisture_pct,
-                air_temperature_c,
-                air_humidity_pct,
-                substrate_temperature_c,
-                source,
-                reading_resolution,
-                sample_count,
-                changed_at
-            )
-            VALUES (
-                %(sensor_id)s,
-                %(recorded_at)s,
-                %(soil_moisture_pct)s,
-                %(air_temperature_c)s,
-                %(air_humidity_pct)s,
-                %(substrate_temperature_c)s,
-                %(source)s,
-                %(reading_resolution)s,
-                %(sample_count)s,
-                {changed_at_value}
-            )
-            ON CONFLICT (sensor_id, recorded_at) DO UPDATE SET
-                soil_moisture_pct = EXCLUDED.soil_moisture_pct,
-                air_temperature_c = EXCLUDED.air_temperature_c,
-                air_humidity_pct = EXCLUDED.air_humidity_pct,
-                substrate_temperature_c = EXCLUDED.substrate_temperature_c,
-                source = EXCLUDED.source,
-                reading_resolution = EXCLUDED.reading_resolution,
-                sample_count = EXCLUDED.sample_count,
-                changed_at = {changed_at_value}
-            {conflict_filter}
-            """,
-            rows,
-        )
-        rowcount = cur.rowcount
-    return rowcount if rowcount else len(rows)
-
-
-def _tiered_periods(end_at: datetime) -> dict[str, datetime]:
-    end_at = _align_to_reading_interval(_as_local(end_at))
-    raw_start = datetime.combine(end_at.date(), time(0, 0), tzinfo=LOCAL_TZ)
-    hourly_start = raw_start - timedelta(days=HOURLY_RETENTION_DAYS)
-    daily_start = raw_start - timedelta(days=DAILY_RETENTION_DAYS)
-    return {
-        "daily_start": daily_start,
-        "hourly_start": hourly_start,
-        "raw_start": raw_start,
-        "end_at": end_at,
-    }
-
 
 def _tiered_resolution_for_time(recorded_at: datetime, period: dict[str, datetime]) -> str | None:
     if period["raw_start"] <= recorded_at <= period["end_at"]:
@@ -1820,12 +752,6 @@ def _tiered_resolution_for_time(recorded_at: datetime, period: dict[str, datetim
     if period["daily_start"] <= recorded_at < period["hourly_start"]:
         return DAILY_RESOLUTION if recorded_at.time().replace(second=0, microsecond=0) in DAILY_READING_TIMES else None
     return None
-
-
-def _slot_count(start_at: datetime, end_at: datetime, minutes: int) -> int:
-    if end_at < start_at:
-        return 0
-    return int((end_at - start_at).total_seconds() // (minutes * 60)) + 1
 
 
 def _sample_count_for_resolution(resolution: str) -> int:
@@ -1840,299 +766,6 @@ def _daily_slot_offsets_minutes() -> list[int]:
     return [slot.hour * 60 + slot.minute for slot in DAILY_READING_TIMES]
 
 
-def _time_key(value: time | str) -> time:
-    if isinstance(value, str):
-        value = time.fromisoformat(value)
-    return value.replace(second=0, microsecond=0)
-
-
-def _put_sensor_lookup_row(
-    lookup: dict[tuple[Any, ...], dict[str, Any]],
-    experiment_date: date,
-    row: dict[str, Any],
-) -> None:
-    sensor_id = row["sensor_id"]
-    local_time = _time_key(row["local_time"])
-    exact_key = (experiment_date, local_time, sensor_id)
-    lookup[exact_key] = row
-
-    bucket_hour = _hour_bucket_for_time(local_time)
-    hour_key = (experiment_date, bucket_hour, sensor_id)
-    current = lookup.get(hour_key)
-    if current is None:
-        lookup[hour_key] = row
-        return
-
-    current_time = _time_key(current["local_time"])
-    hour_start_minutes = bucket_hour * 60
-    current_distance = abs(current_time.hour * 60 + current_time.minute - hour_start_minutes)
-    incoming_distance = abs(local_time.hour * 60 + local_time.minute - hour_start_minutes)
-    if incoming_distance < current_distance:
-        lookup[hour_key] = row
-
-
-def _hour_bucket_for_time(value: time) -> int:
-    return min(23, (value.hour * 60 + value.minute + 30) // 60)
-
-
-def _initial_sensor_states(pots: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
-    return {pot["id"]: _initial_state_for_pot(pot) for pot in pots}
-
-
-def _initial_state_for_pot(pot: dict[str, Any]) -> dict[str, Any]:
-    rng = random.Random(2026 + int(pot["id"]))
-    target = float(pot["moisture_target_pct"])
-    return {
-        "moisture": clamp(target + rng.uniform(-6.0, 4.0), 5.0, 95.0),
-        "last_recorded_at": datetime.combine(DEFAULT_HISTORY_START, time(0, 0), tzinfo=LOCAL_TZ),
-    }
-
-
-def apply_hourly_environment(
-    state: dict[str, Any],
-    pot: dict[str, Any],
-    weather: dict[str, Any],
-    local_day: date,
-    hours: float = 1.0,
-) -> None:
-    state["moisture"] = apply_hourly_environment_moisture(
-        state["moisture"],
-        pot,
-        weather,
-        local_day,
-        hours=hours,
-        outdoor=is_outdoor(pot, local_day),
-    )
-
-
-def _apply_virtual_irrigation_if_due(state: dict[str, Any], pot: dict[str, Any], weather: dict[str, Any], recorded_at: datetime) -> None:
-    hour = recorded_at.hour
-    if hour not in {7, 18}:
-        return
-
-    temp = number(weather.get("temperature_c"), 20.0)
-    precipitation = number(weather.get("precipitation_mm"), 0.0)
-    threshold = float(pot["moisture_min_pct"])
-    target = float(pot["moisture_target_pct"])
-
-    if recorded_at.month in {12, 1, 2}:
-        threshold = 10.0
-        target = float(pot["winter_moisture_target_pct"])
-        if temp <= 10.0:
-            return
-
-    if temp <= 0.0:
-        return
-    if precipitation >= 2.0 and state["moisture"] > threshold * 0.85:
-        return
-    if hour == 18 and pot["plant_type_code"] not in {"vegetables", "herbs"} and pot["size_class"] != "small":
-        return
-    if state["moisture"] >= threshold:
-        return
-
-    volume_l = float(pot["volume_l"])
-    retention = max(float(pot["retention_factor"]), 0.1)
-    flow_rate = max(float(pot["drip_flow_ml_min"]), 1.0)
-    need_pct = max(0.0, target - state["moisture"])
-    planned_volume_ml = need_pct * volume_l * 10.0 / retention
-    max_minutes = {"huge": 90, "large": 60, "medium": 35, "small": 20}[pot["size_class"]]
-    planned_volume_ml = min(planned_volume_ml, flow_rate * max_minutes)
-    moisture_gain = planned_volume_ml * retention / max(volume_l * 10.0, 1.0)
-    state["moisture"] = clamp(state["moisture"] + moisture_gain, 0.0, 100.0)
-
-
-def _sensor_row(
-    pot: dict[str, Any],
-    state: dict[str, Any],
-    weather: dict[str, Any],
-    recorded_at: datetime,
-    source: str,
-) -> dict[str, Any]:
-    rng = random.Random(f"{pot['id']}|{recorded_at.isoformat()}|{source}")
-    air_temperature = _microclimate_temperature(pot, weather, recorded_at)
-    air_humidity = clamp(number(weather.get("relative_humidity_pct"), 60.0) + rng.uniform(-4.0, 4.0), 20.0, 100.0)
-    substrate_temperature = air_temperature + _substrate_delta(pot, recorded_at)
-    moisture = clamp(
-        state["moisture"] + rng.uniform(-1.2, 1.2),
-        minimum_realistic_moisture(pot, recorded_at.date()),
-        100.0,
-    )
-    return {
-        "sensor_id": pot["id"],
-        "recorded_at": _db_timestamp(recorded_at),
-        "soil_moisture_pct": round(moisture, 2),
-        "air_temperature_c": round(air_temperature, 2),
-        "air_humidity_pct": round(air_humidity, 2),
-        "substrate_temperature_c": round(substrate_temperature, 2),
-        "source": source,
-        "reading_resolution": RAW_RESOLUTION,
-        "sample_count": 1,
-    }
-
-
-def _microclimate_temperature(pot: dict[str, Any], weather: dict[str, Any], recorded_at: datetime) -> float:
-    base = number(weather.get("temperature_c"), 20.0)
-    hour = recorded_at.hour
-    sun_delta = {
-        "shade": -0.4,
-        "partial": 0.5,
-        "full": 1.4,
-        "reflected_heat": 2.6,
-    }[pot["sun_exposure"]]
-    if hour < 8 or hour > 19:
-        sun_delta *= 0.2
-    elif 11 <= hour <= 16:
-        sun_delta *= 1.25
-    wind_delta = -0.3 if pot["wind_exposure"] == "gusty" else 0.0
-    indoor_delta = 1.8 if not is_outdoor(pot, recorded_at.date()) else 0.0
-    return base + sun_delta + wind_delta + indoor_delta
-
-
-def _substrate_delta(pot: dict[str, Any], recorded_at: datetime) -> float:
-    material_delta = {
-        "terracotta": 0.6,
-        "plastic": 1.1,
-        "ceramic": 0.4,
-        "fabric": -0.2,
-    }.get(pot["container_material"], 0.0)
-    if 11 <= recorded_at.hour <= 16 and pot["sun_exposure"] in {"full", "reflected_heat"}:
-        material_delta += 1.5
-    return material_delta
-
-
-def _fallback_weather(observed_at: datetime) -> dict[str, Any]:
-    month = observed_at.month
-    if month in {12, 1, 2}:
-        temp = 3.0
-        humidity = 78.0
-    elif month in {6, 7, 8}:
-        temp = 25.0
-        humidity = 55.0
-    elif month in {3, 4, 5}:
-        temp = 16.0
-        humidity = 65.0
-    else:
-        temp = 13.0
-        humidity = 70.0
-    return {
-        "observed_at": observed_at,
-        "observed_local_at": observed_at.replace(tzinfo=None) if observed_at.tzinfo else observed_at,
-        "observed_date": observed_at.date(),
-        "observed_hour": observed_at.hour,
-        "temperature_c": temp,
-        "relative_humidity_pct": humidity,
-        "precipitation_mm": 0.0,
-        "wind_speed_kmh": 8.0,
-        "wind_gust_kmh": 14.0,
-        "evapotranspiration_mm": None,
-        "source": "fallback",
-    }
-
-
-def _reading_exists(recorded_at: datetime, source: str) -> bool:
-    sensor_ids = _sensor_equipped_pot_ids()
-    if not sensor_ids:
-        return False
-    with get_connection() as conn:
-        row = conn.execute(
-            """
-            SELECT count(DISTINCT sensor_id)
-            FROM sensor_readings
-            WHERE source = ANY(%(sources)s)
-              AND reading_resolution = %(raw_resolution)s
-              AND recorded_at = %(recorded_at)s
-              AND sensor_id = ANY(%(sensor_ids)s)
-            """,
-            {
-                "sources": _query_sources(source),
-                "raw_resolution": RAW_RESOLUTION,
-                "recorded_at": _db_timestamp(recorded_at),
-                "sensor_ids": sensor_ids,
-            },
-        ).fetchone()
-    return bool(row and row[0] >= len(sensor_ids))
-
-
-def _sensor_equipped_pot_ids(candidate_pot_ids: list[int] | None = None) -> list[int]:
-    return SensorPlacementService().selected_pot_ids(candidate_pot_ids)
-
-
-def _query_sources(source: str | None) -> list[str]:
-    if source == DEFAULT_SENSOR_SOURCE:
-        return [DEFAULT_SENSOR_SOURCE, ACTUAL_SENSOR_SOURCE, ACTUATOR_FEEDBACK_SOURCE]
-    if source:
-        return [source]
-    return [DEFAULT_SENSOR_SOURCE, ACTUAL_SENSOR_SOURCE, ACTUATOR_FEEDBACK_SOURCE]
-
-
-def _scheduled_datetimes(day: date) -> list[datetime]:
-    return [datetime.combine(day, slot, tzinfo=LOCAL_TZ) for slot in DAILY_READING_TIMES]
-
-
-def _next_scheduled_datetime(now: datetime) -> datetime:
-    now = _as_local(now)
-    for candidate in _scheduled_datetimes(now.date()):
-        if candidate > now:
-            return candidate
-    return _scheduled_datetimes(now.date() + timedelta(days=1))[0]
-
-
-def next_scheduled_sensor_datetime(now: datetime) -> datetime:
-    return _next_scheduled_datetime(now)
-
-
-def _reading_interval_minutes() -> int:
-    return max(1, min(24 * 60, get_settings().sensor_reading_interval_minutes))
-
-
-def _align_to_reading_interval(value: datetime) -> datetime:
-    return _align_to_interval(value, _reading_interval_minutes())
-
-
-def _align_to_interval(value: datetime, interval: int) -> datetime:
-    value = _as_local(value).replace(second=0, microsecond=0)
-    minutes_since_midnight = value.hour * 60 + value.minute
-    aligned_minutes = (minutes_since_midnight // interval) * interval
-    return datetime.combine(value.date(), time(0, 0), tzinfo=LOCAL_TZ) + timedelta(minutes=aligned_minutes)
-
-
-def _ceil_to_interval(value: datetime, interval: int) -> datetime:
-    value = _as_local(value).replace(second=0, microsecond=0)
-    minutes_since_midnight = value.hour * 60 + value.minute
-    aligned_minutes = ((minutes_since_midnight + interval - 1) // interval) * interval
-    return datetime.combine(value.date(), time(0, 0), tzinfo=LOCAL_TZ) + timedelta(minutes=aligned_minutes)
-
-
-def _payload_dict(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return value
-    if hasattr(value, "obj") and isinstance(value.obj, dict):
-        return value.obj
-    return {}
-
-
-def valve_number_for_zone(zone: str) -> int | None:
-    for design in VALVE_ZONE_DESIGN:
-        if design["zone"] == zone:
-            return int(design["valve_number"])
-    return None
-
-
-def _is_hot_irrigation_day(conn, day: date) -> bool:
-    start_at = datetime.combine(day, time.min)
-    end_at = start_at + timedelta(days=1)
-    row = conn.execute(
-        """
-        SELECT max(temperature_c) AS max_temperature_c
-        FROM weather_hourly
-        WHERE location_name = %(location)s
-          AND observed_local_at >= %(start_at)s
-          AND observed_local_at < %(end_at)s
-        """,
-        {"location": LOCATION_NAME, "start_at": start_at, "end_at": end_at},
-    ).fetchone()
-    return bool(row and number(row["max_temperature_c"], 0.0) >= 32.0)
-
 
 def _date_from_env(name: str, default: date) -> date:
     settings = get_settings()
@@ -2145,31 +778,6 @@ def _date_from_env(name: str, default: date) -> date:
 
 def date_from_env(name: str, default: date) -> date:
     return _date_from_env(name, default)
-
-
-def _today_local() -> date:
-    return datetime.now(LOCAL_TZ).date()
-
-
-def _as_local(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value.replace(tzinfo=LOCAL_TZ)
-    return value.astimezone(LOCAL_TZ)
-
-
-def _db_timestamp(value: datetime) -> datetime:
-    return _as_local(value).replace(tzinfo=None)
-
-
-def _same_month_day(year: int, source_date: date) -> date:
-    try:
-        return date(year, source_date.month, source_date.day)
-    except ValueError:
-        return date(year, 2, 28)
-
-
-def is_outdoor(pot: dict[str, Any], day: date) -> bool:
-    return True
 
 
 def _required_number(item: dict[str, Any], key: str) -> float:
@@ -2251,4 +859,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
 

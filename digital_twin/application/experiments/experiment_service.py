@@ -2,10 +2,8 @@
 
 import calendar
 import logging
-import os
 import threading
 import time
-from concurrent.futures import Future, ProcessPoolExecutor
 from datetime import date, timedelta
 from typing import Any
 
@@ -24,6 +22,8 @@ from digital_twin.application.experiments.runners import (
     FuzzyDigitalTwinExperiment,
     SamplingIrrigationExperiment,
 )
+import digital_twin.application.experiments.cache_keys as cache_keys
+import digital_twin.application.experiments.precompute as precompute
 from digital_twin.core.cache import SingleFlightCache
 from digital_twin.core.config import get_settings
 from digital_twin.core.exceptions import ExperimentConfigurationError, InvalidDateRange
@@ -43,16 +43,9 @@ logger = logging.getLogger("digital_twin.application.experiments")
 DEFAULT_SCENARIO_SEED = 2026
 DEFAULT_SAMPLING_INTERVAL_DAYS = 3
 DEFAULT_SNAPSHOT_CACHE_TTL_SECONDS = 15 * 60
-ANFIS_MODEL_KEY_BY_START_YEAR = {
-    2023: "anfis-2023-simulated",
-}
-
 _experiment_cache = SingleFlightCache()
 _snapshot_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
 _snapshot_cache_lock = threading.Lock()
-_precompute_executor: ProcessPoolExecutor | None = None
-_precompute_executor_lock = threading.Lock()
-_PRECOMPUTE_WORKER_COUNT = max(1, min(2, (os.cpu_count() or 2) // 2))
 
 
 def get_default_experiment_range(end: date | None = None) -> tuple[date, date]:
@@ -76,7 +69,7 @@ def run_default_dt_control_strategy(
     end: date,
     persist: bool = True,
 ) -> dict[str, Any]:
-    cache_key = _baseline_cache_key(start, end, persist)
+    cache_key = cache_keys.baseline_cache_key(start, end, persist)
     result = _cached_experiment_result(
         cache_key,
         lambda: _baseline_payload(start, end, persist=persist),
@@ -93,7 +86,7 @@ def run_sampling_experiment(
     sample_interval_days: int,
     sample_interval_hours: int | None,
 ) -> dict[str, Any]:
-    cache_key = _sampling_cache_key(start, end, sample_interval_days, sample_interval_hours, True)
+    cache_key = cache_keys.sampling_cache_key(start, end, sample_interval_days, sample_interval_hours, True)
     result = _cached_experiment_result(
         cache_key,
         lambda: _sampling_payload(start, end, sample_interval_days, sample_interval_hours, persist=True),
@@ -124,7 +117,7 @@ def run_anfis_experiment(
     end: date,
     seed: int | None,
 ) -> dict[str, Any]:
-    cache_key = _anfis_cache_key(
+    cache_key = cache_keys.anfis_cache_key(
         start,
         end,
         seed,
@@ -139,7 +132,7 @@ def run_anfis_experiment(
             persist=True,
         ),
     )
-    resolved_model_key = _resolve_anfis_model_key(start, end)
+    resolved_model_key = cache_keys.resolve_anfis_model_key(start)
     _store_experiment_run(
         "anfis",
         start,
@@ -164,7 +157,7 @@ def run_fuzzy_dt_experiment(
     start: date,
     end: date,
 ) -> dict[str, Any]:
-    cache_key = _fuzzy_dt_cache_key(start, end, True)
+    cache_key = cache_keys.fuzzy_dt_cache_key(start, end, True)
     result = _cached_experiment_result(
         cache_key,
         lambda: _fuzzy_dt_payload(start, end, persist=True),
@@ -203,7 +196,7 @@ def precompute_experiments(
 
 def get_cached_snapshot(start: date, end: date):
     ttl_seconds = get_settings().experiment_snapshot_cache_ttl_seconds
-    cache_key = ("db-snapshot-v7-baseline-startup", start, end, _sensor_placement_cache_token())
+    cache_key = cache_keys.snapshot_cache_key(start, end)
     now = time.time()
     with _snapshot_cache_lock:
         entry = _snapshot_cache.get(cache_key)
@@ -218,11 +211,14 @@ def get_cached_snapshot(start: date, end: date):
 
 def warm_default_baseline_cache() -> dict[str, Any]:
     start, end = get_default_experiment_range()
-    cache_key = _baseline_cache_key(start, end, True)
-    status = _start_precompute_task(
+    cache_key = cache_keys.baseline_cache_key(start, end, True)
+    status = precompute.start_precompute_task(
         "baseline",
         cache_key,
         {"experiment": "baseline", "start": start, "end": end, "persist": True},
+        cache=_experiment_cache,
+        compute_payload=_compute_precompute_payload,
+        logger=logger,
     )
     return {
         "start": start.isoformat(),
@@ -233,7 +229,7 @@ def warm_default_baseline_cache() -> dict[str, Any]:
 
 def _shared_baseline_result(start: date, end: date) -> dict[str, Any]:
     return _cached_experiment_result(
-        _baseline_cache_key(start, end, True),
+        cache_keys.baseline_cache_key(start, end, True),
         lambda: _baseline_payload(start, end, persist=True),
     )
 
@@ -268,7 +264,7 @@ def schedule_related_precompute(
         tasks.append(
             (
                 "baseline",
-                _baseline_cache_key(start, end),
+                cache_keys.baseline_cache_key(start, end),
                 {"experiment": "baseline", "start": start, "end": end, "persist": True},
             )
         )
@@ -276,7 +272,7 @@ def schedule_related_precompute(
         tasks.append(
             (
                 "sampling",
-                _sampling_cache_key(start, end, sample_interval_days, sample_interval_hours),
+                cache_keys.sampling_cache_key(start, end, sample_interval_days, sample_interval_hours),
                 {
                     "experiment": "sampling",
                     "start": start,
@@ -292,7 +288,7 @@ def schedule_related_precompute(
             tasks.append(
                 (
                     "anfis",
-                    _anfis_cache_key(
+                    cache_keys.anfis_cache_key(
                         start,
                         end,
                         seed,
@@ -312,13 +308,20 @@ def schedule_related_precompute(
         tasks.append(
             (
                 "fuzzy_dt",
-                _fuzzy_dt_cache_key(start, end),
+                cache_keys.fuzzy_dt_cache_key(start, end),
                 {"experiment": "fuzzy_dt", "start": start, "end": end, "persist": True},
             )
         )
 
     for label, cache_key, task in tasks:
-        task_status = _start_precompute_task(label, cache_key, task)
+        task_status = precompute.start_precompute_task(
+            label,
+            cache_key,
+            task,
+            cache=_experiment_cache,
+            compute_payload=_compute_precompute_payload,
+            logger=logger,
+        )
         status[task_status].append(label)
 
     return status
@@ -370,7 +373,7 @@ def _anfis_payload(
 ) -> dict[str, Any]:
     snapshot, snapshot_cache_hit = get_cached_snapshot(start, end)
     baseline = _shared_baseline_result(start, end)
-    resolved_model_key = _resolve_anfis_model_key(start, end)
+    resolved_model_key = cache_keys.resolve_anfis_model_key(start)
     persisted_model = AnfisModelService().load_latest_model(resolved_model_key)
     if not persisted_model:
         raise ExperimentConfigurationError(
@@ -427,10 +430,6 @@ def _persisted_anfis_model_matches(
         and int(metadata.get("population") or 0) == DEFAULT_ANFIS_POPULATION
     )
 
-
-def _resolve_anfis_model_key(start: date, end: date) -> str:
-    """Select the persisted ANFIS model from the range lower bound."""
-    return ANFIS_MODEL_KEY_BY_START_YEAR.get(start.year, DEFAULT_MODEL_KEY)
 
 
 def _fuzzy_dt_payload(start: date, end: date, persist: bool = True) -> dict[str, Any]:
@@ -553,50 +552,6 @@ def _annotate_snapshot_cache(result: dict[str, Any], snapshot, cache_hit: bool) 
     return result
 
 
-def _start_precompute_task(
-    label: str,
-    cache_key: tuple[Any, ...],
-    task: dict[str, Any],
-) -> str:
-    event, should_compute = _experiment_cache.reserve(cache_key)
-    if event is None:
-        return "cached"
-    if not should_compute:
-        return "inflight"
-
-    logger.info("Precomputing %s experiment cache for %s", label, cache_key)
-    try:
-        future = _get_precompute_executor().submit(_compute_precompute_payload, task)
-    except Exception as exc:
-        _experiment_cache.release_failed(cache_key, event)
-        logger.warning("Precomputing %s experiment cache could not start: %s", label, exc)
-        return "failed"
-    future.add_done_callback(lambda completed: _finish_precompute_task(label, cache_key, event, completed))
-    return "started"
-
-
-def _get_precompute_executor() -> ProcessPoolExecutor:
-    global _precompute_executor
-    with _precompute_executor_lock:
-        if _precompute_executor is None:
-            _precompute_executor = ProcessPoolExecutor(max_workers=_PRECOMPUTE_WORKER_COUNT)
-        return _precompute_executor
-
-
-def _finish_precompute_task(
-    label: str,
-    cache_key: tuple[Any, ...],
-    event: threading.Event,
-    future: Future,
-) -> None:
-    try:
-        result = future.result()
-        _experiment_cache.store(cache_key, result, event)
-        logger.info("Precomputed %s experiment cache for %s", label, cache_key)
-    except Exception as exc:
-        _experiment_cache.release_failed(cache_key, event)
-        logger.warning("Precomputing %s experiment cache failed: %s", label, exc)
-
 
 def _compute_precompute_payload(task: dict[str, Any]) -> dict[str, Any]:
     experiment = task["experiment"]
@@ -621,63 +576,6 @@ def _compute_precompute_payload(task: dict[str, Any]) -> dict[str, Any]:
         return _fuzzy_dt_payload(task["start"], task["end"], persist=task.get("persist", True))
     raise ValueError(f"Unknown precompute experiment: {experiment}")
 
-
-def _baseline_cache_key(start: date, end: date, persist: bool = True) -> tuple[Any, ...]:
-    return ("baseline-db-v17-seasonal-rain-dose-valve-details", start, end, persist, _sensor_placement_cache_token())
-
-
-def _sampling_cache_key(
-    start: date,
-    end: date,
-    sample_interval_days: int,
-    sample_interval_hours: int | None,
-    persist: bool = True,
-) -> tuple[Any, ...]:
-    effective_sample_interval_hours = sample_interval_hours or sample_interval_days * 24
-    return (
-        "sampling-db-sensor-weather-v14-hourly-raw-weather-popover-valve-details",
-        start,
-        end,
-        sample_interval_days,
-        effective_sample_interval_hours,
-        persist,
-        _sensor_placement_cache_token(),
-    )
-
-
-def _anfis_cache_key(
-    start: date,
-    end: date,
-    seed: int | None,
-    persist: bool = True,
-) -> tuple[Any, ...]:
-    return (
-        "anfis-db-size-flow-pots-v17-weighted-zone-calibrated-valve-details",
-        start,
-        end,
-        seed,
-        _resolve_anfis_model_key(start, end),
-        persist,
-        _sensor_placement_cache_token(),
-    )
-
-
-def _fuzzy_dt_cache_key(start: date, end: date, persist: bool = True) -> tuple[Any, ...]:
-    return ("fuzzy-dt-db-v10-volume-score-valve-details", start, end, persist, _sensor_placement_cache_token())
-
-
-def _sensor_placement_cache_token() -> tuple[Any, ...]:
-    with get_connection() as conn:
-        row = conn.execute(
-            """
-            SELECT
-                count(*) AS location_count,
-                coalesce(max(requested_sensor_count), 0) AS requested_sensor_count,
-                coalesce(string_agg(pot_id::text, ',' ORDER BY rank), '') AS pot_ids
-            FROM sensor_location_recommendations
-            """
-        ).fetchone()
-    return (int(row[0] or 0), int(row[1] or 0), row[2] or "")
 
 
 def _precompute_enabled() -> bool:
@@ -790,4 +688,7 @@ __all__ = [
     "list_experiment_runs",
     "prepare_tomorrow_prescriptions",
 ]
+
+
+
 

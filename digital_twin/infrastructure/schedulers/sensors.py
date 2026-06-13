@@ -5,8 +5,8 @@ import threading
 import time as sleep_time
 from datetime import datetime, timedelta
 
-from digital_twin.application.sensor_history.readings.core import (
-    next_scheduled_sensor_datetime,
+from digital_twin.application.sensor_history.readings.shared import (
+    next_scheduled_datetime,
 )
 from digital_twin.application.sensor_history.sensor_history_service import SensorService
 from digital_twin.core.config import get_settings
@@ -39,7 +39,7 @@ class SensorScheduler:
     def _loop(self, source: str) -> None:
         tz = local_timezone()
         while True:
-            next_run = next_scheduled_sensor_datetime(datetime.now(tz))
+            next_run = next_scheduled_datetime(datetime.now(tz))
             seconds = max(1, int((next_run - datetime.now(tz)).total_seconds()))
             logger.info("Next sensor reading scheduled at %s", next_run.isoformat())
             sleep_time.sleep(seconds)

@@ -11,7 +11,7 @@ from digital_twin.application.control_loop.snapshots import (
 )
 from digital_twin.simulation.anfis.execution import run_anfis_daily_irrigation
 from digital_twin.simulation.anfis.model import ANFIS
-from digital_twin.simulation.anfis.modeling import AnfisModelController
+from digital_twin.simulation.anfis.controller import AnfisModelController
 from digital_twin.simulation.baseline.execution import run_default_daily_irrigation
 from digital_twin.simulation.experiment_comparison import ExperimentComparison
 from digital_twin.simulation.fuzzy.execution import (
@@ -31,7 +31,7 @@ from digital_twin.simulation.shared.constants import (
     LOCAL_TZ,
 )
 from digital_twin.simulation.shared.types import ExperimentSnapshot
-from digital_twin.simulation.state.sensor_context import sensor_control_pots
+from digital_twin.simulation.sensors.context import sensor_control_pots
 
 
 def load_experiment_snapshot(start_date: date, end_date: date) -> ExperimentSnapshot:

@@ -4,22 +4,22 @@ import unittest
 from datetime import date, datetime, time
 from unittest.mock import patch
 
-from digital_twin.application.sensor_history.readings.core import ACTUAL_SENSOR_SOURCE
+from digital_twin.domain.sensors import ACTUAL_SENSOR_SOURCE
 from digital_twin.simulation import engine
-from digital_twin.simulation.anfis.model import ANFIS
-from digital_twin.simulation.anfis.modeling import (
+from digital_twin.simulation.anfis.controller import (
     AnfisModelController,
     AnfisProbabilityCalibrator,
 )
+from digital_twin.simulation.anfis.model import ANFIS
 from digital_twin.simulation.shared.constants import LOCAL_TZ
 from digital_twin.simulation.shared.types import (
     ExperimentSnapshot,
     PotState,
 )
-from digital_twin.simulation.state.sensor_calibration import (
+from digital_twin.simulation.sensors.calibration import (
     apply_sensor_calibration_marker,
 )
-from digital_twin.simulation.state.sensor_context import sensor_control_pots
+from digital_twin.simulation.sensors.context import sensor_control_pots
 
 
 class StrategySensorAnchorPolicyTests(unittest.TestCase):
@@ -30,7 +30,7 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
             "digital_twin.simulation.engine.resolve_simulation_snapshot",
             side_effect=AssertionError("strategy comparison should start from selected snapshot"),
         ), patch(
-            "digital_twin.simulation.state.sensor_calibration.apply_sensor_calibration_marker",
+            "digital_twin.simulation.sensors.calibration.apply_sensor_calibration_marker",
             side_effect=AssertionError("continuous calibration should not run"),
         ):
             result = engine.run_fuzzy_dt_daily_irrigation_with_snapshot(
@@ -54,7 +54,7 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
             "digital_twin.simulation.engine.resolve_simulation_snapshot",
             side_effect=AssertionError("strategy comparison should start from selected snapshot"),
         ), patch(
-            "digital_twin.simulation.state.sensor_calibration.apply_sensor_calibration_marker",
+            "digital_twin.simulation.sensors.calibration.apply_sensor_calibration_marker",
             side_effect=AssertionError("continuous calibration should not run"),
         ):
             result = engine.run_anfis_daily_irrigation_with_snapshot(

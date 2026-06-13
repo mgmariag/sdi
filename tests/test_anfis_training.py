@@ -3,15 +3,17 @@ from __future__ import annotations
 import unittest
 from datetime import date, datetime, time
 
-from digital_twin.simulation.anfis.model import ANFIS, DEFAULT_INPUTS
-from digital_twin.simulation.anfis.modeling import (
+from digital_twin.simulation.anfis.controller import (
     AnfisModelController,
     AnfisProbabilityCalibrator,
+    deserialize_trained_anfis_model,
+    serialize_trained_anfis_model,
+)
+from digital_twin.simulation.anfis.model import ANFIS, DEFAULT_INPUTS
+from digital_twin.simulation.anfis.modeling import (
     anfis_training_signals,
     anfis_training_target_probability,
-    deserialize_trained_anfis_model,
     generate_database_anfis_dataset,
-    serialize_trained_anfis_model,
 )
 from digital_twin.simulation.shared.constants import LOCAL_TZ
 

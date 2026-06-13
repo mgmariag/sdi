@@ -3,7 +3,6 @@
 from datetime import date
 from typing import Any
 
-from digital_twin.application.control_loop.actuation import ActuationStage
 from digital_twin.application.control_loop.decision import DecisionStage
 from digital_twin.application.control_loop.prescriptions import PrescriptionStage
 
@@ -32,7 +31,6 @@ class RuntimeControlLoop:
         self.actuation_service = actuation_service
         self.decision = DecisionStage(self.experiment_service)
         self.prescriptions = PrescriptionStage(self.experiment_service, self.actuation_service)
-        self.actuation = ActuationStage(self.actuation_service)
 
     def prepare_next_day_prescriptions(self, target: date | None = None) -> dict[str, Any]:
         return self.prescriptions.prepare_next_day(target)
@@ -41,8 +39,8 @@ class RuntimeControlLoop:
         return self.prescriptions.dispatch_next_day(target)
 
     def run_due_actuation(self, actuator_node: str = "irrigation-actuator", limit: int = 100) -> dict[str, Any]:
-        return self.actuation.run_due(actuator_node=actuator_node, limit=limit)
+        return self.actuation_service.run_due_prescription_windows(actuator_node=actuator_node, limit=limit)
 
     def actuation_summary(self) -> dict[str, Any]:
-        return self.actuation.summary()
+        return self.actuation_service.summary()
 

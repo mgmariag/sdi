@@ -3,6 +3,7 @@
 import unittest
 from datetime import date
 
+import digital_twin.application.experiments.cache_keys as cache_keys
 import digital_twin.application.experiments.experiment_service as experiments
 from digital_twin.application.anfis_training.anfis_training_service import (
     DEFAULT_ANFIS_GENERATIONS,
@@ -110,24 +111,15 @@ class AnfisModelServiceTests(unittest.TestCase):
         current_year = experiments.today_local().year
 
         self.assertEqual(
-            experiments._resolve_anfis_model_key(
-                date(current_year, 1, 1),
-                date(current_year, 6, 1),
-            ),
+            cache_keys.resolve_anfis_model_key(date(current_year, 1, 1)),
             "anfis-default",
         )
         self.assertEqual(
-            experiments._resolve_anfis_model_key(
-                date(2023, 5, 1),
-                date(2023, 6, 1),
-            ),
+            cache_keys.resolve_anfis_model_key(date(2023, 5, 1)),
             "anfis-2023-simulated",
         )
         self.assertEqual(
-            experiments._resolve_anfis_model_key(
-                date(2025, 5, 1),
-                date(2025, 6, 1),
-            ),
+            cache_keys.resolve_anfis_model_key(date(2025, 5, 1)),
             "anfis-default",
         )
 

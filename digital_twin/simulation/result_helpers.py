@@ -74,6 +74,37 @@ def event_water_usage_l_by_pot(events: list[dict[str, Any]]) -> dict[int, float]
     return {pot_id: round(value, 2) for pot_id, value in usage.items()}
 
 
+def experiment_result(
+    *,
+    entries: list[dict[str, Any]],
+    chart_entries: list[dict[str, Any]],
+    summary: dict[str, Any],
+    pots: list[dict[str, Any]],
+    valve_rollup: dict[str, list[dict[str, Any]]],
+    decisions: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    alerts: list[dict[str, Any]],
+    extra_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = {
+        "entries": entries,
+        "chartEntries": chart_entries,
+        "summary": summary,
+        "pots": pot_info_entries(
+            pots,
+            {"period_water_usage_l": event_water_usage_l_by_pot(events)},
+        ),
+        "sampleDecisions": valve_rollup["decisions"][:200],
+        "sampleEvents": valve_rollup["events"][:200],
+        "samplePotDecisions": decisions[:200],
+        "samplePotEvents": events[:200],
+        "sampleAlerts": alerts[:200],
+    }
+    if extra_fields:
+        result.update(extra_fields)
+    return result
+
+
 def average_moisture_from_state_payload(payload: Any) -> float | None:
     if not isinstance(payload, dict):
         return None

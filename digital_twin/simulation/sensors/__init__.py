@@ -1,0 +1,1 @@
+"""Sensor-specific simulation helpers."""

@@ -3,10 +3,12 @@ from __future__ import annotations
 import unittest
 from datetime import date, datetime
 
-from digital_twin.application.sensor_history.readings.core import (
+from digital_twin.application.sensor_history.readings.state_rows import (
     LOCAL_TZ,
-    _sensor_row,
     apply_hourly_environment,
+    sensor_row,
+)
+from digital_twin.simulation.soil_model import (
     minimum_realistic_moisture,
 )
 
@@ -18,7 +20,7 @@ class SensorReadingBoundsTests(unittest.TestCase):
         local_day = date(2025, 12, 18)
 
         apply_hourly_environment(state, pot, _weather(), local_day)
-        row = _sensor_row(
+        row = sensor_row(
             pot,
             state,
             _weather(),

@@ -6,7 +6,7 @@ from typing import Any
 from digital_twin.domain.sensors import ACTUAL_SENSOR_SOURCE, DEFAULT_SENSOR_SOURCE
 from digital_twin.simulation.shared.constants import LOCAL_TZ
 from digital_twin.simulation.soil_model import local_observed_at
-from digital_twin.simulation.state.sensor_calibration import (
+from digital_twin.simulation.sensors.calibration import (
     _sensor_hour_is_future,
     lookup_sensor_reading,
     sensor_date_is_future,

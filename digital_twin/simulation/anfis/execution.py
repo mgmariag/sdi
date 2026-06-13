@@ -4,6 +4,7 @@ from datetime import date, timedelta
 from typing import Any
 
 import digital_twin.simulation.anfis.modeling as modeling
+import digital_twin.simulation.anfis.controller as anfis_controller
 import digital_twin.simulation.metrics as metrics
 import digital_twin.simulation.result_helpers as results
 import digital_twin.simulation.soil_model as soil
@@ -11,7 +12,7 @@ import digital_twin.simulation.state.aggregates as state_aggregates
 import digital_twin.simulation.state.environment as state_environment
 import digital_twin.simulation.state.lookback as state_lookback
 import digital_twin.simulation.state.projection as state_projection
-import digital_twin.simulation.state.sensor_context as sensor_context_helpers
+import digital_twin.simulation.sensors.context as sensor_context_helpers
 import digital_twin.simulation.valves.distribution as valve_distribution
 import digital_twin.simulation.valves.rollups as valve_rollups
 import digital_twin.simulation.valves.zones as valve_zones
@@ -41,7 +42,7 @@ ANFIS_HARD_STOP_REASON_CODES = {
 def run_anfis_daily_irrigation(
     start_date: date,
     end_date: date,
-    model: ANFIS | modeling.AnfisModelController,
+    model: ANFIS | anfis_controller.AnfisModelController,
     persist: bool,
     selected_snapshot: ExperimentSnapshot,
     decision_threshold: float = ANFIS_DECISION_THRESHOLD,
@@ -505,18 +506,14 @@ def run_anfis_daily_irrigation(
     summary["decisionLevel"] = "valve_zone"
     chart_entries = results.chart_entries_for_range(start_date, end_date, entries, detail_entries)
     metrics.add_chart_summary(summary, chart_entries, start_date, end_date)
-    return {
-        "entries": entries,
-        "chartEntries": chart_entries,
-        "summary": summary,
-        "pots": results.pot_info_entries(
-            pots,
-            {"period_water_usage_l": results.event_water_usage_l_by_pot(events)},
-        ),
-        "sampleDecisions": valve_rollup["decisions"][:200],
-        "sampleEvents": valve_rollup["events"][:200],
-        "samplePotDecisions": decisions[:200],
-        "samplePotEvents": events[:200],
-        "sampleAlerts": alerts[:200],
-    }
+    return results.experiment_result(
+        entries=entries,
+        chart_entries=chart_entries,
+        summary=summary,
+        pots=pots,
+        valve_rollup=valve_rollup,
+        decisions=decisions,
+        events=events,
+        alerts=alerts,
+    )
 

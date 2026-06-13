@@ -13,71 +13,79 @@ sap.ui.define([
         ["fuzzyMoistureChart", "fuzzyContextChart"]
     ];
 
+    function fullWindow() {
+        return {
+            start: "firstDataPoint",
+            end: "lastDataPoint"
+        };
+    }
+
+    function initialChartWindow(rows, rowLabel) {
+        const normalizedRows = Array.isArray(rows) ? rows : [];
+        if (normalizedRows.length === 0) {
+            return fullWindow();
+        }
+
+        const endRow = normalizedRows[normalizedRows.length - 1];
+        const endDate = entryTimestamp(endRow);
+        if (!endDate) {
+            return fullWindow();
+        }
+
+        const startDate = new Date(endDate.getTime() - INITIAL_VISIBLE_CHART_DAYS * 24 * 60 * 60 * 1000);
+        const startRow = normalizedRows.find((row) => {
+            const rowDate = entryTimestamp(row);
+            return rowDate && rowDate >= startDate;
+        }) || normalizedRows[0];
+
+        if (startRow === normalizedRows[0] && endRow === normalizedRows[normalizedRows.length - 1]) {
+            return fullWindow();
+        }
+
+        return {
+            start: {
+                categoryAxis: {
+                    "Date/Time": rowLabel(startRow)
+                }
+            },
+            end: {
+                categoryAxis: {
+                    "Date/Time": rowLabel(endRow)
+                }
+            }
+        };
+    }
+
+    function chartWindowSignature(rows, rowLabel) {
+        const normalizedRows = Array.isArray(rows) ? rows : [];
+        if (normalizedRows.length === 0) {
+            return "";
+        }
+        const endRow = normalizedRows[normalizedRows.length - 1];
+        const endDate = entryTimestamp(endRow);
+        const startDate = endDate ? new Date(endDate.getTime() - INITIAL_VISIBLE_CHART_DAYS * 24 * 60 * 60 * 1000) : null;
+        const startIndex = startDate
+            ? Math.max(0, normalizedRows.findIndex((row) => {
+                const rowDate = entryTimestamp(row);
+                return rowDate && rowDate >= startDate;
+            }))
+            : 0;
+        return [
+            normalizedRows.length,
+            rowLabel(normalizedRows[startIndex]),
+            rowLabel(normalizedRows[normalizedRows.length - 1])
+        ].join("|");
+    }
+
     return {
         _initialChartWindow(chartId) {
             const rows = this.getView().getModel().getProperty(this._chartDataPath(chartId)) || [];
-            if (!Array.isArray(rows) || rows.length === 0) {
-                return {
-                    start: "firstDataPoint",
-                    end: "lastDataPoint"
-                };
-            }
-
-            const endRow = rows[rows.length - 1];
-            const endDate = entryTimestamp(endRow);
-            if (!endDate) {
-                return {
-                    start: "firstDataPoint",
-                    end: "lastDataPoint"
-                };
-            }
-
-            const startDate = new Date(endDate.getTime() - INITIAL_VISIBLE_CHART_DAYS * 24 * 60 * 60 * 1000);
-            const startRow = rows.find((row) => {
-                const rowDate = entryTimestamp(row);
-                return rowDate && rowDate >= startDate;
-            }) || rows[0];
-
-            if (startRow === rows[0] && endRow === rows[rows.length - 1]) {
-                return {
-                    start: "firstDataPoint",
-                    end: "lastDataPoint"
-                };
-            }
-
-            return {
-                start: {
-                    categoryAxis: {
-                        "Date/Time": this._chartRowLabel(startRow)
-                    }
-                },
-                end: {
-                    categoryAxis: {
-                        "Date/Time": this._chartRowLabel(endRow)
-                    }
-                }
-            };
+            return initialChartWindow(rows, (row) => this._chartRowLabel(row));
         },
 
         _chartWindowSignature(chartId) {
             const rows = this.getView().getModel().getProperty(this._chartDataPath(chartId)) || [];
-            if (!Array.isArray(rows) || rows.length === 0) {
-                return "";
-            }
-            const endRow = rows[rows.length - 1];
-            const endDate = entryTimestamp(endRow);
-            const startDate = endDate ? new Date(endDate.getTime() - INITIAL_VISIBLE_CHART_DAYS * 24 * 60 * 60 * 1000) : null;
-            const startIndex = startDate
-                ? Math.max(0, rows.findIndex((row) => {
-                    const rowDate = entryTimestamp(row);
-                    return rowDate && rowDate >= startDate;
-                }))
-                : 0;
-            return [
-                rows.length,
-                this._chartRowLabel(rows[startIndex]),
-                this._chartRowLabel(rows[rows.length - 1])
-            ].join("|");
+            return chartWindowSignature(rows, (row) => this._chartRowLabel(row));
         },
 
         _applyInitialChartWindow(chartId) {

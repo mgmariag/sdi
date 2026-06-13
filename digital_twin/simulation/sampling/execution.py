@@ -30,8 +30,7 @@ from digital_twin.simulation.metrics import (
 from digital_twin.simulation.result_helpers import (
     chart_entries_for_range,
     daily_summary,
-    event_water_usage_l_by_pot,
-    pot_info_entries,
+    experiment_result,
 )
 from digital_twin.simulation.shared.types import (
     ExperimentSnapshot,
@@ -62,14 +61,14 @@ from digital_twin.simulation.state.lookback import (
 from digital_twin.simulation.state.projection import (
     initialize_states_from_first_day_sensor_readings,
 )
-from digital_twin.simulation.state.sensor_calibration import (
+from digital_twin.simulation.sensors.calibration import (
     apply_calibration_reading,
     apply_sensor_calibration_marker,
     forecast_sensor_reading_for_pot,
     sampling_calibration_at,
     sensor_reading_for_pot,
 )
-from digital_twin.simulation.state.sensor_context import (
+from digital_twin.simulation.sensors.context import (
     sensor_control_pots,
     sensor_control_summary_fields,
     with_sensor_key,
@@ -214,20 +213,16 @@ class _SparseSamplingController:
         summary = self._summary(valve_rollup)
         chart_entries = chart_entries_for_range(self.start_date, self.end_date, self.entries, self.detail_entries)
         add_chart_summary(summary, chart_entries, self.start_date, self.end_date)
-        return {
-            "entries": self.entries,
-            "chartEntries": chart_entries,
-            "summary": summary,
-            "pots": pot_info_entries(
-                self.pots,
-                {"period_water_usage_l": event_water_usage_l_by_pot(self.events)},
-            ),
-            "sampleDecisions": valve_rollup["decisions"][:200],
-            "sampleEvents": valve_rollup["events"][:200],
-            "samplePotDecisions": self.decisions[:200],
-            "samplePotEvents": self.events[:200],
-            "sampleAlerts": self.alerts[:200],
-        }
+        return experiment_result(
+            entries=self.entries,
+            chart_entries=chart_entries,
+            summary=summary,
+            pots=self.pots,
+            valve_rollup=valve_rollup,
+            decisions=self.decisions,
+            events=self.events,
+            alerts=self.alerts,
+        )
 
     def _run_day(self, current_date: date) -> None:
         day_weather = self.weather_by_day.get(current_date, [])

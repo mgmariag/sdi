@@ -20,12 +20,12 @@ from digital_twin.simulation.state.environment import (
     day_profile as build_day_profile,
     group_weather_by_day,
 )
-from digital_twin.simulation.state.sensor_calibration import (
+from digital_twin.simulation.sensors.calibration import (
     latest_sensor_state_for_pot,
     sensor_lookup_time,
     sensor_reading_for_pot,
 )
-from digital_twin.simulation.state.sensor_context import (
+from digital_twin.simulation.sensors.context import (
     sensor_control_pots,
     with_sensor_key,
 )

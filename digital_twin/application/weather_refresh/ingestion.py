@@ -1,12 +1,25 @@
-from datetime import date, datetime, time, timedelta
-from decimal import Decimal
+﻿from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from psycopg.rows import dict_row
-from psycopg.types.json import Jsonb
 
+from digital_twin.application.weather_refresh.persistence import (
+    empty_import_stats as _empty_import_stats,
+    merge_stats as _merge_stats,
+    upsert_weather_hourly as _upsert_weather_hourly,
+    upsert_weather_hourly_with_stats as _upsert_weather_hourly_with_stats,
+)
+from digital_twin.application.weather_refresh.rows import (
+    fill_missing_local_weather_hours as _fill_missing_local_weather_hours,
+    filter_weather_rows_by_date as _filter_weather_rows_by_date,
+    json_ready as _json_ready,
+    local_bucket as _local_bucket,
+    parse_open_meteo_csv as _parse_open_meteo_csv,
+    today_local as _today_local,
+    year_chunks as _year_chunks,
+)
 from digital_twin.infrastructure.database.connection import get_connection
 from digital_twin.infrastructure.database.schema.lifecycle import initialize_database
 from digital_twin.infrastructure.weather import open_meteo
@@ -27,57 +40,6 @@ FORECAST_PAST_DAYS_MAX = open_meteo.FORECAST_PAST_DAYS_MAX
 WEATHER_REFRESH_LOOKBACK_DAYS = 7
 
 HOURLY_VARIABLES = open_meteo.HOURLY_VARIABLES
-
-WEATHER_INSERT_COLUMNS = [
-    "location_name",
-    "latitude",
-    "longitude",
-    "observed_at",
-    "observed_local_at",
-    "observed_date",
-    "observed_hour",
-    "source",
-    "temperature_c",
-    "relative_humidity_pct",
-    "precipitation_mm",
-    "wind_speed_kmh",
-    "wind_gust_kmh",
-    "cloud_cover_pct",
-    "apparent_temperature_c",
-    "is_day",
-    "precipitation_probability_pct",
-    "evapotranspiration_mm",
-    "rain_mm",
-    "showers_mm",
-    "snowfall_cm",
-    "weather_code",
-    "pressure_msl_hpa",
-    "surface_pressure_hpa",
-    "wind_direction_10m_deg",
-    "soil_temperature_0cm_c",
-    "soil_temperature_6cm_c",
-    "soil_moisture_0_to_1cm",
-    "soil_moisture_1_to_3cm",
-    "shortwave_radiation_w_m2",
-    "raw_payload",
-]
-
-WEATHER_COMPARISON_COLUMNS = [
-    column
-    for column in WEATHER_INSERT_COLUMNS
-    if column
-    not in {
-        "location_name",
-        "latitude",
-        "longitude",
-        "observed_at",
-        "observed_local_at",
-        "observed_date",
-        "observed_hour",
-        "source",
-        "raw_payload",
-    }
-]
 
 
 def cache_cluj_weather_range(start: date, end: date, include_climate: bool = True) -> dict[str, Any]:
@@ -514,219 +476,3 @@ def _hourly_request_params(start: date, end: date) -> dict[str, Any]:
 def _forecast_request_params(start: date, end: date) -> dict[str, Any]:
     return open_meteo.forecast_request_params(start, end, today=_today_local())
 
-
-def _filter_weather_rows_by_date(rows: list[dict[str, Any]], start: date, end: date) -> list[dict[str, Any]]:
-    return open_meteo.filter_weather_rows_by_date(rows, start, end)
-
-
-def _fill_missing_local_weather_hours(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not rows:
-        return rows
-
-    by_bucket = {row["observed_local_at"]: row for row in rows}
-    dates = sorted({bucket.date() for bucket in by_bucket})
-    for cursor in dates:
-        for hour in range(24):
-            bucket = datetime.combine(cursor, time(hour, 0))
-            if bucket not in by_bucket:
-                buckets = sorted(by_bucket)
-                by_bucket[bucket] = _synthetic_local_weather_row(bucket, buckets, by_bucket)
-
-    return [by_bucket[bucket] for bucket in sorted(by_bucket)]
-
-
-def _synthetic_local_weather_row(
-    bucket: datetime,
-    sorted_buckets: list[datetime],
-    by_bucket: dict[datetime, dict[str, Any]],
-) -> dict[str, Any]:
-    previous_bucket = max((item for item in sorted_buckets if item < bucket), default=None)
-    next_bucket = min((item for item in sorted_buckets if item > bucket), default=None)
-    previous = by_bucket.get(previous_bucket) if previous_bucket else None
-    following = by_bucket.get(next_bucket) if next_bucket else None
-    template = previous or following
-    if template is None:
-        raise ValueError("Cannot synthesize weather row without a neighboring row")
-
-    row = dict(template)
-    row["observed_local_at"] = bucket
-    row["observed_date"] = bucket.date()
-    row["observed_hour"] = bucket.hour
-    row["observed_at"] = bucket.replace(tzinfo=ZoneInfo(CLUJ_NAPOCA["timezone"]))
-    row["raw_payload"] = {
-        **(template.get("raw_payload") or {}),
-        "synthetic_local_hour": True,
-        "filled_from_previous": previous_bucket.isoformat() if previous_bucket else None,
-        "filled_from_next": next_bucket.isoformat() if next_bucket else None,
-    }
-
-    if previous and following:
-        for column in WEATHER_COMPARISON_COLUMNS:
-            row[column] = _interpolated_weather_value(previous.get(column), following.get(column), template.get(column))
-    return row
-
-
-def _interpolated_weather_value(previous, following, default):
-    if previous is None or following is None:
-        return default
-    if isinstance(previous, bool) and isinstance(following, bool):
-        return previous or following
-    if isinstance(previous, Decimal) or isinstance(following, Decimal):
-        return (Decimal(str(previous)) + Decimal(str(following))) / Decimal("2")
-    if isinstance(previous, (int, float)) and isinstance(following, (int, float)):
-        return (previous + following) / 2
-    return default
-
-
-def _upsert_weather_hourly(rows: list[dict[str, Any]]) -> int:
-    if not rows:
-        return 0
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.executemany(_weather_upsert_query(), [_weather_db_row(row) for row in rows])
-        conn.commit()
-    return len(rows)
-
-
-def _upsert_weather_hourly_with_stats(rows: list[dict[str, Any]], skip_existing_observed: bool) -> dict[str, int]:
-    stats = _empty_import_stats()
-    if not rows:
-        return stats
-
-    with get_connection(row_factory=dict_row) as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            query = _weather_upsert_query()
-            for row in rows:
-                if skip_existing_observed and _has_existing_observed_row(cur, row):
-                    stats["skipped_existing_observed"] += 1
-                    continue
-
-                existing = cur.execute(
-                    """
-                    SELECT *
-                    FROM weather_hourly
-                    WHERE location_name = %(location_name)s
-                      AND source = %(source)s
-                      AND observed_local_at = %(observed_local_at)s
-                    """,
-                    row,
-                ).fetchone()
-
-                if existing is None:
-                    cur.execute(query, _weather_db_row(row))
-                    stats["inserted"] += 1
-                elif _weather_row_changed(existing, row):
-                    cur.execute(query, _weather_db_row(row))
-                    stats["updated"] += 1
-                else:
-                    stats["unchanged"] += 1
-        conn.commit()
-    return stats
-
-
-def _has_existing_observed_row(cur, row: dict[str, Any]) -> bool:
-    existing = cur.execute(
-        """
-        SELECT 1
-        FROM weather_hourly
-        WHERE location_name = %(location_name)s
-          AND observed_at = %(observed_at)s
-          AND observed_local_at = %(observed_local_at)s
-          AND source <> %(source)s
-          AND observed_at <= now()
-        LIMIT 1
-        """,
-        row,
-    ).fetchone()
-    return existing is not None
-
-
-def _weather_upsert_query() -> str:
-    columns = ", ".join(WEATHER_INSERT_COLUMNS)
-    values = ", ".join(f"%({column})s" for column in WEATHER_INSERT_COLUMNS)
-    updates = ", ".join(
-        f"{column} = EXCLUDED.{column}"
-        for column in WEATHER_INSERT_COLUMNS
-        if column not in {"location_name", "source", "observed_local_at"}
-    )
-    changed_condition = " OR ".join(
-        f"weather_hourly.{column} IS DISTINCT FROM EXCLUDED.{column}"
-        for column in WEATHER_COMPARISON_COLUMNS
-    )
-    return f"""
-        INSERT INTO weather_hourly ({columns})
-        VALUES ({values})
-        ON CONFLICT (location_name, source, observed_local_at) DO UPDATE SET
-            {updates},
-            changed_at = now()
-        WHERE {changed_condition}
-    """
-
-
-def _weather_db_row(row: dict[str, Any]) -> dict[str, Any]:
-    normalized = {column: row.get(column) for column in WEATHER_INSERT_COLUMNS}
-    observed_local_at = normalized.get("observed_local_at")
-    if observed_local_at is None:
-        observed_local_at = _local_bucket_from_observed_at(normalized["observed_at"])
-        normalized["observed_local_at"] = observed_local_at
-    normalized["observed_date"] = normalized.get("observed_date") or observed_local_at.date()
-    if normalized.get("observed_hour") is None:
-        normalized["observed_hour"] = observed_local_at.hour
-    raw_payload = normalized.get("raw_payload") or {}
-    normalized["raw_payload"] = raw_payload if isinstance(raw_payload, Jsonb) else Jsonb(raw_payload)
-    return normalized
-
-
-def _weather_row_changed(existing: dict[str, Any], incoming: dict[str, Any]) -> bool:
-    for column in WEATHER_COMPARISON_COLUMNS:
-        if _comparable(existing.get(column)) != _comparable(incoming.get(column)):
-            return True
-    return False
-
-
-def _comparable(value):
-    if isinstance(value, Decimal):
-        return value.normalize()
-    return value
-
-
-def _empty_import_stats() -> dict[str, int]:
-    return {
-        "inserted": 0,
-        "updated": 0,
-        "unchanged": 0,
-        "skipped_existing_observed": 0,
-    }
-
-
-def _merge_stats(target: dict[str, int], source: dict[str, int]) -> None:
-    for key, value in source.items():
-        target[key] = target.get(key, 0) + value
-
-
-def _parse_open_meteo_csv(csv_path: str | Path) -> dict[str, Any]:
-    parsed = open_meteo.parse_csv(csv_path)
-    return {
-        **parsed,
-        "rows": _fill_missing_local_weather_hours(parsed["rows"]),
-    }
-
-
-def _year_chunks(start: date, end: date):
-    return open_meteo.year_chunks(start, end)
-
-
-def _local_bucket(day: date) -> datetime:
-    return open_meteo.local_bucket(day)
-
-
-def _today_local() -> date:
-    return open_meteo.today_local()
-
-
-def _local_bucket_from_observed_at(value: datetime) -> datetime:
-    return open_meteo.local_bucket_from_observed_at(value)
-
-
-def _json_ready(value):
-    return open_meteo.json_ready(value)

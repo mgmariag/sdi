@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import date, datetime, time
 
-from digital_twin.application.sensor_history.readings.core import (
+from digital_twin.domain.sensors import (
     ACTUAL_SENSOR_SOURCE,
     DEFAULT_SENSOR_SOURCE,
 )
@@ -20,7 +20,7 @@ from digital_twin.simulation.shared.types import PotState
 from digital_twin.simulation.state.projection import (
     initialize_states_from_first_day_sensor_readings,
 )
-from digital_twin.simulation.state.sensor_calibration import (
+from digital_twin.simulation.sensors.calibration import (
     apply_calibration_reading,
     apply_sensor_calibration_marker,
     apply_sensor_reading,

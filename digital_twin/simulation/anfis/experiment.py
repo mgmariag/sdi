@@ -5,10 +5,11 @@ from collections.abc import Callable
 from datetime import date
 from typing import Any
 
+import digital_twin.simulation.anfis.controller as anfis_controller
 import digital_twin.simulation.anfis.modeling as modeling
 import digital_twin.simulation.metrics as metrics
 import digital_twin.simulation.state.lookback as state_lookback
-import digital_twin.simulation.state.sensor_context as sensor_context_helpers
+import digital_twin.simulation.sensors.context as sensor_context_helpers
 from digital_twin.simulation.anfis.model import probability_category
 from digital_twin.simulation.experiment_comparison import ExperimentComparison
 from digital_twin.simulation.shared.constants import (
@@ -30,7 +31,7 @@ def train_anfis_model_from_snapshot_context(
     seed: int | None = 2026,
     generations: int = 35,
     population: int = 24,
-) -> modeling.AnfisTrainingResult:
+) -> anfis_controller.AnfisTrainingResult:
     """Train and evaluate the ANFIS controller from database sensor/weather examples."""
     training_snapshot = training_snapshot_resolver(start_date, end_date, selected_snapshot)
     anfis_dataset = modeling.generate_database_anfis_dataset(
@@ -54,7 +55,7 @@ def train_anfis_model_from_snapshot_context(
         population=population,
         seed=seed,
     )
-    evaluation = modeling.evaluate_anfis_model(model, train_dataset)
+    model_evaluation = modeling.evaluate_anfis_model(model, train_dataset)
     metadata = {
         "train_samples": len(train_dataset),
         "fit_samples": len(fit_dataset),
@@ -74,9 +75,9 @@ def train_anfis_model_from_snapshot_context(
         "training_history_days": (training_snapshot.end_date - training_snapshot.start_date).days + 1,
         "training_signals": modeling.anfis_training_signal_summary(train_dataset),
         "anfis_input_features": list(model.global_model.input_names),
-        "evaluation": evaluation,
+        "evaluation": model_evaluation,
     }
-    return modeling.AnfisTrainingResult(model=model, evaluation=evaluation, metadata=metadata)
+    return anfis_controller.AnfisTrainingResult(model=model, evaluation=model_evaluation, metadata=metadata)
 
 
 def run_daily_anfis_experiment(
@@ -91,7 +92,7 @@ def run_daily_anfis_experiment(
     population: int = 24,
     persist: bool = False,
     baseline_result: dict[str, Any] | None = None,
-    trained_model: modeling.AnfisModelController | None = None,
+    trained_model: anfis_controller.AnfisModelController | None = None,
     training_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apply an ANFIS controller to the same database weather/pot simulation."""

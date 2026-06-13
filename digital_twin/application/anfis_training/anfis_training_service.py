@@ -16,10 +16,12 @@ from digital_twin.simulation.anfis.experiment import (
     train_anfis_model_from_snapshot_context,
 )
 from digital_twin.simulation.anfis.model import DEFAULT_INPUTS as ANFIS_INPUT_FEATURES
-from digital_twin.simulation.anfis.modeling import (
-    ANFIS_TRAINING_DATASET_VERSION,
+from digital_twin.simulation.anfis.controller import (
     deserialize_trained_anfis_model,
     serialize_trained_anfis_model,
+)
+from digital_twin.simulation.anfis.modeling import (
+    ANFIS_TRAINING_DATASET_VERSION,
 )
 
 DEFAULT_ANFIS_GENERATIONS = 50

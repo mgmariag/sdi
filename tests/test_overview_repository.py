@@ -3,13 +3,15 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, time
 
-from digital_twin.infrastructure.database.repositories.overview import (
-    _activity_window,
-    _irrigation_activity,
-    _next_dt_planned_irrigation,
-    _next_irrigation_window,
-    _next_prescription_irrigation,
-    _next_recommendation_ready_at,
+from digital_twin.infrastructure.database.repositories.overview.activity import (
+    activity_window,
+    irrigation_activity,
+)
+from digital_twin.infrastructure.database.repositories.overview.irrigation_windows import (
+    next_dt_planned_irrigation,
+    next_irrigation_window,
+    next_prescription_irrigation,
+    next_recommendation_ready_at,
 )
 
 
@@ -26,7 +28,7 @@ class OverviewRepositoryTests(unittest.TestCase):
             "complete_irrigation_volume_l": 135.31,
         }
 
-        self.assertIsNone(_next_dt_planned_irrigation(next_window, valve_plan))
+        self.assertIsNone(next_dt_planned_irrigation(next_window, valve_plan))
 
     def test_next_dt_planned_irrigation_uses_immediate_run_only(self) -> None:
         next_window = {
@@ -40,7 +42,7 @@ class OverviewRepositoryTests(unittest.TestCase):
             "immediate_irrigation_volume_l": 18.25,
         }
 
-        planned = _next_dt_planned_irrigation(next_window, valve_plan)
+        planned = next_dt_planned_irrigation(next_window, valve_plan)
 
         self.assertIsNotNone(planned)
         self.assertEqual(planned["source"], "digital_twin_immediate_plan")
@@ -51,21 +53,21 @@ class OverviewRepositoryTests(unittest.TestCase):
     def test_evening_window_is_skipped_on_non_hot_days(self) -> None:
         conn = _FakeOverviewConnection(max_temperatures={"2026-06-05": 26.9, "2026-06-06": 27.0})
 
-        window = _next_irrigation_window(conn, datetime(2026, 6, 5, 7, 10))
+        window = next_irrigation_window(conn, datetime(2026, 6, 5, 7, 10))
 
         self.assertEqual(window["label"], "2026-06-06 05:30 - 07:30")
 
     def test_evening_window_is_allowed_on_hot_days(self) -> None:
         conn = _FakeOverviewConnection(max_temperatures={"2026-06-05": 33.1})
 
-        window = _next_irrigation_window(conn, datetime(2026, 6, 5, 7, 10))
+        window = next_irrigation_window(conn, datetime(2026, 6, 5, 7, 10))
 
         self.assertEqual(window["label"], "2026-06-05 17:00 - 19:00")
 
     def test_next_prescription_irrigation_reads_baseline_future_events(self) -> None:
         conn = _FakePrescriptionConnection()
 
-        window = _next_prescription_irrigation(conn, datetime(2026, 6, 5, 20, 0))
+        window = next_prescription_irrigation(conn, datetime(2026, 6, 5, 20, 0))
 
         self.assertIsNotNone(window)
         self.assertEqual(window["source"], "prescription")
@@ -77,7 +79,7 @@ class OverviewRepositoryTests(unittest.TestCase):
         self.assertEqual(window["activated_valves"], "V1")
 
     def test_activity_window_reports_valve_water_details(self) -> None:
-        window = _activity_window(
+        window = activity_window(
             [
                 {
                     "experiment_type": "baseline",
@@ -127,7 +129,7 @@ class OverviewRepositoryTests(unittest.TestCase):
             ]
         )
 
-        self.assertIsNone(_next_prescription_irrigation(conn, datetime(2026, 6, 5, 7, 0)))
+        self.assertIsNone(next_prescription_irrigation(conn, datetime(2026, 6, 5, 7, 0)))
 
     def test_irrigation_activity_falls_back_to_recent_window(self) -> None:
         recent = {
@@ -137,7 +139,7 @@ class OverviewRepositoryTests(unittest.TestCase):
             "source": "actuation_history",
         }
 
-        activity = _irrigation_activity(None, recent)
+        activity = irrigation_activity(None, recent)
 
         self.assertEqual(activity["mode"], "most_recent")
         self.assertEqual(activity["display_label"], "Most recent irrigation")
@@ -145,11 +147,11 @@ class OverviewRepositoryTests(unittest.TestCase):
 
     def test_next_recommendation_ready_uses_dispatch_time(self) -> None:
         self.assertEqual(
-            _next_recommendation_ready_at(datetime(2026, 6, 5, 20, 0)),
+            next_recommendation_ready_at(datetime(2026, 6, 5, 20, 0)),
             datetime(2026, 6, 5, 21, 0),
         )
         self.assertEqual(
-            _next_recommendation_ready_at(datetime(2026, 6, 5, 22, 0)),
+            next_recommendation_ready_at(datetime(2026, 6, 5, 22, 0)),
             datetime(2026, 6, 6, 21, 0),
         )
 

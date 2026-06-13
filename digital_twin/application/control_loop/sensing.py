@@ -8,7 +8,7 @@ from psycopg.rows import dict_row
 from digital_twin.infrastructure.database.connection import get_connection
 from digital_twin.infrastructure.database.schema.lifecycle import initialize_database
 from digital_twin.simulation.soil_model import sun_factor, wind_factor
-from digital_twin.simulation.state.sensor_context import load_sensor_context
+from digital_twin.simulation.sensors.context import load_sensor_context
 from digital_twin.simulation.weather_model import load_weather
 
 

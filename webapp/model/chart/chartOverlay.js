@@ -18,6 +18,57 @@ sap.ui.define([
         visibleChartMeasures
     } = ChartVisibility;
 
+    function chartOverlayMarkup(geometry, chartId, helpers) {
+        const px = helpers.px;
+        const top = px(geometry.top);
+        const chartHeight = px(geometry.bottom - geometry.top);
+        const markup = [];
+        const futureBandLabel = String(chartId || "").includes("MoistureChart")
+            ? "Simulation"
+            : "Forecast / Simulation";
+
+        if (Number.isFinite(geometry.nowX)) {
+            const nowX = px(geometry.nowX);
+            const futureWidth = px(Math.max(0, geometry.right - geometry.nowX));
+            markup.push(
+                `<div class="dtChartFutureBand" style="left:${nowX};top:${top};width:${futureWidth};height:${chartHeight};">` +
+                `<span class="dtChartFutureBandLabel">${futureBandLabel}</span>` +
+                "</div>"
+            );
+        }
+
+        if (Number.isFinite(geometry.thresholdY) && Number.isFinite(geometry.thresholdPct)) {
+            const thresholdY = px(geometry.thresholdY);
+            const thresholdLeft = px(geometry.left);
+            const thresholdWidth = px(geometry.right - geometry.left);
+            const thresholdPct = helpers.formatThresholdPct(geometry.thresholdPct);
+            const thresholdTitle = `Comfort threshold ${thresholdPct}%`;
+            markup.push(
+                `<div class="dtChartThresholdLine" title="${thresholdTitle}" ` +
+                `aria-label="${thresholdTitle}" tabindex="0" ` +
+                `style="left:${thresholdLeft};top:${thresholdY};width:${thresholdWidth};` +
+                `border-color:${MOISTURE_THRESHOLD_COLOR};">` +
+                `<span class="dtChartThresholdLabel">${thresholdTitle}</span>` +
+                "</div>"
+            );
+        }
+
+        if (Number.isFinite(geometry.nowX)) {
+            const nowX = px(geometry.nowX);
+            markup.push(
+                `<div class="dtChartNowLine" style="left:${nowX};top:${top};height:${chartHeight};"></div>`
+            );
+            if (helpers.showsBoundaryBadge(chartId)) {
+                const badgeTop = px(Math.max(0, geometry.top - 23));
+                markup.push(
+                    `<div class="dtChartNowBadge" style="left:${nowX};top:${badgeTop};">Forecast boundary</div>`
+                );
+            }
+        }
+
+        return markup.join("");
+    }
+
     return {
         _scheduleChartOverlay(chartId) {
             this._requestChartOverlayFrame(chartId);
@@ -131,53 +182,11 @@ sap.ui.define([
         },
 
         _chartOverlayMarkup(geometry, chartId) {
-            const top = this._chartOverlayPx(geometry.top);
-            const chartHeight = this._chartOverlayPx(geometry.bottom - geometry.top);
-            const markup = [];
-            const futureBandLabel = String(chartId || "").includes("MoistureChart")
-                ? "Simulation"
-                : "Forecast / Simulation";
-
-            if (Number.isFinite(geometry.nowX)) {
-                const nowX = this._chartOverlayPx(geometry.nowX);
-                const futureWidth = this._chartOverlayPx(Math.max(0, geometry.right - geometry.nowX));
-                markup.push(
-                    `<div class="dtChartFutureBand" style="left:${nowX};top:${top};width:${futureWidth};height:${chartHeight};">` +
-                    `<span class="dtChartFutureBandLabel">${futureBandLabel}</span>` +
-                    "</div>"
-                );
-            }
-
-            if (Number.isFinite(geometry.thresholdY) && Number.isFinite(geometry.thresholdPct)) {
-                const thresholdY = this._chartOverlayPx(geometry.thresholdY);
-                const thresholdLeft = this._chartOverlayPx(geometry.left);
-                const thresholdWidth = this._chartOverlayPx(geometry.right - geometry.left);
-                const thresholdPct = this._formatThresholdPct(geometry.thresholdPct);
-                const thresholdTitle = `Comfort threshold ${thresholdPct}%`;
-                markup.push(
-                    `<div class="dtChartThresholdLine" title="${thresholdTitle}" ` +
-                    `aria-label="${thresholdTitle}" tabindex="0" ` +
-                    `style="left:${thresholdLeft};top:${thresholdY};width:${thresholdWidth};` +
-                    `border-color:${MOISTURE_THRESHOLD_COLOR};">` +
-                    `<span class="dtChartThresholdLabel">${thresholdTitle}</span>` +
-                    "</div>"
-                );
-            }
-
-            if (Number.isFinite(geometry.nowX)) {
-                const nowX = this._chartOverlayPx(geometry.nowX);
-                markup.push(
-                    `<div class="dtChartNowLine" style="left:${nowX};top:${top};height:${chartHeight};"></div>`
-                );
-                if (this._showsBoundaryBadge(chartId)) {
-                    const badgeTop = this._chartOverlayPx(Math.max(0, geometry.top - 23));
-                    markup.push(
-                        `<div class="dtChartNowBadge" style="left:${nowX};top:${badgeTop};">Forecast boundary</div>`
-                    );
-                }
-            }
-
-            return markup.join("");
+            return chartOverlayMarkup(geometry, chartId, {
+                formatThresholdPct: (value) => this._formatThresholdPct(value),
+                px: (value) => this._chartOverlayPx(value),
+                showsBoundaryBadge: (id) => this._showsBoundaryBadge(id)
+            });
         },
 
         _thinCategoryAxisLabels(chartDom, chartId) {

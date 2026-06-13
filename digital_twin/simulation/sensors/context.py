@@ -6,10 +6,8 @@ from typing import Any
 
 from psycopg.rows import dict_row
 
-from digital_twin.application.sensor_history.readings.core import (
-    ensure_sensor_readings_for_experiment_range,
-    load_sensor_readings_for_experiment,
-)
+from digital_twin.application.sensor_history.readings.availability import load_sensor_readings_for_experiment
+from digital_twin.application.sensor_history.readings.core import ensure_sensor_readings_for_experiment_range
 from digital_twin.domain.sensors import DEFAULT_SENSOR_SOURCE
 from digital_twin.infrastructure.database.connection import get_connection
 from digital_twin.simulation.soil_model import clamp, number

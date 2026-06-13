@@ -15,7 +15,7 @@ from digital_twin.application.sensor_placement.sensor_placement_service import (
 )
 from digital_twin.core.config import get_settings
 from digital_twin.core.time import today_local
-from digital_twin.infrastructure.database.repositories.overview import (
+from digital_twin.infrastructure.database.repositories.overview.current import (
     OverviewRepository,
 )
 from digital_twin.infrastructure.database.repositories.pots import PotRepository

@@ -7,9 +7,7 @@ from digital_twin.application.control_loop.runtime_prescriptions import (
     RuntimeIrrigationPrescription,
     runtime_prescription_store,
 )
-from digital_twin.application.sensor_history.readings.core import (
-    ActuationFeedbackService,
-)
+from digital_twin.application.control_loop.actuation_feedback import ActuationFeedbackService
 from digital_twin.core.time import now_local
 from digital_twin.infrastructure.database.repositories.experiment_repository import (
     ActuationRepository,
