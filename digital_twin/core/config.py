@@ -5,6 +5,14 @@ from dataclasses import dataclass, field
 from datetime import date, time, timedelta
 from functools import lru_cache
 
+from digital_twin.domain.sensors import DEFAULT_SENSOR_SOURCE
+from digital_twin.domain.weather import (
+    DEFAULT_LOCAL_TIMEZONE,
+    DEFAULT_WEATHER_LATITUDE,
+    DEFAULT_WEATHER_LOCATION_NAME,
+    DEFAULT_WEATHER_LONGITUDE,
+)
+
 
 def _env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
@@ -47,10 +55,10 @@ def _env_time(name: str, default: time) -> time:
 
 @dataclass(frozen=True)
 class WeatherLocation:
-    name: str = "Cluj-Napoca"
-    latitude: float = 46.7712
-    longitude: float = 23.6236
-    timezone: str = "Europe/Bucharest"
+    name: str = DEFAULT_WEATHER_LOCATION_NAME
+    latitude: float = DEFAULT_WEATHER_LATITUDE
+    longitude: float = DEFAULT_WEATHER_LONGITUDE
+    timezone: str = DEFAULT_LOCAL_TIMEZONE
 
 
 @dataclass(frozen=True)
@@ -59,10 +67,10 @@ class Settings:
     cors_origins: tuple[str, ...] = field(default_factory=lambda: ("http://localhost:8080", "http://localhost:8081"))
     default_pot_count: int = 200
     default_seed: int = 2026
-    local_timezone: str = "Europe/Bucharest"
+    local_timezone: str = DEFAULT_LOCAL_TIMEZONE
     weather_location: WeatherLocation = field(default_factory=WeatherLocation)
     weather_refresh_on_startup: bool = True
-    sensor_source: str = "simulated_sensor"
+    sensor_source: str = DEFAULT_SENSOR_SOURCE
     sensor_history_start: date = field(default_factory=lambda: date.today() - timedelta(days=29))
     sensor_history_end: date | None = None
     sensor_reading_interval_minutes: int = 15
@@ -88,7 +96,7 @@ def get_settings() -> Settings:
         database_url=os.getenv("DATABASE_URL", Settings.database_url),
         cors_origins=_env_csv("CORS_ORIGINS", ("http://localhost:8080", "http://localhost:8081")),
         weather_refresh_on_startup=_env_bool("WEATHER_REFRESH_ON_STARTUP", True),
-        sensor_source=os.getenv("SENSOR_SOURCE", "simulated_sensor"),
+        sensor_source=os.getenv("SENSOR_SOURCE", DEFAULT_SENSOR_SOURCE),
         sensor_history_start=_env_date("SENSOR_HISTORY_START", date.today() - timedelta(days=29)),
         sensor_history_end=_env_date("SENSOR_HISTORY_END", date.today()) if os.getenv("SENSOR_HISTORY_END") else None,
         sensor_reading_interval_minutes=_env_int("SENSOR_READING_INTERVAL_MINUTES", 15),

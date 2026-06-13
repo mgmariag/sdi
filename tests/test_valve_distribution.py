@@ -3,8 +3,12 @@ from __future__ import annotations
 import unittest
 from datetime import date
 
-from digital_twin.simulation import engine
-from digital_twin.simulation.dto import PotState
+from digital_twin.simulation.shared.types import PotState
+from digital_twin.simulation.valves.distribution import execute_valve_zone_distribution
+from digital_twin.simulation.valves.rollups import (
+    apply_valve_counts,
+    valve_event_from_group,
+)
 
 
 class ValveDistributionTests(unittest.TestCase):
@@ -17,7 +21,7 @@ class ValveDistributionTests(unittest.TestCase):
         states = {pot["id"]: PotState(moisture=0.0) for pot in pots}
         requested = {1: 120.0, 2: 80.0, 3: 250.0}
 
-        events = engine._execute_valve_zone_distribution(
+        events = execute_valve_zone_distribution(
             states,
             {"west_wall": pots},
             "west_wall",
@@ -40,7 +44,7 @@ class ValveDistributionTests(unittest.TestCase):
         self.assertEqual(events[0]["post_delivery_moisture_pct"], 0.64)
         self.assertEqual(events[0]["delivery_moisture_gain_pct"], 0.64)
 
-        valve_event = engine._valve_event_from_group(
+        valve_event = valve_event_from_group(
             ("2026-05-21", "morning", "2026-05-21T06:00:00+03:00", "west_wall"),
             events,
             {pot["id"]: pot for pot in pots},
@@ -58,7 +62,7 @@ class ValveDistributionTests(unittest.TestCase):
         self.assertEqual(valve_event["per_pot_distribution"][0]["post_delivery_moisture_pct"], 0.64)
 
         entries = [{"date": "2026-05-21", "timestamp": "2026-05-21T12:00:00+03:00"}]
-        engine._apply_valve_counts(entries, {"decisions": [], "events": [valve_event]}, hourly=False)
+        apply_valve_counts(entries, {"decisions": [], "events": [valve_event]}, hourly=False)
         self.assertEqual(entries[0]["irrigated_pre_moisture"], 0.0)
         self.assertEqual(entries[0]["irrigated_post_moisture"], 1.5)
         self.assertEqual(entries[0]["irrigated_moisture_gain"], 1.5)
@@ -72,7 +76,7 @@ class ValveDistributionTests(unittest.TestCase):
         states = {pot["id"]: PotState(moisture=0.0) for pot in pots}
         requested = {1: 120.0, 2: 0.0, 3: 0.0}
 
-        events = engine._execute_valve_zone_distribution(
+        events = execute_valve_zone_distribution(
             states,
             {"west_wall": pots},
             "west_wall",
@@ -98,7 +102,7 @@ class ValveDistributionTests(unittest.TestCase):
         states = {pot["id"]: PotState(moisture=0.0) for pot in pots}
         requested = {1: 120.0, 2: 80.0, 3: 250.0}
 
-        events = engine._execute_valve_zone_distribution(
+        events = execute_valve_zone_distribution(
             states,
             {"west_wall": pots},
             "west_wall",

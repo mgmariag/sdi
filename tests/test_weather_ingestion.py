@@ -4,7 +4,7 @@ from datetime import date, datetime, timezone
 from unittest import TestCase
 from unittest.mock import patch
 
-from digital_twin.services import weather_ingestion
+import digital_twin.application.weather_refresh.ingestion as weather_ingestion
 
 
 class WeatherIngestionTests(TestCase):

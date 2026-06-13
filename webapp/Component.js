@@ -1,7 +1,7 @@
 sap.ui.define([
     "sap/ui/core/UIComponent",
-    "disertatie/model/flpUser",
-    "disertatie/model/models"
+    "disertatie/model/app/flpUser",
+    "disertatie/model/app/models"
 ], (UIComponent, flpUser, models) => {
     "use strict";
 

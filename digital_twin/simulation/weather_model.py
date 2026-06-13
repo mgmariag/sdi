@@ -8,11 +8,19 @@ from typing import Any
 from psycopg.rows import dict_row
 
 from digital_twin.core.exceptions import NoWeatherData
-from digital_twin.db.connection import get_connection
-from digital_twin.simulation.dto import LOCAL_TZ, LOCATION_NAME
-from digital_twin.simulation.soil_model import clamp as _clamp, local_observed_at as _local_observed_at, number as _number
+from digital_twin.domain.weather import (
+    OPEN_METEO_ARCHIVE_SOURCE,
+    OPEN_METEO_FORECAST_SOURCE,
+)
+from digital_twin.infrastructure.database.connection import get_connection
+from digital_twin.simulation.shared.constants import (
+    LOCAL_TZ,
+    LOCATION_NAME,
+)
+from digital_twin.simulation.soil_model import clamp, local_observed_at
 
-def _load_weather(start_date: date, end_date: date) -> list[dict[str, Any]]:
+
+def load_weather(start_date: date, end_date: date) -> list[dict[str, Any]]:
     start_ts = datetime.combine(start_date, time.min, tzinfo=LOCAL_TZ)
     end_ts = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=LOCAL_TZ)
     with get_connection(row_factory=dict_row) as conn:
@@ -25,8 +33,8 @@ def _load_weather(start_date: date, end_date: date) -> list[dict[str, Any]]:
                         PARTITION BY observed_local_at
                         ORDER BY
                             CASE
-                                WHEN source = 'open-meteo-archive' THEN 0
-                                WHEN source = 'open-meteo-forecast' THEN 1
+                                WHEN source = %(archive_source)s THEN 0
+                                WHEN source = %(forecast_source)s THEN 1
                                 ELSE 2
                             END,
                             id DESC
@@ -41,12 +49,18 @@ def _load_weather(start_date: date, end_date: date) -> list[dict[str, Any]]:
             WHERE source_rank = 1
             ORDER BY observed_local_at
             """,
-            {"location": LOCATION_NAME, "start_ts": start_ts.replace(tzinfo=None), "end_ts": end_ts.replace(tzinfo=None)},
+            {
+                "archive_source": OPEN_METEO_ARCHIVE_SOURCE,
+                "forecast_source": OPEN_METEO_FORECAST_SOURCE,
+                "location": LOCATION_NAME,
+                "start_ts": start_ts.replace(tzinfo=None),
+                "end_ts": end_ts.replace(tzinfo=None),
+            },
         ).fetchall()
         return rows
 
 
-def _raise_if_missing_historical_weather(weather_rows: list[dict[str, Any]], start_date: date, end_date: date) -> None:
+def raise_if_missing_historical_weather(weather_rows: list[dict[str, Any]], start_date: date, end_date: date) -> None:
     missing = _missing_historical_weather_hours(weather_rows, start_date, end_date)
     if not missing:
         return
@@ -150,7 +164,7 @@ def _closest_higher_weather_range(availability: list[dict[str, Any]], end_date: 
     return min(candidates, key=lambda item: date.fromisoformat(item["start"]))
 
 
-def _with_estimated_future_weather(
+def with_estimated_future_weather(
     weather_rows: list[dict[str, Any]],
     start_date: date,
     end_date: date,
@@ -173,7 +187,7 @@ def _with_estimated_future_weather(
             estimated_count += 1
         current += timedelta(hours=1)
 
-    rows.sort(key=lambda row: _local_observed_at(row))
+    rows.sort(key=lambda row: local_observed_at(row))
     return rows, estimated_count
 
 
@@ -183,7 +197,7 @@ def _local_weather_bucket(row: dict[str, Any]) -> datetime:
         if observed_local_at.tzinfo is None:
             return observed_local_at.replace(tzinfo=LOCAL_TZ)
         return observed_local_at.astimezone(LOCAL_TZ)
-    return _local_observed_at(row).replace(minute=0, second=0, microsecond=0)
+    return local_observed_at(row).replace(minute=0, second=0, microsecond=0)
 
 
 def _estimated_weather_row(observed_at: datetime) -> dict[str, Any]:
@@ -192,7 +206,7 @@ def _estimated_weather_row(observed_at: datetime) -> dict[str, Any]:
     hour = observed_at.hour
     diurnal = math.cos(((hour - 14) / 24.0) * 2.0 * math.pi)
     temperature = profile["avg_temp"] + profile["diurnal_amp"] * diurnal + rng.uniform(-1.8, 1.8)
-    humidity = _clamp(profile["humidity"] - (temperature - profile["avg_temp"]) * 1.6 + rng.uniform(-7.0, 7.0), 30.0, 98.0)
+    humidity = clamp(profile["humidity"] - (temperature - profile["avg_temp"]) * 1.6 + rng.uniform(-7.0, 7.0), 30.0, 98.0)
     wind_speed = max(1.0, profile["wind"] + rng.uniform(-3.0, 5.0))
     wind_gust = wind_speed + rng.uniform(4.0, 12.0)
     precipitation = 0.0
@@ -219,7 +233,7 @@ def _estimated_weather_row(observed_at: datetime) -> dict[str, Any]:
         "precipitation_mm": precipitation,
         "wind_speed_kmh": round(wind_speed, 2),
         "wind_gust_kmh": round(wind_gust, 2),
-        "cloud_cover_pct": round(_clamp(profile["cloud"] + rng.uniform(-18.0, 18.0), 0.0, 100.0), 2),
+        "cloud_cover_pct": round(clamp(profile["cloud"] + rng.uniform(-18.0, 18.0), 0.0, 100.0), 2),
         "apparent_temperature_c": round(temperature - max(0.0, wind_speed - 15.0) * 0.05, 2),
         "is_day": 7 <= hour <= 18,
         "precipitation_probability_pct": round(profile["precip_chance"] * 100.0, 2),

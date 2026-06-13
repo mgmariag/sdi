@@ -31,7 +31,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.backend
-    command: ["python", "-m", "digital_twin.workers.anfis_training_worker"]
+    command: ["python", "-m", "digital_twin.infrastructure.schedulers.anfis_training"]
     profiles:
       - anfis-training
     restart: "no"

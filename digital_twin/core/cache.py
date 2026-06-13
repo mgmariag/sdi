@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from copy import deepcopy
 import threading
+from copy import deepcopy
 from typing import Any, Callable
 
 
@@ -13,19 +13,15 @@ class SingleFlightCache:
         self._inflight: dict[tuple[Any, ...], threading.Event] = {}
         self._lock = threading.Lock()
 
-    def get_or_compute(self, key: tuple[Any, ...], compute: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    def get_or_compute(self, key: tuple[Any, ...], compute: Callable[[], Any]) -> tuple[Any, bool]:
         event, should_compute = self.reserve(key)
         if event is None:
-            result = self.get(key)
-            result["summary"]["cacheHit"] = True
-            return result
+            return self.get(key), True
 
         if not should_compute:
             event.wait()
             if self.contains(key):
-                result = self.get(key)
-                result["summary"]["cacheHit"] = True
-                return result
+                return self.get(key), True
             return self.get_or_compute(key, compute)
 
         try:
@@ -35,9 +31,7 @@ class SingleFlightCache:
             self.release_failed(key, event)
             raise
 
-        result = deepcopy(computed)
-        result["summary"]["cacheHit"] = False
-        return result
+        return deepcopy(computed), False
 
     def reserve(self, key: tuple[Any, ...]) -> tuple[threading.Event | None, bool]:
         with self._lock:
@@ -50,7 +44,7 @@ class SingleFlightCache:
             self._inflight[key] = event
             return event, True
 
-    def store(self, key: tuple[Any, ...], value: dict[str, Any], event: threading.Event) -> None:
+    def store(self, key: tuple[Any, ...], value: Any, event: threading.Event) -> None:
         with self._lock:
             self._values[key] = value
             self._inflight.pop(key, None)
@@ -65,7 +59,6 @@ class SingleFlightCache:
         with self._lock:
             return key in self._values
 
-    def get(self, key: tuple[Any, ...]) -> dict[str, Any]:
+    def get(self, key: tuple[Any, ...]) -> Any:
         with self._lock:
             return deepcopy(self._values[key])
-

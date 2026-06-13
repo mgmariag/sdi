@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from fastapi import HTTPException
 
-from digital_twin.core.exceptions import DatabaseUnavailable, DigitalTwinError, InvalidDateRange, NoWeatherData
+from digital_twin.core.exceptions import (
+    DatabaseUnavailable,
+    DigitalTwinError,
+    InvalidDateRange,
+    NoWeatherData,
+)
 
 
 def http_error(exc: Exception, default_status: int = 500, prefix: str | None = None) -> HTTPException:

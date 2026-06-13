@@ -3,8 +3,12 @@ from __future__ import annotations
 import unittest
 from datetime import date
 
-from digital_twin.services.sensor_readings import _indoor_hourly_moisture_loss as sensor_indoor_loss
-from digital_twin.simulation.engine import _indoor_hourly_moisture_loss as simulation_indoor_loss
+from digital_twin.application.sensor_history.readings.core import (
+    indoor_hourly_moisture_loss as sensor_indoor_loss,
+)
+from digital_twin.simulation.soil_model import (
+    indoor_hourly_moisture_loss as simulation_indoor_loss,
+)
 
 
 class IndoorMoistureLossTests(unittest.TestCase):

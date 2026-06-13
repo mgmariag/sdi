@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import date, datetime
 from typing import Any
@@ -7,12 +7,18 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
 from digital_twin.api.errors import http_error
+from digital_twin.application.sensor_history.sensor_history_service import SensorService
+from digital_twin.application.sensor_placement.sensor_placement_service import (
+    DEFAULT_SENSOR_COUNT,
+    MIN_SENSOR_COUNT,
+    SensorPlacementService,
+)
 from digital_twin.core.config import get_settings
 from digital_twin.core.time import today_local
-from digital_twin.db.repositories.sensor_repository import OverviewRepository, PotRepository
-from digital_twin.services.sensor_placements import DEFAULT_SENSOR_COUNT, MIN_SENSOR_COUNT, SensorPlacementService
-from digital_twin.services.sensor_service import SensorService
-
+from digital_twin.infrastructure.database.repositories.overview import (
+    OverviewRepository,
+)
+from digital_twin.infrastructure.database.repositories.pots import PotRepository
 
 system_router = APIRouter()
 api_router = APIRouter(prefix="/api/sensors")
@@ -190,4 +196,5 @@ def run_sensor_readings_at(
         return service.generate_at(recorded_at, source=source)
     except Exception as exc:
         raise http_error(exc, 500, "Sensor generation failed") from exc
+
 

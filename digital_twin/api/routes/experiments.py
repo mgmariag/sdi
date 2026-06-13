@@ -1,20 +1,19 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import date
 
 from fastapi import APIRouter, HTTPException, Query
 
 from digital_twin.api.errors import http_error
-from digital_twin.services.experiment_service import (
+from digital_twin.application.control_loop.decision import DecisionStage
+from digital_twin.application.experiments.experiment_service import (
     DEFAULT_SCENARIO_SEED,
     ExperimentService,
 )
-from digital_twin.services.irrigation_service import IrrigationActuationService
-
 
 router = APIRouter(prefix="/api/experiment")
 service = ExperimentService()
-actuation_service = IrrigationActuationService()
+decision_stage = DecisionStage(service)
 MAX_SAMPLING_INTERVAL_HOURS = 14 * 24
 MAX_SAMPLING_INTERVAL_DAYS = 14
 
@@ -26,7 +25,7 @@ def run_dt_experiment(
     persist: bool = Query(True),
 ):
     try:
-        return service.run_default_control(start=start, end=end, persist=persist)
+        return decision_stage.baseline(start=start, end=end, persist=persist)
     except Exception as exc:
         raise http_error(exc, 500, "Default strategy failed") from exc
 
@@ -39,7 +38,7 @@ def run_dt_sampling_experiment(
     sample_interval_hours: int | None = Query(None, ge=1, le=MAX_SAMPLING_INTERVAL_HOURS),
 ):
     try:
-        return service.run_sampling(
+        return decision_stage.sampling(
             start=start,
             end=end,
             sample_interval_days=sample_interval_days,
@@ -56,7 +55,7 @@ def run_dt_anfis_experiment(
     seed: int | None = Query(DEFAULT_SCENARIO_SEED),
 ):
     try:
-        return service.run_anfis(
+        return decision_stage.anfis(
             start=start,
             end=end,
             seed=seed,
@@ -71,7 +70,7 @@ def run_dt_fuzzy_dt_experiment(
     end: date | None = Query(None),
 ):
     try:
-        return service.run_fuzzy_dt(start=start, end=end)
+        return decision_stage.fuzzy_dt(start=start, end=end)
     except Exception as exc:
         raise http_error(exc, 500, "Fuzzy DT experiment failed") from exc
 
@@ -117,34 +116,3 @@ def precompute_dt_experiments(
     except Exception as exc:
         raise http_error(exc, 500, "Experiment precompute failed") from exc
 
-
-@router.post("/prescriptions/prepare")
-def prepare_tomorrow_prescriptions(target: date | None = Query(None)):
-    try:
-        return service.prepare_tomorrow_prescriptions(target=target)
-    except Exception as exc:
-        raise http_error(exc, 500, "Prescription preparation failed") from exc
-
-
-@router.post("/prescriptions/dispatch")
-def dispatch_tomorrow_prescriptions(target: date | None = Query(None)):
-    try:
-        return service.dispatch_tomorrow_prescriptions(target=target)
-    except Exception as exc:
-        raise http_error(exc, 500, "Prescription dispatch failed") from exc
-
-
-@router.post("/actuations/run-due")
-def run_due_actuations():
-    try:
-        return actuation_service.run_due_prescription_windows()
-    except Exception as exc:
-        raise http_error(exc, 500, "Actuator consumption failed") from exc
-
-
-@router.get("/actuations/summary")
-def actuation_summary():
-    try:
-        return actuation_service.summary()
-    except Exception as exc:
-        raise http_error(exc, 500, "Actuation summary failed") from exc

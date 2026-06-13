@@ -1,21 +1,24 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from digital_twin.api.routes import experiments, sensors, weather
+from digital_twin.api.routes import control_loop, experiments, sensors, weather
+from digital_twin.application.experiments.experiment_service import (
+    warm_default_baseline_cache,
+)
+from digital_twin.application.sensor_history.sensor_history_service import SensorService
+from digital_twin.application.weather_refresh.weather_refresh_service import (
+    WeatherService,
+)
 from digital_twin.core.config import get_settings
-from digital_twin.db.schema import initialize_database
-from digital_twin.services.experiment_service import warm_default_baseline_cache
-from digital_twin.services.sensor_service import SensorService
-from digital_twin.services.weather_service import WeatherService
-from digital_twin.workers.actuation_scheduler import ActuationScheduler
-from digital_twin.workers.prescription_scheduler import PrescriptionScheduler
-
+from digital_twin.infrastructure.database.schema.lifecycle import initialize_database
+from digital_twin.infrastructure.schedulers.actuation import ActuationScheduler
+from digital_twin.infrastructure.schedulers.prescriptions import PrescriptionScheduler
 
 logger = logging.getLogger("digital_twin.api")
 _prescription_scheduler: PrescriptionScheduler | None = None
@@ -131,7 +134,9 @@ def create_app() -> FastAPI:
     app.include_router(sensors.api_router)
     app.include_router(weather.api_router)
     app.include_router(experiments.router)
+    app.include_router(control_loop.router)
     return app
 
 
 app = create_app()
+

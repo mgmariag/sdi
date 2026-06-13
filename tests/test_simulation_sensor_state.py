@@ -3,9 +3,35 @@ from __future__ import annotations
 import unittest
 from datetime import date, datetime, time
 
-from digital_twin.services.sensor_readings import ACTUAL_SENSOR_SOURCE, DEFAULT_SENSOR_SOURCE
-from digital_twin.simulation import engine
-from digital_twin.simulation.dto import LOCAL_TZ, PotState
+from digital_twin.application.sensor_history.readings.core import (
+    ACTUAL_SENSOR_SOURCE,
+    DEFAULT_SENSOR_SOURCE,
+)
+from digital_twin.domain.sensors import SPARSE_FORECAST_SENSOR_SOURCE
+from digital_twin.simulation.metrics import (
+    daily_moisture_summary,
+    new_daily_moisture_tracker,
+    post_irrigation_snapshot_index,
+    record_daily_moisture_snapshot,
+    sampling_moisture_chart_summary,
+)
+from digital_twin.simulation.shared.constants import LOCAL_TZ
+from digital_twin.simulation.shared.types import PotState
+from digital_twin.simulation.state.projection import (
+    initialize_states_from_first_day_sensor_readings,
+)
+from digital_twin.simulation.state.sensor_calibration import (
+    apply_calibration_reading,
+    apply_sensor_calibration_marker,
+    apply_sensor_reading,
+    apply_stored_sensor_calibration,
+    forecast_sensor_reading_for_pot,
+    sampling_calibration_at,
+)
+from digital_twin.simulation.valves.rollups import (
+    activated_valve_label,
+    comparison_window_fields,
+)
 
 
 class SimulationSensorStateTests(unittest.TestCase):
@@ -13,7 +39,7 @@ class SimulationSensorStateTests(unittest.TestCase):
         state = PotState(moisture=31.0)
         reading = _sensor_reading(DEFAULT_SENSOR_SOURCE, 52.0)
 
-        result = engine._apply_sensor_reading(
+        result = apply_sensor_reading(
             state,
             _pot(),
             date(2026, 5, 21),
@@ -28,7 +54,7 @@ class SimulationSensorStateTests(unittest.TestCase):
         state = PotState(moisture=31.0)
         reading = _sensor_reading(ACTUAL_SENSOR_SOURCE, 52.0)
 
-        engine._apply_sensor_reading(
+        apply_sensor_reading(
             state,
             _pot(),
             date(2026, 5, 21),
@@ -42,7 +68,7 @@ class SimulationSensorStateTests(unittest.TestCase):
         state = PotState(moisture=31.0)
         reading = _sensor_reading(DEFAULT_SENSOR_SOURCE, 52.0)
 
-        engine._apply_sensor_calibration_marker(
+        apply_sensor_calibration_marker(
             state,
             _pot(),
             date(2026, 5, 21),
@@ -57,7 +83,7 @@ class SimulationSensorStateTests(unittest.TestCase):
         state = PotState(moisture=31.0)
         reading = _sensor_reading(DEFAULT_SENSOR_SOURCE, 44.0)
 
-        engine._apply_sensor_calibration_marker(
+        apply_sensor_calibration_marker(
             state,
             _pot(),
             date(2026, 5, 21),
@@ -84,7 +110,7 @@ class SimulationSensorStateTests(unittest.TestCase):
             },
         }
 
-        result = engine._apply_stored_sensor_calibration(
+        result = apply_stored_sensor_calibration(
             state,
             _associated_pot(2),
             date(2026, 5, 21),
@@ -114,7 +140,7 @@ class SimulationSensorStateTests(unittest.TestCase):
             },
         }
 
-        anchor = engine._initialize_states_from_first_day_sensor_readings(
+        anchor = initialize_states_from_first_day_sensor_readings(
             states,
             [_associated_pot(1), _associated_pot(2)],
             sensor_context,
@@ -129,7 +155,7 @@ class SimulationSensorStateTests(unittest.TestCase):
         state = PotState(moisture=31.0)
         reading = _sensor_reading(DEFAULT_SENSOR_SOURCE, 44.0)
 
-        engine._apply_sensor_calibration_marker(
+        apply_sensor_calibration_marker(
             state,
             _pot(),
             date(2026, 5, 21),
@@ -141,7 +167,7 @@ class SimulationSensorStateTests(unittest.TestCase):
         self.assertEqual(state.moisture, 31.0)
 
     def test_sampling_first_morning_sample_uses_same_530_anchor(self) -> None:
-        calibration_at = engine._sampling_calibration_at(
+        calibration_at = sampling_calibration_at(
             date(2026, 5, 21),
             datetime(2026, 5, 21, 6, 0, tzinfo=LOCAL_TZ),
             {"max_temperature_c": 25.0},
@@ -166,21 +192,21 @@ class SimulationSensorStateTests(unittest.TestCase):
             },
         }
 
-        reading = engine._forecast_sensor_reading_for_pot(
+        reading = forecast_sensor_reading_for_pot(
             probe_states,
             sensor_context,
             _associated_pot(2),
             forecast_day,
             datetime(2026, 5, 21, 6, 0, tzinfo=LOCAL_TZ),
         )
-        applied = engine._apply_calibration_reading(
+        applied = apply_calibration_reading(
             sparse_states[2],
             reading,
             datetime(2026, 5, 21, 6, 0, tzinfo=LOCAL_TZ),
         )
 
         self.assertIsNotNone(applied)
-        self.assertEqual(applied["source"], engine.SPARSE_FORECAST_SENSOR_SOURCE)
+        self.assertEqual(applied["source"], SPARSE_FORECAST_SENSOR_SOURCE)
         self.assertEqual(applied["associated_sensor_id"], 1)
         self.assertEqual(applied["association_source"], "default_strategy_reference")
         self.assertEqual(sparse_states[2].moisture, 37.0)
@@ -193,7 +219,7 @@ class SimulationSensorStateTests(unittest.TestCase):
             {"baseline_moisture": 43.0, "sparse_moisture": 38.75, "sparse_sensor_sample": False},
         ]
 
-        summary = engine._sampling_moisture_chart_summary(rows, sample_interval_hours=72, hourly=False)
+        summary = sampling_moisture_chart_summary(rows, sample_interval_hours=72, hourly=False)
 
         self.assertEqual([row["sparse_moisture"] for row in rows], [40.0, 39.25, 38.75])
         self.assertEqual(summary["sample_count"], 1)
@@ -201,7 +227,7 @@ class SimulationSensorStateTests(unittest.TestCase):
     def test_sparse_daily_summary_uses_post_morning_marker(self) -> None:
         rows = [_weather_hour(date(2026, 5, 21), hour) for hour in range(7, 11)]
 
-        index, label = engine._post_irrigation_snapshot_index(
+        index, label = post_irrigation_snapshot_index(
             date(2026, 5, 21),
             rows,
             0,
@@ -214,7 +240,7 @@ class SimulationSensorStateTests(unittest.TestCase):
     def test_sparse_daily_summary_uses_hot_day_post_evening_marker(self) -> None:
         rows = [_weather_hour(date(2026, 6, 3), hour) for hour in range(19, 23)]
 
-        index, label = engine._post_irrigation_snapshot_index(
+        index, label = post_irrigation_snapshot_index(
             date(2026, 6, 3),
             rows,
             0,
@@ -225,17 +251,17 @@ class SimulationSensorStateTests(unittest.TestCase):
         self.assertEqual(label, "after_evening")
 
     def test_daily_moisture_summary_reports_end_of_day_moisture(self) -> None:
-        tracker = engine._new_daily_moisture_tracker()
+        tracker = new_daily_moisture_tracker()
         states = {1: PotState(moisture=31.0), 2: PotState(moisture=41.0)}
-        engine._record_daily_moisture_snapshot(tracker, states, "before_morning")
+        record_daily_moisture_snapshot(tracker, states, "before_morning")
 
         states[1].moisture = 51.0
         states[2].moisture = 61.0
-        engine._record_daily_moisture_snapshot(tracker, states, "after_morning")
+        record_daily_moisture_snapshot(tracker, states, "after_morning")
 
         states[1].moisture = 34.0
         states[2].moisture = 44.0
-        summary = engine._daily_moisture_summary(tracker, states)
+        summary = daily_moisture_summary(tracker, states)
 
         self.assertEqual(summary["average_moisture"], 39.0)
         self.assertEqual(summary["pre_irrigation_moisture"], 36.0)
@@ -243,7 +269,7 @@ class SimulationSensorStateTests(unittest.TestCase):
         self.assertEqual(summary["moisture_sample_method"], "end_of_day")
 
     def test_comparison_window_fields_include_moisture_markers(self) -> None:
-        fields = engine._comparison_window_fields(
+        fields = comparison_window_fields(
             "baseline",
             {
                 "pre_irrigation_moisture": 35.68,
@@ -255,10 +281,10 @@ class SimulationSensorStateTests(unittest.TestCase):
         self.assertEqual(fields["baseline_post_irrigation_moisture"], 36.8)
 
     def test_activated_valve_label_compacts_configured_valves(self) -> None:
-        self.assertEqual(engine._activated_valve_label([]), "none")
-        self.assertEqual(engine._activated_valve_label(_valve_events([1, 2, 3, 4, 5])), "all")
-        self.assertEqual(engine._activated_valve_label(_valve_events([1, 2, 3, 4])), "V1-V4")
-        self.assertEqual(engine._activated_valve_label(_valve_events([1, 3, 5])), "V1, V3, V5")
+        self.assertEqual(activated_valve_label([]), "none")
+        self.assertEqual(activated_valve_label(_valve_events([1, 2, 3, 4, 5])), "all")
+        self.assertEqual(activated_valve_label(_valve_events([1, 2, 3, 4])), "V1-V4")
+        self.assertEqual(activated_valve_label(_valve_events([1, 3, 5])), "V1, V3, V5")
 
 
 def _pot() -> dict:

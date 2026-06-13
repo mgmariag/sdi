@@ -18,11 +18,9 @@ The frontend calls the backend through `/api/...`. The backend code lives under 
 ## Important Folders
 
 - `digital_twin/api/` - FastAPI app factory and route modules.
-- `digital_twin/services/` - experiment, weather, irrigation, and sensor services.
-- `digital_twin/workers/` - internal schedulers for prescription dispatch and actuator consumption.
-- `digital_twin/control/` - default digital-twin irrigation control strategies.
-- `digital_twin/domain/` - domain models and irrigation method definitions.
-- `digital_twin/db/` - database connection, schema initialization, and repositories.
+- `digital_twin/application/` - use cases for experiments, ANFIS training, weather refresh, sensor history, placement, and the runtime control loop.
+- `digital_twin/infrastructure/` - database connection/schema/repositories, importers, external weather client, and internal schedulers.
+- `digital_twin/domain/` - shared domain constants and simple domain models.
 - `digital_twin/experiments/` - sampling, ANFIS-GA, and fuzzy DT experiment wrappers.
 - `digital_twin/simulation/` - split simulation engine, DTOs, soil/weather models, and irrigation controller logic.
 - `webapp/` - SAPUI5 frontend.

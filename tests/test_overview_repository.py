@@ -3,13 +3,13 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, time
 
-from digital_twin.db.repositories.sensor_repository import (
+from digital_twin.infrastructure.database.repositories.overview import (
     _activity_window,
     _irrigation_activity,
-    _next_prescription_irrigation,
-    _next_recommendation_ready_at,
     _next_dt_planned_irrigation,
     _next_irrigation_window,
+    _next_prescription_irrigation,
+    _next_recommendation_ready_at,
 )
 
 

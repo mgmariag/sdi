@@ -4,9 +4,16 @@ import unittest
 from datetime import date, datetime
 from decimal import Decimal
 
-from digital_twin.control.prescriptions import RuntimePrescriptionStore
-from digital_twin.db.repositories.experiment_repository import _experiment_run_row, _prescription_event_row
-from digital_twin.services.irrigation_service import IrrigationActuationService
+from digital_twin.application.control_loop.irrigation_actuation import (
+    IrrigationActuationService,
+)
+from digital_twin.application.control_loop.runtime_prescriptions import (
+    RuntimePrescriptionStore,
+)
+from digital_twin.infrastructure.database.repositories.experiment_repository import (
+    _experiment_run_row,
+    _prescription_event_row,
+)
 
 
 class RuntimePrescriptionStoreTests(unittest.TestCase):

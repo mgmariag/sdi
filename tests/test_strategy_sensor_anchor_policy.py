@@ -4,9 +4,22 @@ import unittest
 from datetime import date, datetime, time
 from unittest.mock import patch
 
-from digital_twin.services.sensor_readings import ACTUAL_SENSOR_SOURCE
+from digital_twin.application.sensor_history.readings.core import ACTUAL_SENSOR_SOURCE
 from digital_twin.simulation import engine
-from digital_twin.simulation.dto import ExperimentSnapshot, LOCAL_TZ, PotState
+from digital_twin.simulation.anfis.model import ANFIS
+from digital_twin.simulation.anfis.modeling import (
+    AnfisModelController,
+    AnfisProbabilityCalibrator,
+)
+from digital_twin.simulation.shared.constants import LOCAL_TZ
+from digital_twin.simulation.shared.types import (
+    ExperimentSnapshot,
+    PotState,
+)
+from digital_twin.simulation.state.sensor_calibration import (
+    apply_sensor_calibration_marker,
+)
+from digital_twin.simulation.state.sensor_context import sensor_control_pots
 
 
 class StrategySensorAnchorPolicyTests(unittest.TestCase):
@@ -14,13 +27,13 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
         snapshot = _snapshot()
 
         with patch(
-            "digital_twin.simulation.engine._resolve_simulation_snapshot",
+            "digital_twin.simulation.engine.resolve_simulation_snapshot",
             side_effect=AssertionError("strategy comparison should start from selected snapshot"),
         ), patch(
-            "digital_twin.simulation.engine._apply_sensor_calibration_marker",
+            "digital_twin.simulation.state.sensor_calibration.apply_sensor_calibration_marker",
             side_effect=AssertionError("continuous calibration should not run"),
         ):
-            result = engine._run_fuzzy_dt_daily_irrigation(
+            result = engine.run_fuzzy_dt_daily_irrigation_with_snapshot(
                 snapshot.start_date,
                 snapshot.end_date,
                 snapshot=snapshot,
@@ -38,16 +51,16 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
         snapshot = _snapshot()
 
         with patch(
-            "digital_twin.simulation.engine._resolve_simulation_snapshot",
+            "digital_twin.simulation.engine.resolve_simulation_snapshot",
             side_effect=AssertionError("strategy comparison should start from selected snapshot"),
         ), patch(
-            "digital_twin.simulation.engine._apply_sensor_calibration_marker",
+            "digital_twin.simulation.state.sensor_calibration.apply_sensor_calibration_marker",
             side_effect=AssertionError("continuous calibration should not run"),
         ):
-            result = engine._run_anfis_daily_irrigation(
+            result = engine.run_anfis_daily_irrigation_with_snapshot(
                 snapshot.start_date,
                 snapshot.end_date,
-                engine.ANFIS(),
+                ANFIS(),
                 snapshot=snapshot,
             )
 
@@ -63,11 +76,11 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
         snapshot = _snapshot()
 
         with patch(
-            "digital_twin.simulation.engine._state_simulation_start",
+            "digital_twin.simulation.engine.state_simulation_start",
             return_value=snapshot.start_date,
         ), patch(
-            "digital_twin.simulation.engine._apply_sensor_calibration_marker",
-            wraps=engine._apply_sensor_calibration_marker,
+            "digital_twin.simulation.baseline.execution.sensor_calibration.apply_sensor_calibration_marker",
+            wraps=apply_sensor_calibration_marker,
         ) as calibration_marker:
             result = engine.run_daily_fuzzy_dt_experiment(
                 snapshot.start_date,
@@ -89,11 +102,11 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
         snapshot = _snapshot()
 
         with patch(
-            "digital_twin.simulation.engine._state_simulation_start",
+            "digital_twin.simulation.engine.state_simulation_start",
             return_value=snapshot.start_date,
         ), patch(
-            "digital_twin.simulation.engine._apply_sensor_calibration_marker",
-            wraps=engine._apply_sensor_calibration_marker,
+            "digital_twin.simulation.baseline.execution.sensor_calibration.apply_sensor_calibration_marker",
+            wraps=apply_sensor_calibration_marker,
         ) as calibration_marker:
             result = engine.run_daily_anfis_experiment(
                 snapshot.start_date,
@@ -130,10 +143,10 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
         }
 
         with patch(
-            "digital_twin.simulation.engine._resolve_simulation_snapshot",
+            "digital_twin.simulation.engine.resolve_simulation_snapshot",
             side_effect=AssertionError("sampling should reuse baseline warm-up state"),
         ):
-            result = engine._run_sparse_daily_irrigation(
+            result = engine.run_sparse_daily_irrigation_with_snapshot(
                 snapshot.start_date,
                 snapshot.end_date,
                 sample_interval_hours=48,
@@ -237,15 +250,15 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
     def test_fuzzy_and_anfis_use_sensor_pots_as_decision_inputs(self) -> None:
         snapshot = _two_pot_snapshot(sensor_moisture=45.0, nonsensor_moisture=8.0)
 
-        fuzzy = engine._run_fuzzy_dt_daily_irrigation(
+        fuzzy = engine.run_fuzzy_dt_daily_irrigation_with_snapshot(
             snapshot.start_date,
             snapshot.end_date,
             snapshot=snapshot,
         )
-        anfis = engine._run_anfis_daily_irrigation(
+        anfis = engine.run_anfis_daily_irrigation_with_snapshot(
             snapshot.start_date,
             snapshot.end_date,
-            engine.ANFIS(),
+            ANFIS(),
             snapshot=snapshot,
         )
 
@@ -259,7 +272,7 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
         self.assertEqual({row["sensor_id"] for row in anfis["samplePotDecisions"]}, {1})
 
     def test_sensor_threshold_config_overrides_sensor_location_thresholds(self) -> None:
-        control_pots = engine._sensor_control_pots(
+        control_pots = sensor_control_pots(
             [_pot()],
             {
                 "sensor_ids": [1],
@@ -301,7 +314,7 @@ def _snapshot() -> ExperimentSnapshot:
         weather_rows=weather_rows,
         selected_weather_rows=weather_rows,
         weather_by_day={day: weather_rows},
-        day_profiles={day: _day_profile()},
+        day_profiles={day: day_profile()},
         sensor_context=sensor_context,
         initial_pot_states={1: PotState(moisture=18.0)},
         estimated_weather_rows=0,
@@ -336,7 +349,7 @@ def _two_pot_snapshot(sensor_moisture: float, nonsensor_moisture: float) -> Expe
         weather_rows=weather_rows,
         selected_weather_rows=weather_rows,
         weather_by_day={day: weather_rows},
-        day_profiles={day: _day_profile()},
+        day_profiles={day: day_profile()},
         sensor_context=sensor_context,
         initial_pot_states={
             1: PotState(moisture=sensor_moisture),
@@ -349,10 +362,10 @@ def _two_pot_snapshot(sensor_moisture: float, nonsensor_moisture: float) -> Expe
     )
 
 
-def _anfis_controller() -> engine._AnfisModelController:
-    return engine._AnfisModelController(
-        global_model=engine.ANFIS(),
-        global_calibrator=engine._AnfisProbabilityCalibrator([]),
+def _anfis_controller() -> AnfisModelController:
+    return AnfisModelController(
+        global_model=ANFIS(),
+        global_calibrator=AnfisProbabilityCalibrator([]),
         zone_models={},
         zone_calibrators={},
     )
@@ -419,7 +432,7 @@ def _weather_row(day: date, hour: int) -> dict:
     }
 
 
-def _day_profile() -> dict:
+def day_profile() -> dict:
     return {
         "season": "spring",
         "dormant_period": False,

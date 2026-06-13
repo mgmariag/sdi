@@ -3,11 +3,11 @@ from __future__ import annotations
 import unittest
 from datetime import date, datetime
 
-from digital_twin.services.sensor_readings import (
+from digital_twin.application.sensor_history.readings.core import (
     LOCAL_TZ,
-    _apply_hourly_environment,
-    _minimum_realistic_moisture,
     _sensor_row,
+    apply_hourly_environment,
+    minimum_realistic_moisture,
 )
 
 
@@ -17,7 +17,7 @@ class SensorReadingBoundsTests(unittest.TestCase):
         state = {"moisture": 0.0}
         local_day = date(2025, 12, 18)
 
-        _apply_hourly_environment(state, pot, _weather(), local_day)
+        apply_hourly_environment(state, pot, _weather(), local_day)
         row = _sensor_row(
             pot,
             state,
@@ -26,8 +26,8 @@ class SensorReadingBoundsTests(unittest.TestCase):
             "simulated_sensor",
         )
 
-        self.assertGreaterEqual(state["moisture"], _minimum_realistic_moisture(pot, local_day))
-        self.assertGreaterEqual(row["soil_moisture_pct"], _minimum_realistic_moisture(pot, local_day))
+        self.assertGreaterEqual(state["moisture"], minimum_realistic_moisture(pot, local_day))
+        self.assertGreaterEqual(row["soil_moisture_pct"], minimum_realistic_moisture(pot, local_day))
 
 
 def _pot() -> dict:

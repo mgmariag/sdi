@@ -1,19 +1,19 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import unittest
 from typing import Any
 
-from digital_twin.domain.irrigation_methods import VALVE_ZONE_DESIGN
-from digital_twin.services.sensor_placements import (
+from digital_twin.application.sensor_placement.sensor_placement_service import (
     MIN_SENSOR_COUNT,
     PLACEMENT_POLICY_VERSION,
     SensorPlacementService,
 )
+from digital_twin.domain.valves import VALVE_ZONE_DESIGN
 
 
 class SensorPlacementServiceTests(unittest.TestCase):
     def test_recommendation_clamps_to_valve_count_and_covers_zones(self) -> None:
-        repository = _FakePlacementRepository(pots=_pots_by_valve_zone())
+        repository = _FakePlacementRepository(pots=pots_by_valve_zone())
         service = SensorPlacementService(repository=repository)
 
         result = service.recommend(sensor_count=1)
@@ -28,7 +28,7 @@ class SensorPlacementServiceTests(unittest.TestCase):
             "items": [{"balcony_zone": "west_wall"} for _ in range(MIN_SENSOR_COUNT)],
             "active_pot_count": 200,
         }
-        repository = _FakePlacementRepository(current=current, pots=_pots_by_valve_zone())
+        repository = _FakePlacementRepository(current=current, pots=pots_by_valve_zone())
         service = SensorPlacementService(repository=repository)
 
         result = service.ensure(sensor_count=MIN_SENSOR_COUNT)
@@ -48,7 +48,7 @@ class SensorPlacementServiceTests(unittest.TestCase):
             ],
             "active_pot_count": 200,
         }
-        repository = _FakePlacementRepository(current=current, pots=_pots_by_valve_zone())
+        repository = _FakePlacementRepository(current=current, pots=pots_by_valve_zone())
         service = SensorPlacementService(repository=repository)
 
         result = service.ensure(sensor_count=1)
@@ -57,7 +57,7 @@ class SensorPlacementServiceTests(unittest.TestCase):
         self.assertIsNone(repository.replaced_count)
 
     def test_recommendation_prefers_fast_drying_zone_sentinel(self) -> None:
-        pots = _pots_by_valve_zone()
+        pots = pots_by_valve_zone()
         west_zone = VALVE_ZONE_DESIGN[0]["zone"]
         pots = [pot for pot in pots if pot["balcony_zone"] != west_zone]
         pots.extend(
@@ -159,7 +159,7 @@ class _FakePlacementRepository:
         return []
 
 
-def _pots_by_valve_zone() -> list[dict[str, Any]]:
+def pots_by_valve_zone() -> list[dict[str, Any]]:
     return [
         _pot(index, item["zone"])
         for index, item in enumerate(VALVE_ZONE_DESIGN, start=1)
@@ -200,3 +200,4 @@ def _pot(
 
 if __name__ == "__main__":
     unittest.main()
+
