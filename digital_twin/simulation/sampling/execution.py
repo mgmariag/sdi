@@ -3,19 +3,15 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from digital_twin.domain.sensors import SPARSE_FORECAST_SENSOR_SOURCE
-from digital_twin.simulation.irrigation_controller.baseline_decision import (
-    make_baseline_irrigation_decision,
-)
+from digital_twin.domain.pot import Pot
+from digital_twin.domain.sensor import SensorSource
 from digital_twin.simulation.irrigation_controller.defaults import (
+    DEFAULT_BASELINE_IRRIGATION_STEP,
+    DEFAULT_BASELINE_VALVE_ZONE_EXECUTOR,
+    DEFAULT_IRRIGATION_REQUEST_BUILDER,
     DEFAULT_IRRIGATION_POLICY,
 )
-from digital_twin.simulation.irrigation_controller.environment import (
-    alert_row,
-    is_emergency_dryness,
-    is_outdoor,
-    rain_exposure_factor,
-)
+from digital_twin.simulation.irrigation_controller.environment import alert_row
 from digital_twin.simulation.metrics import (
     add_chart_summary,
     daily_moisture_snapshot_label,
@@ -36,46 +32,31 @@ from digital_twin.simulation.shared.types import (
     ExperimentSnapshot,
     PotState,
 )
-from digital_twin.simulation.soil_model import (
-    clamp,
-    hourly_reference_et_mm,
-    indoor_hourly_moisture_loss,
-    local_observed_at,
-    low_retention_drydown_multiplier,
-    minimum_realistic_moisture,
-    number,
-)
+from digital_twin.domain.soil import DEFAULT_SOIL_MODEL as soil
+from digital_twin.domain.weather import local_observed_at
 from digital_twin.simulation.state.aggregates import (
     daily_aggregate_entry,
     hourly_aggregate_entry,
 )
-from digital_twin.simulation.state.environment import (
-    copy_pot_states,
-    copy_pot_states_from_payload,
-    day_profile as build_day_profile,
-)
+from digital_twin.simulation.state.environment import StateEnvironment
 from digital_twin.simulation.state.lookback import (
     daily_line_metadata,
     hourly_line_metadata,
 )
-from digital_twin.simulation.state.projection import (
-    initialize_states_from_first_day_sensor_readings,
-)
+from digital_twin.simulation.state.projection import StateProjector
 from digital_twin.simulation.sensors.calibration import (
     apply_calibration_reading,
     apply_sensor_calibration_marker,
     forecast_sensor_reading_for_pot,
     sampling_calibration_at,
+    sensor_date_is_future,
     sensor_reading_for_pot,
 )
 from digital_twin.simulation.sensors.context import (
     sensor_control_pots,
     sensor_control_summary_fields,
-    with_sensor_key,
 )
 from digital_twin.simulation.valves.distribution import (
-    apply_cold_month_indoor_skip,
-    baseline_zone_dose_factor,
     execute_valve_zone_distribution,
     sparse_zone_dose_factor,
     trigger_pot_codes as collect_trigger_pot_codes,
@@ -90,33 +71,7 @@ from digital_twin.simulation.valves.zones import (
 )
 
 
-def run_sparse_daily_irrigation(
-    start_date: date,
-    end_date: date,
-    sample_interval_hours: int,
-    persist: bool,
-    selected_snapshot: ExperimentSnapshot,
-    simulation_start_date: date,
-    simulation_snapshot: ExperimentSnapshot,
-    state_anchor_policy: str,
-    warmup_reuse_policy: str,
-    baseline_result: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    return _SparseSamplingController(
-        start_date=start_date,
-        end_date=end_date,
-        sample_interval_hours=sample_interval_hours,
-        persist=persist,
-        selected_snapshot=selected_snapshot,
-        simulation_start_date=simulation_start_date,
-        simulation_snapshot=simulation_snapshot,
-        state_anchor_policy=state_anchor_policy,
-        warmup_reuse_policy=warmup_reuse_policy,
-        baseline_result=baseline_result,
-    ).run()
-
-
-class _SparseSamplingController:
+class SparseSamplingRunner:
     """Sparse sampling controller evaluated at default strategy decision slots."""
 
     def __init__(
@@ -131,6 +86,7 @@ class _SparseSamplingController:
         state_anchor_policy: str,
         warmup_reuse_policy: str,
         baseline_result: dict[str, Any] | None = None,
+        state_environment: StateEnvironment | None = None,
     ) -> None:
         if end_date < start_date:
             raise ValueError("end_date must not be before start_date")
@@ -145,6 +101,9 @@ class _SparseSamplingController:
         self.state_anchor_policy = state_anchor_policy
         self.warmup_reuse_policy = warmup_reuse_policy
         self.baseline_result = baseline_result or {}
+        self.state_environment = state_environment or StateEnvironment()
+        self.state_projector = StateProjector(self.state_environment)
+        self.baseline_valve_zone_executor = DEFAULT_BASELINE_VALVE_ZONE_EXECUTOR
         baseline_start_states = self.baseline_result.get("stateAtExperimentStart")
         self.weather_rows = self.selected_snapshot.selected_weather_rows
         self.pots = self.simulation_snapshot.pots
@@ -155,11 +114,11 @@ class _SparseSamplingController:
         self.control_pot_ids = {int(pot["id"]) for pot in self.control_pots}
         self.weather_by_day = self.simulation_snapshot.weather_by_day
         if baseline_start_states:
-            self.states = copy_pot_states_from_payload(
+            self.states = self.state_environment.copy_pot_states_from_payload(
                 baseline_start_states,
                 self.simulation_snapshot.initial_pot_states,
             )
-            self.probe_states = copy_pot_states(self.states)
+            self.probe_states = self.state_environment.copy_pot_states(self.states)
             baseline_summary = self.baseline_result.get("summary", {})
             self.sensor_state_anchor = {
                 "source": "baseline_warmup_reuse",
@@ -170,15 +129,15 @@ class _SparseSamplingController:
                 "baseline_sensor_calibration_policy": baseline_summary.get("baselineSensorCalibrationPolicy"),
             }
         else:
-            self.states = copy_pot_states(self.simulation_snapshot.initial_pot_states)
-            self.probe_states = copy_pot_states(self.simulation_snapshot.initial_pot_states)
-            self.sensor_state_anchor = initialize_states_from_first_day_sensor_readings(
+            self.states = self.state_environment.copy_pot_states(self.simulation_snapshot.initial_pot_states)
+            self.probe_states = self.state_environment.copy_pot_states(self.simulation_snapshot.initial_pot_states)
+            self.sensor_state_anchor = self.state_projector.initialize_from_first_day_sensor_readings(
                 self.states,
                 self.pots,
                 self.sensor_context,
                 self.simulation_start_date,
             )
-            initialize_states_from_first_day_sensor_readings(
+            self.state_projector.initialize_from_first_day_sensor_readings(
                 self.probe_states,
                 self.pots,
                 self.sensor_context,
@@ -230,7 +189,7 @@ class _SparseSamplingController:
             return
 
         record_date = current_date >= self.start_date
-        day_profile = self.simulation_snapshot.day_profiles.get(current_date) or build_day_profile(
+        day_profile = self.simulation_snapshot.day_profiles.get(current_date) or self.state_environment.day_profile(
             current_date,
             day_weather,
             self.weather_by_day,
@@ -246,8 +205,8 @@ class _SparseSamplingController:
         for hour_weather in day_weather:
             observed_local = local_observed_at(hour_weather)
             slot = DEFAULT_IRRIGATION_POLICY.decision_slot(current_date, observed_local, day_profile)
-            self._apply_weather_window(current_date, [hour_weather], self.states)
-            self._apply_weather_window(current_date, [hour_weather], self.probe_states)
+            self._apply_hourly_environment(hour_weather, self.states)
+            self._apply_hourly_environment(hour_weather, self.probe_states)
             self._calibrate_probe_states(current_date, observed_local, day_profile)
 
             hourly_water_ml = 0.0
@@ -258,7 +217,10 @@ class _SparseSamplingController:
             hourly_sensor_samples = 0
 
             if slot is not None:
-                sample_now = record_date and self._should_sample(observed_local)
+                sample_now = record_date and (
+                    sensor_date_is_future(self.sensor_context, current_date)
+                    or self._should_sample(observed_local)
+                )
                 calibrate_now = sample_now or not record_date
                 if sample_now:
                     self.last_sensor_sample_at = observed_local
@@ -288,6 +250,8 @@ class _SparseSamplingController:
                 daily_decisions += hourly_decisions
                 daily_alerts += hourly_alerts
                 self._run_probe_slot(current_date, hour_weather, day_profile, slot)
+                if sample_now and sensor_date_is_future(self.sensor_context, current_date):
+                    self._sync_states_from_probe_reference()
             else:
                 snapshot_label = daily_moisture_snapshot_label(current_date, observed_local, day_profile)
                 if record_date and snapshot_label:
@@ -309,6 +273,7 @@ class _SparseSamplingController:
                             "sparse_sensor_sample": sample_now,
                             "sparse_sensor_samples": hourly_sensor_samples,
                         },
+                        state_environment=self.state_environment,
                     )
                 )
         if not record_date:
@@ -356,34 +321,31 @@ class _SparseSamplingController:
         events = 0
         decisions = 0
         alerts = 0
-        sample_sensor_ids: set[int] = set()
         decision_by_pot_id: dict[int, dict[str, Any]] = {}
         zone_trigger_decisions: dict[str, list[dict[str, Any]]] = {}
 
+        sample_sensor_ids = (
+            self._refresh_sample_states_from_sensor(current_date, observed_local, day_profile, sample_now)
+            if calibrate_now
+            else set()
+        )
+
         for pot in self.control_pots:
             state = self.states[pot["id"]]
-            if calibrate_now:
-                sensor_id = self._refresh_state_from_sensor(
-                    state,
-                    pot,
-                    current_date,
-                    observed_local,
-                    day_profile,
-                    record_stats=sample_now,
-                )
-                if sample_now and sensor_id is not None:
-                    sample_sensor_ids.add(sensor_id)
 
-            if is_emergency_dryness(state, pot, current_date, observed_local) and record_date:
+            if DEFAULT_IRRIGATION_POLICY.has_emergency_dryness(state, pot, current_date, observed_local) and record_date:
                 self.alerts.append(alert_row(pot, hour_weather, "emergency_dryness", "warning", "Emergency dryness at sparse decision slot"))
                 alerts += 1
 
-            decision = with_sensor_key(
-                make_baseline_irrigation_decision(state, pot, hour_weather, day_profile, slot),
+            decision = DEFAULT_BASELINE_IRRIGATION_STEP.make_decision(
+                state,
                 pot,
+                hour_weather,
+                day_profile,
+                slot,
                 self.sensor_context,
+                current_date,
             )
-            decision = apply_cold_month_indoor_skip(decision, pot, current_date)
             decision_by_pot_id[int(pot["id"])] = decision
             if record_date:
                 self.decisions.append(decision)
@@ -420,7 +382,7 @@ class _SparseSamplingController:
                     "should_irrigate": True,
                     "dose_factor": zone_dose_factor,
                 },
-                DEFAULT_IRRIGATION_POLICY.irrigation_request,
+                DEFAULT_IRRIGATION_REQUEST_BUILDER.build,
                 {
                     "zone_triggered": True,
                     "zone_trigger_sensor_ids": trigger_sensor_ids,
@@ -446,6 +408,27 @@ class _SparseSamplingController:
             "alerts": alerts,
             "sensor_samples": len(sample_sensor_ids),
         }
+
+    def _refresh_sample_states_from_sensor(
+        self,
+        current_date: date,
+        observed_local: datetime,
+        day_profile: dict[str, Any],
+        sample_now: bool,
+    ) -> set[int]:
+        sample_sensor_ids: set[int] = set()
+        for pot in self.pots:
+            sensor_id = self._refresh_state_from_sensor(
+                self.states[pot["id"]],
+                pot,
+                current_date,
+                observed_local,
+                day_profile,
+                record_stats=sample_now,
+            )
+            if sample_now and sensor_id is not None:
+                sample_sensor_ids.add(sensor_id)
+        return sample_sensor_ids
 
     def _refresh_state_from_sensor(
         self,
@@ -478,46 +461,32 @@ class _SparseSamplingController:
         if record_stats:
             record_sampling_estimation_error(self.sampling_stats, before, state)
             self.sampling_stats["sensor_refreshes"] += 1
-            if reading.get("source") == SPARSE_FORECAST_SENSOR_SOURCE:
+            if reading.get("source") == SensorSource.SPARSE_FORECAST.value:
                 self.sampling_stats["forecast_refreshes"] += 1
         inferred = reading.get("association_source") == "associated_sensor"
         if record_stats and inferred:
-            distance = number(association.get("distance"), 1.0)
+            distance = soil.number(association.get("distance"), 1.0)
             self.sampling_stats["associated_refreshes"] += 1
             self.sampling_stats["association_distance_sum"] += distance
         elif record_stats:
             self.sampling_stats["direct_refreshes"] += 1
         return int(reading.get("associated_sensor_id") or reading.get("sensor_id") or pot["id"])
 
-    def _apply_weather_window(
+    def _apply_hourly_environment(
         self,
-        current_date: date,
-        weather_rows: list[dict[str, Any]],
+        hour_weather: dict[str, Any],
         states: dict[int, PotState],
     ) -> None:
-        if not weather_rows:
-            return
-
-        reference_et_mm = sum(hourly_reference_et_mm(row) for row in weather_rows)
-        precipitation_mm = sum(number(row.get("precipitation_mm"), 0.0) for row in weather_rows)
-        indoor_hours = len(weather_rows)
+        observed_local = local_observed_at(hour_weather)
         for pot in self.pots:
-            state = states[pot["id"]]
-            if is_outdoor(pot, current_date):
-                loss = reference_et_mm * pot["evaporation_factor"] * pot["_sun_factor"] * pot["_wind_factor"]
-                if pot["plant_type_code"] in {"vegetables", "herbs"}:
-                    loss *= 1.12
-                elif pot["plant_type_code"] == "succulents":
-                    loss *= 0.48
-                loss *= low_retention_drydown_multiplier(pot)
-                rain_gain = min(
-                    8.0,
-                    precipitation_mm * rain_exposure_factor(pot, current_date) * 0.85,
-                )
-                state.moisture += rain_gain - loss
-            else:
-                state.moisture -= indoor_hourly_moisture_loss(pot, current_date) * indoor_hours
-            state.moisture = clamp(state.moisture, minimum_realistic_moisture(pot, current_date), 100.0)
+            self.state_environment.apply_hourly_environment(
+                states[pot["id"]],
+                pot,
+                hour_weather,
+                self.simulation_snapshot.day_profiles.get(observed_local.date(), {}),
+                observed_local.date(),
+                rain_exposure_factor=Pot.from_mapping(pot).rain_exposure_factor(observed_local.date()),
+            )
 
     def _calibrate_probe_states(
         self,
@@ -547,49 +516,28 @@ class _SparseSamplingController:
 
         for pot in self.control_pots:
             state = self.probe_states[pot["id"]]
-            decision = make_baseline_irrigation_decision(state, pot, hour_weather, day_profile, slot)
-            decision = with_sensor_key(decision, pot, self.sensor_context)
-            decision = apply_cold_month_indoor_skip(decision, pot, current_date)
+            decision = DEFAULT_BASELINE_IRRIGATION_STEP.make_decision(
+                state,
+                pot,
+                hour_weather,
+                day_profile,
+                slot,
+                self.sensor_context,
+                current_date,
+            )
             decision_by_pot_id[int(pot["id"])] = decision
             if decision["should_irrigate"] and is_valve_managed_pot(pot, current_date):
                 zone_trigger_decisions.setdefault(pot["balcony_zone"], []).append(decision)
 
         for zone, trigger_decisions in zone_trigger_decisions.items():
-            trigger_pot_ids = collect_trigger_pot_ids(trigger_decisions)
-            trigger_sensor_ids = collect_trigger_sensor_ids(trigger_decisions)
-            trigger_pot_codes = collect_trigger_pot_codes(trigger_decisions)
-            zone_dose_factor = baseline_zone_dose_factor(trigger_decisions)
-            execution_decisions = zone_execution_decision_map(
-                decision_by_pot_id,
-                self.zone_pots,
-                zone,
-                current_date,
-                trigger_decisions,
-            )
-            execute_valve_zone_distribution(
+            self.baseline_valve_zone_executor.execute(
                 self.probe_states,
                 self.zone_pots,
                 zone,
                 current_date,
                 hour_weather,
-                execution_decisions,
-                lambda zone_pot, zone_decision: {
-                    **zone_decision,
-                    "should_irrigate": True,
-                    "dose_factor": zone_dose_factor,
-                },
-                DEFAULT_IRRIGATION_POLICY.irrigation_request,
-                {
-                    "zone_triggered": True,
-                    "zone_trigger_sensor_ids": trigger_sensor_ids,
-                    "zone_trigger_pot_ids": trigger_pot_ids,
-                    "zone_trigger_pot_codes": trigger_pot_codes,
-                    "runtime_request_sensor_ids": trigger_sensor_ids,
-                    "zone_dose_factor": zone_dose_factor,
-                    "zone": zone,
-                    "zone_activation_policy": "sensor_pot_trigger",
-                    "zone_runtime_policy": "sensor_trigger_zone_budget_runtime",
-                },
+                decision_by_pot_id,
+                trigger_decisions,
             )
 
     def _summary(self, valve_rollup: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
@@ -618,7 +566,7 @@ class _SparseSamplingController:
                 "sampledSensorRows": self.sensor_sample_row_count,
                 "weatherSamplingPolicy": "hourly-weather-state-decision-slot-control",
                 "samplingDataPolicy": "decision-slot-sensor-sampling-hourly-state",
-                "forecastSensorCalibrationPolicy": "sparse-sampling-fully-calibrates-to-default-strategy-at-sampling-points",
+                "forecastSensorCalibrationPolicy": "sparse-sampling-syncs-to-default-strategy-at-forecast-decision-slots",
                 "stateSimulationStartDate": self.simulation_start_date.isoformat(),
                 "stateLookbackDays": (self.end_date - self.simulation_start_date).days + 1,
                 "stateAnchorPolicy": self.state_anchor_policy,
@@ -639,3 +587,11 @@ class _SparseSamplingController:
         if self.sensor_state_anchor is not None:
             summary["stateSensorAnchor"] = self.sensor_state_anchor
         return summary
+
+    def _sync_states_from_probe_reference(self) -> None:
+        for pot_id, probe_state in self.probe_states.items():
+            state = self.states.get(pot_id)
+            if state is None:
+                continue
+            state.moisture = probe_state.moisture
+            state.too_wet_hours = probe_state.too_wet_hours

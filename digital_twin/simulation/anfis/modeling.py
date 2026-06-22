@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import random
 from datetime import date, datetime, time
@@ -13,23 +13,17 @@ from digital_twin.simulation.anfis.model import (
 from digital_twin.simulation.irrigation_controller.defaults import (
     DEFAULT_IRRIGATION_POLICY,
 )
-from digital_twin.simulation.irrigation_controller.environment import rain_exposure_factor
 from digital_twin.simulation.shared.constants import (
     ANFIS_DECISION_THRESHOLD,
     ANFIS_FORECAST_DECISION_THRESHOLD,
     LOCAL_TZ,
 )
 from digital_twin.simulation.shared.types import PotState
-from digital_twin.simulation.soil_model import (
-    clamp,
-    local_observed_at,
-    number,
-)
-from digital_twin.simulation.state.environment import (
-    day_profile as build_day_profile,
-    group_weather_by_day,
-)
-from digital_twin.simulation.state.projection import weather_for_hour
+from digital_twin.domain.pot import Pot
+from digital_twin.domain.soil import DEFAULT_SOIL_MODEL as soil
+from digital_twin.domain.weather import local_observed_at
+from digital_twin.simulation.state.environment import StateEnvironment
+from digital_twin.simulation.state.projection import StateProjector
 from digital_twin.simulation.sensors.calibration import (
     lookup_sensor_reading,
     sensor_date_is_future,
@@ -66,7 +60,7 @@ def make_anfis_execution_decision(
     reason_detail = "Valve-zone average ANFIS probability decides irrigation; runtime uses the full calculated need."
     should_irrigate = False
 
-    if number(weather.get("temperature_c"), day_profile["avg_temperature_c"]) <= 3.0:
+    if soil.number(weather.get("temperature_c"), day_profile["avg_temperature_c"]) <= 3.0:
         reason_code = "freeze_risk"
         reason_detail = "Skipped because temperature is too low for irrigation."
 
@@ -111,14 +105,14 @@ def anfis_inputs(
     prior_moisture_pct: float | None = None,
 ) -> dict[str, float]:
     observed_day = local_observed_at(weather).date()
-    rain = number(day_profile.get("precipitation_mm"), number(weather.get("precipitation_mm"), 0.0))
-    effective_rain = rain * rain_exposure_factor(pot, observed_day)
+    rain = soil.number(day_profile.get("precipitation_mm"), soil.number(weather.get("precipitation_mm"), 0.0))
+    effective_rain = rain * Pot.from_mapping(pot).rain_exposure_factor(observed_day)
     if sensor_reading:
-        moisture = number(sensor_reading["soil_moisture_pct"], state.moisture)
-        temperature = number(sensor_reading["air_temperature_c"], number(weather["temperature_c"], 20.0))
+        moisture = soil.number(sensor_reading["soil_moisture_pct"], state.moisture)
+        temperature = soil.number(sensor_reading["air_temperature_c"], soil.number(weather["temperature_c"], 20.0))
     else:
         moisture = state.moisture
-        temperature = number(weather["temperature_c"], 20.0)
+        temperature = soil.number(weather["temperature_c"], 20.0)
     return {
         "moisture": float(moisture),
         "temperature": float(temperature),
@@ -174,14 +168,16 @@ def generate_database_anfis_dataset(
     sensor_context: dict[str, Any] | None = None,
     weather_by_day: dict[date, list[dict[str, Any]]] | None = None,
     day_profiles: dict[date, dict[str, Any]] | None = None,
+    state_environment: StateEnvironment | None = None,
 ) -> list[dict[str, float | str]]:
     rng = random.Random(seed)
     if not sensor_context or not sensor_context.get("available"):
         return []
 
+    state_environment = state_environment or StateEnvironment()
     pot_by_sensor_id = {int(pot["id"]): pot for pot in pots}
     lookup = sensor_context.get("lookup") or {}
-    weather_by_day = weather_by_day or group_weather_by_day(weather_rows)
+    weather_by_day = weather_by_day or state_environment.group_weather_by_day(weather_rows)
     day_profiles = day_profiles or {}
     dataset: list[dict[str, float | str]] = []
     seen: set[tuple[date, time, int]] = set()
@@ -226,10 +222,10 @@ def generate_database_anfis_dataset(
         if not day_weather:
             continue
         observed_at = datetime.combine(reading_date, slot_time, tzinfo=LOCAL_TZ)
-        weather = weather_for_hour(day_weather, observed_at)
+        weather = StateProjector.weather_for_hour(day_weather, observed_at)
         if weather is None:
             continue
-        day_profile = day_profiles.get(reading_date) or build_day_profile(reading_date, day_weather, weather_by_day)
+        day_profile = day_profiles.get(reading_date) or state_environment.day_profile(reading_date, day_weather, weather_by_day)
         decision_slot = DEFAULT_IRRIGATION_POLICY.decision_slot(reading_date, observed_at, day_profile)
         if decision_slot is None:
             decision_slot = _anfis_training_slot(reading_date, day_profile, rng)
@@ -399,13 +395,13 @@ def _anfis_training_example(
     prior_reading: dict[str, Any] | None = None,
     slot_time: time | None = None,
 ) -> dict[str, float | str] | None:
-    moisture = number(sensor_reading.get("soil_moisture_pct"), None)
+    moisture = soil.number(sensor_reading.get("soil_moisture_pct"), None)
     if moisture is None:
         return None
 
-    state = PotState(moisture=clamp(float(moisture), 0.0, 100.0))
+    state = PotState(moisture=soil.clamp(float(moisture), 0.0, 100.0))
     prior_moisture = (
-        number(prior_reading.get("soil_moisture_pct"), None)
+        soil.number(prior_reading.get("soil_moisture_pct"), None)
         if prior_reading
         else None
     )
@@ -436,11 +432,11 @@ def anfis_training_signals(
     prior_reading: dict[str, Any] | None,
     slot_time: time | None,
 ) -> tuple[list[str], float]:
-    moisture = number(sensor_reading.get("soil_moisture_pct"), 50.0)
-    target = number(pot.get("moisture_target_pct"), 40.0)
-    min_moisture = number(pot.get("moisture_min_pct"), target - 8.0)
-    max_temp = number(day_profile.get("max_temperature_c"), 20.0)
-    rain_mm = number(day_profile.get("precipitation_mm"), 0.0)
+    moisture = soil.number(sensor_reading.get("soil_moisture_pct"), 50.0)
+    target = soil.number(pot.get("moisture_target_pct"), 40.0)
+    min_moisture = soil.number(pot.get("moisture_min_pct"), target - 8.0)
+    max_temp = soil.number(day_profile.get("max_temperature_c"), 20.0)
+    rain_mm = soil.number(day_profile.get("precipitation_mm"), 0.0)
     signals = ["real_sensor_reading"]
     weight = 1.0
 
@@ -477,7 +473,7 @@ def _is_post_irrigation_recovery_reading(
 
     if not prior_reading:
         return False
-    prior_moisture = number(prior_reading.get("soil_moisture_pct"), moisture)
+    prior_moisture = soil.number(prior_reading.get("soil_moisture_pct"), moisture)
     return moisture >= target - 2.0 and moisture - prior_moisture >= 2.0
 
 
@@ -509,16 +505,166 @@ def anfis_training_target_probability(
         float(inputs["temperature"]),
         float(inputs["rain"]),
     )
-    return round(clamp(probability, 0.02, 0.95), 4)
+    return round(soil.clamp(probability, 0.02, 0.95), 4)
 
 
 def _anfis_training_slot(observed_date: date, day_profile: dict[str, Any], rng: random.Random) -> str:
     if observed_date.month in {12, 1, 2, 3}:
         return "winter_check"
-    if number(day_profile.get("max_temperature_c"), 20.0) >= 32.0 and rng.random() < 0.35:
+    if soil.number(day_profile.get("max_temperature_c"), 20.0) >= 32.0 and rng.random() < 0.35:
         return "evening"
     return "morning"
 
+
+
+class AnfisFeatureBuilder:
+    """Builds ANFIS runtime inputs and execution decisions."""
+
+    def decision_threshold(
+        self,
+        sensor_context: dict[str, Any],
+        experiment_date: date,
+        decision_threshold: float = ANFIS_DECISION_THRESHOLD,
+        forecast_decision_threshold: float = ANFIS_FORECAST_DECISION_THRESHOLD,
+    ) -> float:
+        return anfis_decision_threshold(
+            sensor_context,
+            experiment_date,
+            decision_threshold=decision_threshold,
+            forecast_decision_threshold=forecast_decision_threshold,
+        )
+
+    def execution_decision(
+        self,
+        state: PotState,
+        pot: dict[str, Any],
+        weather: dict[str, Any],
+        day_profile: dict[str, Any],
+        slot: str,
+    ) -> dict[str, Any]:
+        return make_anfis_execution_decision(state, pot, weather, day_profile, slot)
+
+    def inputs(
+        self,
+        state: PotState,
+        weather: dict[str, Any],
+        sensor_reading: dict[str, Any] | None,
+        pot: dict[str, Any],
+        day_profile: dict[str, Any],
+        prior_moisture_pct: float | None = None,
+    ) -> dict[str, float]:
+        return anfis_inputs(
+            state,
+            weather,
+            sensor_reading,
+            pot,
+            day_profile,
+            prior_moisture_pct=prior_moisture_pct,
+        )
+
+    def duration_policy_note(self, decision: dict[str, Any]) -> str:
+        return anfis_duration_policy_note(decision)
+
+    def zone_probability_summary(self, decisions: list[dict[str, Any]]) -> tuple[float, float]:
+        return anfis_zone_probability_summary(decisions)
+
+
+class AnfisModelEvaluator:
+    """Evaluates trained ANFIS controllers against labeled examples."""
+
+    def predict_probability(
+        self,
+        model: ANFIS | anfis_controller.AnfisModelController,
+        inputs: dict[str, Any],
+        zone: str | None = None,
+    ) -> float:
+        return predict_anfis_probability(model, inputs, zone)
+
+    def evaluate(
+        self,
+        model: ANFIS | anfis_controller.AnfisModelController,
+        dataset: list[dict[str, float | str]],
+    ) -> dict[str, Any]:
+        return evaluate_anfis_model(model, dataset)
+
+
+class AnfisDatasetBuilder:
+    """Builds and describes training datasets from sensor/weather snapshots."""
+
+    def generate_database_dataset(
+        self,
+        weather_rows: list[dict[str, Any]],
+        pots: list[dict[str, Any]],
+        samples: int,
+        seed: int | None,
+        sensor_context: dict[str, Any] | None = None,
+        weather_by_day: dict[date, list[dict[str, Any]]] | None = None,
+        day_profiles: dict[date, dict[str, Any]] | None = None,
+        state_environment: StateEnvironment | None = None,
+    ) -> list[dict[str, float | str]]:
+        return generate_database_anfis_dataset(
+            weather_rows,
+            pots,
+            samples,
+            seed,
+            sensor_context=sensor_context,
+            weather_by_day=weather_by_day,
+            day_profiles=day_profiles,
+            state_environment=state_environment,
+        )
+
+    def signal_summary(self, dataset: list[dict[str, float | str]]) -> dict[str, Any]:
+        return anfis_training_signal_summary(dataset)
+
+    def training_signals(
+        self,
+        pot: dict[str, Any],
+        sensor_reading: dict[str, Any],
+        day_profile: dict[str, Any],
+        prior_reading: dict[str, Any] | None,
+        slot_time: time | None,
+    ) -> tuple[list[str], float]:
+        return anfis_training_signals(pot, sensor_reading, day_profile, prior_reading, slot_time)
+
+    def target_probability(self, inputs: dict[str, float]) -> float:
+        return anfis_training_target_probability(inputs)
+
+
+class AnfisTrainer:
+    """Splits, weights, and trains ANFIS controllers."""
+
+    def split_training_calibration(
+        self,
+        dataset: list[dict[str, float | str]],
+        seed: int | None,
+        calibration_share: float = ANFIS_CALIBRATION_SHARE,
+    ) -> tuple[list[dict[str, float | str]], list[dict[str, float | str]]]:
+        return split_anfis_training_calibration(dataset, seed, calibration_share=calibration_share)
+
+    def expand_training_dataset(self, dataset: list[dict[str, float | str]]) -> list[dict[str, float | str]]:
+        return expand_anfis_training_dataset(dataset)
+
+    def train_controller(
+        self,
+        train_dataset: list[dict[str, float | str]],
+        calibration_dataset: list[dict[str, float | str]],
+        generations: int,
+        population: int,
+        seed: int | None,
+    ) -> anfis_controller.AnfisModelController:
+        return train_anfis_controller(
+            train_dataset,
+            calibration_dataset,
+            generations=generations,
+            population=population,
+            seed=seed,
+        )
+
+
+DEFAULT_ANFIS_FEATURE_BUILDER = AnfisFeatureBuilder()
+DEFAULT_ANFIS_MODEL_EVALUATOR = AnfisModelEvaluator()
+DEFAULT_ANFIS_DATASET_BUILDER = AnfisDatasetBuilder()
+DEFAULT_ANFIS_TRAINER = AnfisTrainer()
 
 
 def _local_timestamp_key(value: str | datetime) -> str:

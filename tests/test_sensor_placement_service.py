@@ -1,14 +1,15 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import unittest
 from typing import Any
 
-from digital_twin.application.sensor_placement.sensor_placement_service import (
+from digital_twin.application.sensors.placement import (
     MIN_SENSOR_COUNT,
     PLACEMENT_POLICY_VERSION,
+    SensorPlacementScorer,
     SensorPlacementService,
 )
-from digital_twin.domain.valves import VALVE_ZONE_DESIGN
+from digital_twin.domain.valve import DEFAULT_VALVE_LAYOUT
 
 
 class SensorPlacementServiceTests(unittest.TestCase):
@@ -19,7 +20,7 @@ class SensorPlacementServiceTests(unittest.TestCase):
         result = service.recommend(sensor_count=1)
 
         self.assertEqual(result["sensor_count"], MIN_SENSOR_COUNT)
-        self.assertEqual({item["balcony_zone"] for item in result["items"]}, {item["zone"] for item in VALVE_ZONE_DESIGN})
+        self.assertEqual({item["balcony_zone"] for item in result["items"]}, DEFAULT_VALVE_LAYOUT.required_zones())
         self.assertTrue(all(item["criteria"]["role"] == "valve_representative" for item in result["items"]))
 
     def test_ensure_replaces_existing_plan_that_misses_valve_zones(self) -> None:
@@ -34,7 +35,7 @@ class SensorPlacementServiceTests(unittest.TestCase):
         result = service.ensure(sensor_count=MIN_SENSOR_COUNT)
 
         self.assertTrue(result["changed"])
-        self.assertEqual({item["balcony_zone"] for item in result["items"]}, {item["zone"] for item in VALVE_ZONE_DESIGN})
+        self.assertEqual({item["balcony_zone"] for item in result["items"]}, DEFAULT_VALVE_LAYOUT.required_zones())
 
     def test_ensure_keeps_valid_valve_zone_plan(self) -> None:
         current = {
@@ -44,7 +45,7 @@ class SensorPlacementServiceTests(unittest.TestCase):
                     "balcony_zone": item["zone"],
                     "criteria": {"placement_policy_version": PLACEMENT_POLICY_VERSION},
                 }
-                for item in VALVE_ZONE_DESIGN
+                for item in DEFAULT_VALVE_LAYOUT.design()
             ],
             "active_pot_count": 200,
         }
@@ -58,7 +59,7 @@ class SensorPlacementServiceTests(unittest.TestCase):
 
     def test_recommendation_prefers_fast_drying_zone_sentinel(self) -> None:
         pots = pots_by_valve_zone()
-        west_zone = VALVE_ZONE_DESIGN[0]["zone"]
+        west_zone = DEFAULT_VALVE_LAYOUT.zones[0].zone
         pots = [pot for pot in pots if pot["balcony_zone"] != west_zone]
         pots.extend(
             [
@@ -121,6 +122,28 @@ class SensorPlacementServiceTests(unittest.TestCase):
         self.assertEqual(west_sensor["pot"]["id"], 104)
         self.assertEqual(west_sensor["criteria"]["placement_policy_version"], PLACEMENT_POLICY_VERSION)
 
+    def test_scorer_owns_fast_drying_pot_score(self) -> None:
+        scorer = SensorPlacementScorer()
+        pot = _pot(
+            104,
+            "west_wall",
+            plant_type_code="vegetables",
+            water_need_level="high",
+            heat_sensitive=True,
+            sun_exposure="reflected_heat",
+            size_class="small",
+            wind_exposure="gusty",
+            retention_factor=0.75,
+        )
+
+        score = scorer.score(pot)
+        penalty = scorer.diversity_penalty(pot, [{"pot": pot}])
+
+        self.assertEqual(score["base_score"], 122.0)
+        self.assertEqual(score["components"]["sun"], 35.0)
+        self.assertIn("heat sensitive", score["reasons"])
+        self.assertEqual(penalty, 30.0)
+
 
 class _FakePlacementRepository:
     def __init__(self, current: dict[str, Any] | None = None, pots: list[dict[str, Any]] | None = None) -> None:
@@ -162,7 +185,7 @@ class _FakePlacementRepository:
 def pots_by_valve_zone() -> list[dict[str, Any]]:
     return [
         _pot(index, item["zone"])
-        for index, item in enumerate(VALVE_ZONE_DESIGN, start=1)
+        for index, item in enumerate(DEFAULT_VALVE_LAYOUT.design(), start=1)
     ]
 
 

@@ -34,7 +34,10 @@ def train_anfis_model_from_snapshot_context(
 ) -> anfis_controller.AnfisTrainingResult:
     """Train and evaluate the ANFIS controller from database sensor/weather examples."""
     training_snapshot = training_snapshot_resolver(start_date, end_date, selected_snapshot)
-    anfis_dataset = modeling.generate_database_anfis_dataset(
+    dataset_builder = modeling.DEFAULT_ANFIS_DATASET_BUILDER
+    trainer = modeling.DEFAULT_ANFIS_TRAINER
+    evaluator = modeling.DEFAULT_ANFIS_MODEL_EVALUATOR
+    anfis_dataset = dataset_builder.generate_database_dataset(
         training_snapshot.selected_weather_rows,
         training_snapshot.pots,
         0,
@@ -47,19 +50,19 @@ def train_anfis_model_from_snapshot_context(
         raise ValueError("ANFIS training requires recorded sensor readings for the selected or historical interval")
 
     train_dataset = list(anfis_dataset)
-    fit_dataset, calibration_dataset = modeling.split_anfis_training_calibration(train_dataset, seed)
-    model = modeling.train_anfis_controller(
+    fit_dataset, calibration_dataset = trainer.split_training_calibration(train_dataset, seed)
+    model = trainer.train_controller(
         fit_dataset,
         calibration_dataset,
         generations=generations,
         population=population,
         seed=seed,
     )
-    model_evaluation = modeling.evaluate_anfis_model(model, train_dataset)
+    model_evaluation = evaluator.evaluate(model, train_dataset)
     metadata = {
         "train_samples": len(train_dataset),
         "fit_samples": len(fit_dataset),
-        "weighted_fit_samples": len(modeling.expand_anfis_training_dataset(fit_dataset)),
+        "weighted_fit_samples": len(trainer.expand_training_dataset(fit_dataset)),
         "calibration_samples": len(calibration_dataset),
         "test_samples": len(train_dataset),
         "evaluation_samples": len(train_dataset),
@@ -73,7 +76,7 @@ def train_anfis_model_from_snapshot_context(
         "training_end_date": training_snapshot.end_date.isoformat(),
         "training_lookback_days": (training_snapshot.end_date - training_snapshot.start_date).days + 1,
         "training_history_days": (training_snapshot.end_date - training_snapshot.start_date).days + 1,
-        "training_signals": modeling.anfis_training_signal_summary(train_dataset),
+        "training_signals": dataset_builder.signal_summary(train_dataset),
         "anfis_input_features": list(model.global_model.input_names),
         "evaluation": model_evaluation,
     }

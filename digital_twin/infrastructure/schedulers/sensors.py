@@ -1,16 +1,16 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import logging
 import threading
 import time as sleep_time
 from datetime import datetime, timedelta
 
-from digital_twin.application.sensor_history.readings.shared import (
-    next_scheduled_datetime,
+from digital_twin.application.sensors.reading_cadence import (
+    DEFAULT_SENSOR_READING_CADENCE,
 )
-from digital_twin.application.sensor_history.sensor_history_service import SensorService
-from digital_twin.core.config import get_settings
-from digital_twin.core.time import local_timezone
+from digital_twin.application.sensors.service import SensorService
+from digital_twin.application.clock import ApplicationClock
+from digital_twin.infrastructure.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +18,9 @@ logger = logging.getLogger(__name__)
 class SensorScheduler:
     """Runs simulated sensor generation and aggregate cleanup loops."""
 
-    def __init__(self, service: SensorService | None = None) -> None:
+    def __init__(self, service: SensorService | None = None, clock: ApplicationClock | None = None) -> None:
         self.service = service or SensorService()
+        self.clock = clock or ApplicationClock()
         self._thread: threading.Thread | None = None
         self._cleanup_thread: threading.Thread | None = None
 
@@ -37,9 +38,9 @@ class SensorScheduler:
             self._cleanup_thread.start()
 
     def _loop(self, source: str) -> None:
-        tz = local_timezone()
+        tz = self.clock.local_timezone()
         while True:
-            next_run = next_scheduled_datetime(datetime.now(tz))
+            next_run = DEFAULT_SENSOR_READING_CADENCE.next_scheduled_datetime(datetime.now(tz))
             seconds = max(1, int((next_run - datetime.now(tz)).total_seconds()))
             logger.info("Next sensor reading scheduled at %s", next_run.isoformat())
             sleep_time.sleep(seconds)
@@ -50,7 +51,7 @@ class SensorScheduler:
                 logger.warning("Scheduled sensor reading failed: %s", exc)
 
     def _cleanup_loop(self, source: str) -> None:
-        tz = local_timezone()
+        tz = self.clock.local_timezone()
         while True:
             next_run = self._next_cleanup_datetime(datetime.now(tz))
             seconds = max(1, int((next_run - datetime.now(tz)).total_seconds()))

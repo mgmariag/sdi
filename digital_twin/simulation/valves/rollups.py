@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from digital_twin.domain.valves import VALVE_ZONE_DESIGN
+from digital_twin.domain.valve import DEFAULT_VALVE_LAYOUT
 from digital_twin.simulation.shared.constants import LOCAL_TZ
 from digital_twin.simulation.valves.distribution import trigger_sensor_ids
 from digital_twin.simulation.valves.zones import (
@@ -11,6 +11,44 @@ from digital_twin.simulation.valves.zones import (
     valve_managed_zone_pots,
     valve_number_for_zone,
 )
+
+
+class ValvePriorityPolicy:
+    """Ranks valve decisions and events for rollup ordering."""
+
+    sun_bonus = {
+        "reflected_heat": 6.0,
+        "full": 4.0,
+        "partial": 1.5,
+        "shade": 0.0,
+    }
+    water_need_bonus = {
+        "high": 4.0,
+        "medium": 2.0,
+        "low": 0.0,
+    }
+
+    def decision_priority(self, decision: dict[str, Any], pot: dict[str, Any]) -> float:
+        moisture = float(decision.get("current_moisture_pct") or pot["moisture_target_pct"])
+        target = float(decision.get("target_moisture_pct") or pot["moisture_target_pct"])
+        return self.priority_score(pot, moisture, target)
+
+    def event_priority(self, event: dict[str, Any], pot: dict[str, Any]) -> float:
+        target = float(pot["moisture_target_pct"])
+        volume_bonus = min(20.0, float(event.get("planned_volume_ml") or 0.0) / 100.0)
+        return self.priority_score(pot, target - 8.0, target) + volume_bonus
+
+    def priority_score(self, pot: dict[str, Any], moisture: float, target: float) -> float:
+        min_moisture = float(pot["moisture_min_pct"])
+        urgency = max(0.0, min_moisture - moisture)
+        deficit = max(0.0, target - moisture)
+        sun_bonus = self.sun_bonus.get(str(pot.get("sun_exposure") or "partial"), 1.5)
+        water_need_bonus = self.water_need_bonus.get(str(pot.get("water_need_level") or "medium"), 2.0)
+        heat_bonus = 2.0 if pot.get("heat_sensitive") else 0.0
+        return urgency * 4.0 + deficit + sun_bonus + water_need_bonus + heat_bonus
+
+
+DEFAULT_VALVE_PRIORITY_POLICY = ValvePriorityPolicy()
 
 
 def apply_valve_rollup_to_entries(
@@ -82,7 +120,13 @@ def _valve_decision_from_group(
     decision_date, slot, decided_key, zone = key
     should = [decision for decision in group if decision.get("should_irrigate")]
     relevant = should or group
-    priority = max((_valve_decision_priority(decision, pot_by_id[int(decision["pot_id"])]) for decision in relevant), default=0.0)
+    priority = max(
+        (
+            DEFAULT_VALVE_PRIORITY_POLICY.decision_priority(decision, pot_by_id[int(decision["pot_id"])])
+            for decision in relevant
+        ),
+        default=0.0,
+    )
     moisture_values = [float(decision.get("current_moisture_pct") or 0.0) for decision in group]
     target_values = [float(decision.get("target_moisture_pct") or 0.0) for decision in group]
     valve_number = valve_number_for_zone(zone)
@@ -188,7 +232,13 @@ def valve_event_from_group(
         for pot_id in trigger_pot_ids
         if pot_id in pot_by_id
     ]
-    priority = max((_valve_event_priority(event, pot_by_id[int(event["pot_id"])]) for event in group), default=0.0)
+    priority = max(
+        (
+            DEFAULT_VALVE_PRIORITY_POLICY.event_priority(event, pot_by_id[int(event["pot_id"])])
+            for event in group
+        ),
+        default=0.0,
+    )
     return {
         "valve_number": valve_number,
         "valve_zone": zone,
@@ -365,7 +415,7 @@ def activated_valve_label(events: list[dict[str, Any]]) -> str:
     if not numbers:
         return "none"
 
-    configured_numbers = sorted(int(item["valve_number"]) for item in VALVE_ZONE_DESIGN)
+    configured_numbers = DEFAULT_VALVE_LAYOUT.configured_numbers()
     if numbers == configured_numbers:
         return "all"
 
@@ -385,27 +435,6 @@ def activated_valve_label(events: list[dict[str, Any]]) -> str:
 def _valve_range_label(start: int, end: int) -> str:
     return f"V{start}" if start == end else f"V{start}-V{end}"
 
-
-def _valve_decision_priority(decision: dict[str, Any], pot: dict[str, Any]) -> float:
-    moisture = float(decision.get("current_moisture_pct") or pot["moisture_target_pct"])
-    target = float(decision.get("target_moisture_pct") or pot["moisture_target_pct"])
-    return _valve_priority_score(pot, moisture, target)
-
-
-def _valve_event_priority(event: dict[str, Any], pot: dict[str, Any]) -> float:
-    target = float(pot["moisture_target_pct"])
-    volume_bonus = min(20.0, float(event.get("planned_volume_ml") or 0.0) / 100.0)
-    return _valve_priority_score(pot, target - 8.0, target) + volume_bonus
-
-
-def _valve_priority_score(pot: dict[str, Any], moisture: float, target: float) -> float:
-    min_moisture = float(pot["moisture_min_pct"])
-    urgency = max(0.0, min_moisture - moisture)
-    deficit = max(0.0, target - moisture)
-    sun_bonus = {"reflected_heat": 6.0, "full": 4.0, "partial": 1.5, "shade": 0.0}.get(str(pot.get("sun_exposure") or "partial"), 1.5)
-    water_need_bonus = {"high": 4.0, "medium": 2.0, "low": 0.0}.get(str(pot.get("water_need_level") or "medium"), 2.0)
-    heat_bonus = 2.0 if pot.get("heat_sensitive") else 0.0
-    return urgency * 4.0 + deficit + sun_bonus + water_need_bonus + heat_bonus
 
 def result_pot_usage_l(result: dict[str, Any], field: str = "period_water_usage_l") -> dict[int, float]:
     usage: dict[int, float] = {}

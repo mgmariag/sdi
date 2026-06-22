@@ -413,13 +413,6 @@ def create_schema(conn) -> None:
             ON weather_refresh_runs (refresh_date, source);
         CREATE INDEX IF NOT EXISTS idx_weather_refresh_runs_recent
             ON weather_refresh_runs (refresh_date DESC, started_at DESC);
-
-        DROP INDEX IF EXISTS idx_irrigation_decisions_pot_date;
-        DROP INDEX IF EXISTS idx_irrigation_decisions_experiment_date_pot;
-        DROP INDEX IF EXISTS idx_irrigation_events_pot_start;
-        DROP INDEX IF EXISTS uq_irrigation_decisions_experiment_pot_slot;
-        DROP INDEX IF EXISTS uq_irrigation_events_experiment_pot_start;
-
         CREATE INDEX IF NOT EXISTS idx_irrigation_events_sensor_start
             ON irrigation_events (sensor_id, scheduled_start_at);
         CREATE INDEX IF NOT EXISTS idx_irrigation_events_experiment_planned_start

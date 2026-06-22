@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 from psycopg.rows import dict_row
 
 from digital_twin.infrastructure.database.connection import get_connection
-from digital_twin.infrastructure.database.schema._utils import _json_ready
+
+
+def _json_ready(value):
+    if isinstance(value, list):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_ready(item) for key, item in value.items()}
+    if isinstance(value, Decimal):
+        return float(value)
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value
 
 
 def get_database_health() -> dict[str, Any]:

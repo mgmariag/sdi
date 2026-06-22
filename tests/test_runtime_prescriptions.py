@@ -4,10 +4,10 @@ import unittest
 from datetime import date, datetime
 from decimal import Decimal
 
-from digital_twin.application.control_loop.irrigation_actuation import (
+from digital_twin.application.actuators.service import (
     IrrigationActuationService,
 )
-from digital_twin.application.control_loop.runtime_prescriptions import (
+from digital_twin.application.control_loop.prescription import (
     RuntimePrescriptionStore,
 )
 from digital_twin.infrastructure.database.repositories.experiment_repository import (

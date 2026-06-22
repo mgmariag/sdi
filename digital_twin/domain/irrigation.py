@@ -1,55 +1,40 @@
 from __future__ import annotations
 
-IRRIGATION_SLOT_MORNING = "morning"
-IRRIGATION_SLOT_EVENING = "evening"
-IRRIGATION_SLOT_WINTER_CHECK = "winter_check"
-IRRIGATION_SLOT_DAILY_PRESCRIPTION = "daily_prescription"
+from enum import Enum
 
-IRRIGATION_SLOTS = (
-    IRRIGATION_SLOT_MORNING,
-    IRRIGATION_SLOT_EVENING,
-    IRRIGATION_SLOT_WINTER_CHECK,
-    IRRIGATION_SLOT_DAILY_PRESCRIPTION,
-)
 
-IRRIGATION_STATUS_PLANNED = "planned"
-IRRIGATION_STATUS_RUNNING = "running"
-IRRIGATION_STATUS_COMPLETED = "completed"
-IRRIGATION_STATUS_SKIPPED = "skipped"
-IRRIGATION_STATUS_CANCELLED = "cancelled"
-IRRIGATION_STATUS_FAILED = "failed"
+class IrrigationSlot(str, Enum):
+    MORNING = "morning"
+    EVENING = "evening"
+    WINTER_CHECK = "winter_check"
+    DAILY_PRESCRIPTION = "daily_prescription"
 
-IRRIGATION_EVENT_STATUSES = (
-    IRRIGATION_STATUS_PLANNED,
-    IRRIGATION_STATUS_RUNNING,
-    IRRIGATION_STATUS_COMPLETED,
-    IRRIGATION_STATUS_SKIPPED,
-    IRRIGATION_STATUS_CANCELLED,
-)
-IRRIGATION_ACTUATION_STATUSES = (
-    IRRIGATION_STATUS_PLANNED,
-    IRRIGATION_STATUS_RUNNING,
-    IRRIGATION_STATUS_COMPLETED,
-    IRRIGATION_STATUS_SKIPPED,
-    IRRIGATION_STATUS_CANCELLED,
-    IRRIGATION_STATUS_FAILED,
-)
+    @classmethod
+    def values(cls) -> tuple[str, ...]:
+        return tuple(item.value for item in cls)
 
-IRRIGATION_ACTUATOR_NODE = "irrigation-actuator"
 
-__all__ = [
-    "IRRIGATION_ACTUATION_STATUSES",
-    "IRRIGATION_ACTUATOR_NODE",
-    "IRRIGATION_EVENT_STATUSES",
-    "IRRIGATION_SLOT_DAILY_PRESCRIPTION",
-    "IRRIGATION_SLOT_EVENING",
-    "IRRIGATION_SLOT_MORNING",
-    "IRRIGATION_SLOT_WINTER_CHECK",
-    "IRRIGATION_SLOTS",
-    "IRRIGATION_STATUS_CANCELLED",
-    "IRRIGATION_STATUS_COMPLETED",
-    "IRRIGATION_STATUS_FAILED",
-    "IRRIGATION_STATUS_PLANNED",
-    "IRRIGATION_STATUS_RUNNING",
-    "IRRIGATION_STATUS_SKIPPED",
-]
+class IrrigationStatus(str, Enum):
+    PLANNED = "planned"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    SKIPPED = "skipped"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+    @classmethod
+    def event_values(cls) -> tuple[str, ...]:
+        return (
+            cls.PLANNED.value,
+            cls.RUNNING.value,
+            cls.COMPLETED.value,
+            cls.SKIPPED.value,
+            cls.CANCELLED.value,
+        )
+
+    @classmethod
+    def actuation_values(cls) -> tuple[str, ...]:
+        return (
+            *cls.event_values(),
+            cls.FAILED.value,
+        )

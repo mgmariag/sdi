@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from digital_twin.domain.valves import VALVE_ZONE_DESIGN
+from digital_twin.domain.valve import DEFAULT_VALVE_LAYOUT
 from digital_twin.infrastructure.database.repositories.overview._common import (
     NO_IRRIGATION_RECORDED_LABEL,
     number as _number,
@@ -94,10 +94,7 @@ def _activity_window_valves(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _valve_zone_for_number(valve_number: int) -> str:
-    for item in VALVE_ZONE_DESIGN:
-        if int(item["valve_number"]) == valve_number:
-            return str(item["zone"])
-    return ""
+    return DEFAULT_VALVE_LAYOUT.zone_for_number(valve_number) or ""
 
 
 def _valve_zone_label(zone: Any) -> str:

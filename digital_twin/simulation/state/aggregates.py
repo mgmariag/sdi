@@ -9,8 +9,8 @@ from digital_twin.simulation.metrics import (
 )
 from digital_twin.simulation.shared.constants import LOCAL_TZ
 from digital_twin.simulation.shared.types import PotState
-from digital_twin.simulation.soil_model import number
-from digital_twin.simulation.state.environment import weather_cloud_cover_pct
+from digital_twin.domain.soil import DEFAULT_SOIL_MODEL as soil
+from digital_twin.simulation.state.environment import StateEnvironment
 
 
 def hourly_aggregate_entry(
@@ -23,14 +23,16 @@ def hourly_aggregate_entry(
     hourly_decisions: int,
     hourly_alerts: int,
     extra: dict[str, Any] | None = None,
+    state_environment: StateEnvironment | None = None,
 ) -> dict[str, Any]:
+    state_environment = state_environment or StateEnvironment()
     moistures = [state.moisture for state in pot_states.values()]
     avg_moisture = sum(moistures) / max(len(moistures), 1)
-    temperature = number(weather["temperature_c"], day_profile["avg_temperature_c"])
-    humidity = number(weather["relative_humidity_pct"], day_profile["avg_humidity_pct"])
-    cloud_cover = weather_cloud_cover_pct(weather, day_profile["avg_cloud_cover_pct"])
-    rain_amount = number(weather["precipitation_mm"], 0.0)
-    wind_gust = number(weather["wind_gust_kmh"], number(weather["wind_speed_kmh"], 0.0))
+    temperature = soil.number(weather["temperature_c"], day_profile["avg_temperature_c"])
+    humidity = soil.number(weather["relative_humidity_pct"], day_profile["avg_humidity_pct"])
+    cloud_cover = state_environment.weather_cloud_cover_pct(weather, day_profile["avg_cloud_cover_pct"])
+    rain_amount = soil.number(weather["precipitation_mm"], 0.0)
+    wind_gust = soil.number(weather["wind_gust_kmh"], soil.number(weather["wind_speed_kmh"], 0.0))
     valve_runs = max(0, int(hourly_events or 0))
     entry = {
         "date": observed_at.date().isoformat(),

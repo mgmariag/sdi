@@ -5,9 +5,9 @@ import threading
 import time as sleep_time
 from datetime import datetime, timedelta
 
+from digital_twin.application.clock import ApplicationClock
 from digital_twin.application.control_loop.runtime import RuntimeControlLoop
-from digital_twin.core.config import get_settings
-from digital_twin.core.time import local_timezone
+from digital_twin.infrastructure.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -15,8 +15,13 @@ logger = logging.getLogger(__name__)
 class PrescriptionScheduler:
     """Publishes tomorrow's four irrigation prescriptions at the configured time."""
 
-    def __init__(self, control_loop: RuntimeControlLoop | None = None) -> None:
-        self.control_loop = control_loop or RuntimeControlLoop()
+    def __init__(
+        self,
+        control_loop: RuntimeControlLoop | None = None,
+        clock: ApplicationClock | None = None,
+    ) -> None:
+        self.clock = clock or ApplicationClock()
+        self.control_loop = control_loop or RuntimeControlLoop(clock=self.clock)
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
@@ -25,7 +30,7 @@ class PrescriptionScheduler:
             self._thread.start()
 
     def _loop(self) -> None:
-        tz = local_timezone()
+        tz = self.clock.local_timezone()
         while True:
             next_run = self._next_dispatch_datetime(datetime.now(tz))
             seconds = max(1, int((next_run - datetime.now(tz)).total_seconds()))

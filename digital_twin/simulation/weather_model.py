@@ -7,20 +7,17 @@ from typing import Any
 
 from psycopg.rows import dict_row
 
-from digital_twin.core.exceptions import NoWeatherData
-from digital_twin.domain.weather import (
-    OPEN_METEO_ARCHIVE_SOURCE,
-    OPEN_METEO_FORECAST_SOURCE,
-)
+from digital_twin.application.exceptions import NoWeatherData
+from digital_twin.domain.weather import DEFAULT_WEATHER_LOCATION, local_observed_at
 from digital_twin.infrastructure.database.connection import get_connection
 from digital_twin.simulation.shared.constants import (
     LOCAL_TZ,
     LOCATION_NAME,
 )
-from digital_twin.simulation.soil_model import clamp, local_observed_at
+from digital_twin.domain.soil import DEFAULT_SOIL_MODEL as soil
 
 
-def load_weather(start_date: date, end_date: date) -> list[dict[str, Any]]:
+def _load_weather(start_date: date, end_date: date) -> list[dict[str, Any]]:
     start_ts = datetime.combine(start_date, time.min, tzinfo=LOCAL_TZ)
     end_ts = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=LOCAL_TZ)
     with get_connection(row_factory=dict_row) as conn:
@@ -50,8 +47,8 @@ def load_weather(start_date: date, end_date: date) -> list[dict[str, Any]]:
             ORDER BY observed_local_at
             """,
             {
-                "archive_source": OPEN_METEO_ARCHIVE_SOURCE,
-                "forecast_source": OPEN_METEO_FORECAST_SOURCE,
+                "archive_source": "open-meteo-archive",
+                "forecast_source": "open-meteo-forecast",
                 "location": LOCATION_NAME,
                 "start_ts": start_ts.replace(tzinfo=None),
                 "end_ts": end_ts.replace(tzinfo=None),
@@ -60,7 +57,7 @@ def load_weather(start_date: date, end_date: date) -> list[dict[str, Any]]:
         return rows
 
 
-def raise_if_missing_historical_weather(weather_rows: list[dict[str, Any]], start_date: date, end_date: date) -> None:
+def _raise_if_missing_historical_weather(weather_rows: list[dict[str, Any]], start_date: date, end_date: date) -> None:
     missing = _missing_historical_weather_hours(weather_rows, start_date, end_date)
     if not missing:
         return
@@ -164,7 +161,7 @@ def _closest_higher_weather_range(availability: list[dict[str, Any]], end_date: 
     return min(candidates, key=lambda item: date.fromisoformat(item["start"]))
 
 
-def with_estimated_future_weather(
+def _with_estimated_future_weather(
     weather_rows: list[dict[str, Any]],
     start_date: date,
     end_date: date,
@@ -206,7 +203,7 @@ def _estimated_weather_row(observed_at: datetime) -> dict[str, Any]:
     hour = observed_at.hour
     diurnal = math.cos(((hour - 14) / 24.0) * 2.0 * math.pi)
     temperature = profile["avg_temp"] + profile["diurnal_amp"] * diurnal + rng.uniform(-1.8, 1.8)
-    humidity = clamp(profile["humidity"] - (temperature - profile["avg_temp"]) * 1.6 + rng.uniform(-7.0, 7.0), 30.0, 98.0)
+    humidity = soil.clamp(profile["humidity"] - (temperature - profile["avg_temp"]) * 1.6 + rng.uniform(-7.0, 7.0), 30.0, 98.0)
     wind_speed = max(1.0, profile["wind"] + rng.uniform(-3.0, 5.0))
     wind_gust = wind_speed + rng.uniform(4.0, 12.0)
     precipitation = 0.0
@@ -220,8 +217,8 @@ def _estimated_weather_row(observed_at: datetime) -> dict[str, Any]:
     return {
         "id": None,
         "location_name": LOCATION_NAME,
-        "latitude": 46.7712,
-        "longitude": 23.6236,
+        "latitude": DEFAULT_WEATHER_LOCATION.latitude,
+        "longitude": DEFAULT_WEATHER_LOCATION.longitude,
         "observed_at": observed_at,
         "observed_local_at": observed_at.replace(tzinfo=None) if observed_at.tzinfo else observed_at,
         "observed_date": observed_at.date(),
@@ -233,7 +230,7 @@ def _estimated_weather_row(observed_at: datetime) -> dict[str, Any]:
         "precipitation_mm": precipitation,
         "wind_speed_kmh": round(wind_speed, 2),
         "wind_gust_kmh": round(wind_gust, 2),
-        "cloud_cover_pct": round(clamp(profile["cloud"] + rng.uniform(-18.0, 18.0), 0.0, 100.0), 2),
+        "cloud_cover_pct": round(soil.clamp(profile["cloud"] + rng.uniform(-18.0, 18.0), 0.0, 100.0), 2),
         "apparent_temperature_c": round(temperature - max(0.0, wind_speed - 15.0) * 0.05, 2),
         "is_day": 7 <= hour <= 18,
         "precipitation_probability_pct": round(profile["precip_chance"] * 100.0, 2),
@@ -272,4 +269,29 @@ def _estimated_month_profile(month: int) -> dict[str, float]:
     return profiles[month]
 
 
+class SimulationWeatherRepository:
+    """Reads stored weather rows and validates historical coverage."""
+
+    def load_weather(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        return _load_weather(start_date, end_date)
+
+    def raise_if_missing_historical_weather(
+        self,
+        weather_rows: list[dict[str, Any]],
+        start_date: date,
+        end_date: date,
+    ) -> None:
+        _raise_if_missing_historical_weather(weather_rows, start_date, end_date)
+
+
+class FutureWeatherEstimator:
+    """Fills future simulation hours when no stored forecast row exists."""
+
+    def with_estimated_future_weather(
+        self,
+        weather_rows: list[dict[str, Any]],
+        start_date: date,
+        end_date: date,
+    ) -> tuple[list[dict[str, Any]], int]:
+        return _with_estimated_future_weather(weather_rows, start_date, end_date)
 

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from digital_twin.domain.valves import VALVE_COUNT, VALVE_ZONE_DESIGN, VALVE_ZONE_ORDER
+from digital_twin.domain.valve import DEFAULT_VALVE_LAYOUT
 from digital_twin.infrastructure.database.connection import get_connection
-from digital_twin.infrastructure.database.repositories._utils import _json_ready
 
 
 class SensorPlacementRepository:
@@ -102,13 +102,13 @@ class SensorPlacementRepository:
         stored_sensor_count = items[0]["requested_sensor_count"] if items else 0
         sensor_reading_pot_count = int(counts["sensor_reading_pot_count"] or 0)
         active_pot_count = int(counts["active_pot_count"] or 0)
-        default_sensor_count = min(active_pot_count, VALVE_COUNT) if active_pot_count > 0 else 0
+        default_sensor_count = min(active_pot_count, DEFAULT_VALVE_LAYOUT.count) if active_pot_count > 0 else 0
         selected_zones = {str(item.get("balcony_zone") or "") for item in items}
-        required_zones = {item["zone"] for item in VALVE_ZONE_DESIGN}
+        required_zones = DEFAULT_VALVE_LAYOUT.required_zones()
         return {
             "sensor_count": stored_sensor_count or default_sensor_count,
-            "minimum_sensor_count": VALVE_COUNT,
-            "valve_count": VALVE_COUNT,
+            "minimum_sensor_count": DEFAULT_VALVE_LAYOUT.count,
+            "valve_count": DEFAULT_VALVE_LAYOUT.count,
             "has_all_valve_zones": bool(items) and required_zones.issubset(selected_zones),
             "stored_sensor_count": stored_sensor_count,
             "sensor_reading_pot_count": sensor_reading_pot_count,
@@ -168,7 +168,19 @@ class SensorPlacementRepository:
 
 
 def _with_valve_fields(item: dict[str, Any]) -> dict[str, Any]:
-    valve_number = VALVE_ZONE_ORDER.get(str(item.get("balcony_zone") or ""))
+    valve_number = DEFAULT_VALVE_LAYOUT.valve_number_for_zone(str(item.get("balcony_zone") or ""))
     item["valve_number"] = valve_number
     item["valve_label"] = f"V{valve_number}" if valve_number else "Unmapped"
     return item
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_ready(item) for key, item in value.items()}
+    if isinstance(value, Decimal):
+        return float(value)
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value

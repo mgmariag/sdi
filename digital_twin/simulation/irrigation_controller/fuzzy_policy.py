@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Any, Mapping
 
-from digital_twin.simulation.irrigation_controller.sizing import (
-    _pot_surface_area_m2,
-    _size_flow_rate_multiplier,
-)
+from digital_twin.domain.pot import Pot
 from digital_twin.simulation.shared.types import PotState
-from digital_twin.simulation.soil_model import clamp, local_observed_at, number
+from digital_twin.domain.soil import DEFAULT_SOIL_MODEL as soil
+from digital_twin.domain.weather import local_observed_at
+
+PotInput = Mapping[str, Any] | Pot
 
 _FUZZY_OUTPUT_SETS = {
     "none": (0.0, 0.0, 0.4),
@@ -33,7 +33,7 @@ class FuzzyIrrigationPolicy:
 
     def decision_slot(self, day: date, observed_at: datetime, day_profile: dict[str, Any]) -> str | None:
         hour = observed_at.hour
-        max_temp = number(day_profile.get("max_temperature_c"), 20.0)
+        max_temp = soil.number(day_profile.get("max_temperature_c"), 20.0)
 
         if day.month in {12, 1, 2, 3}:
             return "winter_check" if hour == 10 else None
@@ -43,44 +43,36 @@ class FuzzyIrrigationPolicy:
             return "evening"
         return None
 
-    def comfort_floor(self, pot: dict[str, Any], day_profile: dict[str, Any], slot: str = "morning") -> float:
-        target = float(pot["moisture_target_pct"])
-        min_moisture = float(pot["moisture_min_pct"])
+    def comfort_floor(self, pot: PotInput, day_profile: dict[str, Any], slot: str = "morning") -> float:
+        domain_pot = Pot.from_mapping(pot)
+        target = domain_pot.moisture_target_pct
+        min_moisture = domain_pot.moisture_min_pct
         floor = max(
             min_moisture + self.comfort_minimum_margin_pct,
             target - self.comfort_target_offset_pct,
         )
-        if self.high_need_pot(pot):
+        if domain_pot.is_high_need():
             floor += 1.0
         if day_profile.get("heatwave_day"):
-            floor += 1.5 if self.heat_priority_pot(pot) else 0.75
+            floor += 1.5 if domain_pot.is_heat_priority() else 0.75
         if day_profile.get("dry_windy_day"):
-            floor += 1.5 if pot["size_class"] == "small" else 0.75
+            floor += 1.5 if domain_pot.size_class == "small" else 0.75
         if slot == "winter_check":
-            winter_target = float(pot["winter_moisture_target_pct"])
-            floor = max(min_moisture, winter_target - 3.0)
-        return clamp(floor, 5.0, target - 1.0)
+            floor = max(min_moisture, domain_pot.winter_moisture_target_pct - 3.0)
+        return soil.clamp(floor, 5.0, target - 1.0)
 
-    def trigger_threshold(self, pot: dict[str, Any], day_profile: dict[str, Any], slot: str = "morning") -> float:
+    def trigger_threshold(self, pot: PotInput, day_profile: dict[str, Any], slot: str = "morning") -> float:
+        domain_pot = Pot.from_mapping(pot)
         threshold = self.comfort_floor(pot, day_profile, slot)
         if slot == "evening":
-            threshold = max(threshold, float(pot["moisture_min_pct"]) + 2.0)
-        return clamp(threshold, 5.0, float(pot["moisture_target_pct"]) - 2.0)
+            threshold = max(threshold, domain_pot.moisture_min_pct + 2.0)
+        return soil.clamp(threshold, 5.0, domain_pot.moisture_target_pct - 2.0)
 
-    def heat_priority_pot(self, pot: dict[str, Any]) -> bool:
-        return (
-            self.high_need_pot(pot)
-            or pot.get("size_class") == "small"
-            or pot.get("small_subtype") == "hanging"
-            or pot.get("balcony_zone") == "hanging_row"
-        )
+    def heat_priority_pot(self, pot: PotInput) -> bool:
+        return Pot.from_mapping(pot).is_heat_priority()
 
-    def high_need_pot(self, pot: dict[str, Any]) -> bool:
-        return (
-            pot.get("water_need_level") == "high"
-            or pot.get("heat_sensitive")
-            or pot.get("plant_type_code") in {"vegetables", "herbs", "tomatoes", "cucumbers", "flowering"}
-        )
+    def high_need_pot(self, pot: PotInput) -> bool:
+        return Pot.from_mapping(pot).is_high_need()
 
     def skip_reason(
         self,
@@ -109,32 +101,34 @@ class FuzzyIrrigationPolicy:
             rain_mm=rain_mm,
         )
 
-    def volume_for_score_pct(self, pot: dict[str, Any], prescription_score_pct: float) -> float:
-        flow_rate = max(pot["drip_flow_ml_min"] * _size_flow_rate_multiplier(pot), 1.0)
-        max_minutes = {"huge": 60, "large": 42, "medium": 27, "small": 17}[pot["size_class"]]
+    def volume_for_score_pct(self, pot: PotInput, prescription_score_pct: float) -> float:
+        domain_pot = Pot.from_mapping(pot)
+        flow_rate = domain_pot.effective_flow_rate_ml_min()
+        max_minutes = {"huge": 60, "large": 42, "medium": 27, "small": 17}[domain_pot.size_class]
         signal = _score_pct_to_signal(prescription_score_pct)
-        requested_volume_ml = max(0.0, signal) * _pot_surface_area_m2(pot) * 1000.0
+        requested_volume_ml = max(0.0, signal) * domain_pot.surface_area_m2() * 1000.0
         return min(requested_volume_ml, flow_rate * max_minutes)
 
-    def prescribed_volume_ml(self, state: PotState, pot: dict[str, Any], prescription_score_pct: float) -> float:
+    def prescribed_volume_ml(self, state: PotState, pot: PotInput, prescription_score_pct: float) -> float:
         _ = state
         return self.volume_for_score_pct(pot, prescription_score_pct)
 
-    def irrigation_request(self, pot: dict[str, Any], weather: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
-        planned_volume_ml = max(0.0, number(decision.get("planned_volume_ml"), 0.0))
-        flow_rate = max(pot["drip_flow_ml_min"] * _size_flow_rate_multiplier(pot), 1.0)
-        duration_min = planned_volume_ml / flow_rate if flow_rate > 0 else 0.0
-        cycle_count = 2 if pot["cycle_soak_enabled"] and duration_min >= 10 else 1
-        soak_pause_min = 10 if cycle_count == 2 else 0
+    def irrigation_request(self, pot: PotInput, weather: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
+        domain_pot = Pot.from_mapping(pot)
+        planned_volume_ml = max(0.0, soil.number(decision.get("planned_volume_ml"), 0.0))
+        flow_rate = domain_pot.effective_flow_rate_ml_min()
+        duration_min = domain_pot.runtime_min_for_volume(planned_volume_ml)
+        cycle_count = domain_pot.cycle_count_for_runtime(duration_min)
+        soak_pause_min = domain_pot.soak_pause_min_for_runtime(duration_min)
 
         scheduled_start = local_observed_at(weather)
         scheduled_end = scheduled_start + timedelta(minutes=duration_min + soak_pause_min)
-        sensor_id = int(decision.get("sensor_id", pot["id"]))
+        sensor_id = int(decision.get("sensor_id", domain_pot.id))
         return {
-            "pot_id": pot["id"],
+            "pot_id": domain_pot.id,
             "sensor_id": sensor_id,
             "request_sensor_id": sensor_id,
-            "pot_code": pot["pot_code"],
+            "pot_code": domain_pot.pot_code,
             "date": scheduled_start.date().isoformat(),
             "slot": decision["slot"],
             "scheduled_start_at": scheduled_start.isoformat(),
@@ -145,23 +139,24 @@ class FuzzyIrrigationPolicy:
             "duration_min": round(duration_min, 3),
             "cycle_count": cycle_count,
             "soak_pause_min": soak_pause_min,
-            "prescription_volume_ml": round(number(decision.get("prescription_volume_ml"), planned_volume_ml), 2),
+            "prescription_volume_ml": round(soil.number(decision.get("prescription_volume_ml"), planned_volume_ml), 2),
             "prescription_score_pct": decision.get("prescription_score_pct", 0.0),
         }
 
     def make_decision(
         self,
         state: PotState,
-        pot: dict[str, Any],
+        pot: PotInput,
         weather: dict[str, Any],
         day_profile: dict[str, Any],
         slot: str = "morning",
     ) -> dict[str, Any]:
+        domain_pot = Pot.from_mapping(pot)
         observed_local = local_observed_at(weather)
-        temperature_c = number(weather.get("temperature_c"), day_profile["avg_temperature_c"])
-        rain_mm = number(day_profile.get("precipitation_mm"), 0.0)
+        temperature_c = soil.number(weather.get("temperature_c"), day_profile["avg_temperature_c"])
+        rain_mm = soil.number(day_profile.get("precipitation_mm"), 0.0)
         comfort_floor = self.comfort_floor(pot, day_profile, slot)
-        min_moisture = float(pot["moisture_min_pct"])
+        min_moisture = domain_pot.moisture_min_pct
         skip_reason = self.skip_reason(
             state.moisture,
             temperature_c,
@@ -244,8 +239,8 @@ class FuzzyIrrigationPolicy:
             )
 
         return {
-            "pot_id": pot["id"],
-            "pot_code": pot["pot_code"],
+            "pot_id": domain_pot.id,
+            "pot_code": domain_pot.pot_code,
             "decided_at": observed_local.isoformat(),
             "date": observed_local.date().isoformat(),
             "slot": slot,
@@ -253,7 +248,7 @@ class FuzzyIrrigationPolicy:
             "reason_code": reason_code,
             "reason_detail": reason_detail,
             "current_moisture_pct": round(state.moisture, 2),
-            "target_moisture_pct": round(pot["moisture_target_pct"], 2),
+            "target_moisture_pct": round(domain_pot.moisture_target_pct, 2),
             "weather_hourly_id": weather["id"],
             "prescription_score_pct": round(prescription_score_pct, 2),
             "prescription_volume_ml": round(planned_volume_ml, 2),
@@ -295,7 +290,7 @@ def _fuzzy_irrigation_score_pct(
         "high": min(very_dry, hot, rain_none),
         "very_high": min(very_dry, hot, rain_none, _left_shoulder(rain_mm, 0.0, 0.4)),
     }
-    signal = clamp(_defuzzify_irrigation_signal(rules), 0.0, _FUZZY_SIGNAL_MAX)
+    signal = soil.clamp(_defuzzify_irrigation_signal(rules), 0.0, _FUZZY_SIGNAL_MAX)
     return round(signal / _FUZZY_SIGNAL_MAX * 100.0, 2)
 
 
@@ -320,7 +315,7 @@ def _defuzzify_irrigation_signal(rule_strengths: dict[str, float]) -> float:
 
 
 def _score_pct_to_signal(score_pct: float) -> float:
-    return clamp(float(score_pct), 0.0, 100.0) / 100.0 * _FUZZY_SIGNAL_MAX
+    return soil.clamp(float(score_pct), 0.0, 100.0) / 100.0 * _FUZZY_SIGNAL_MAX
 
 
 def _defuzz_output_memberships() -> dict[str, tuple[float, ...]]:

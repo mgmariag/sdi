@@ -4,13 +4,10 @@ import math
 from datetime import date, datetime, time
 from typing import Any
 
-from digital_twin.domain.sensors import (
-    ACTUAL_SENSOR_SOURCE,
-    SPARSE_FORECAST_SENSOR_SOURCE,
-)
+from digital_twin.domain.sensor import SensorSource
 from digital_twin.simulation.shared.constants import LOCAL_TZ
 from digital_twin.simulation.shared.types import PotState
-from digital_twin.simulation.soil_model import clamp, number, sun_factor, wind_factor
+from digital_twin.domain.soil import DEFAULT_SOIL_MODEL as soil
 
 MORNING_SENSOR_CALIBRATION_TIME = time(5, 30)
 EVENING_SENSOR_CALIBRATION_TIME = time(17, 30)
@@ -26,17 +23,17 @@ def apply_sensor_reading(
         return None
 
     reading = dict(reading)
-    if reading.get("source") != ACTUAL_SENSOR_SOURCE:
+    if reading.get("source") != SensorSource.ACTUAL.value:
         return reading
 
-    sensor_moisture = number(reading["soil_moisture_pct"], state.moisture)
+    sensor_moisture = soil.number(reading["soil_moisture_pct"], state.moisture)
     if reading.get("association_source") == "associated_sensor":
         sensor_weight = associated_sensor_weight(observed_at)
-        state.moisture = clamp(sensor_moisture * sensor_weight + state.moisture * (1.0 - sensor_weight), 0.0, 100.0)
+        state.moisture = soil.clamp(sensor_moisture * sensor_weight + state.moisture * (1.0 - sensor_weight), 0.0, 100.0)
         reading["soil_moisture_pct"] = round(state.moisture, 2)
         reading["sensor_blend_weight"] = round(sensor_weight, 2)
     else:
-        state.moisture = clamp(sensor_moisture, 0.0, 100.0)
+        state.moisture = soil.clamp(sensor_moisture, 0.0, 100.0)
     return reading
 
 
@@ -60,7 +57,7 @@ def sensor_calibration_marker_time(observed_at: datetime, day_profile: dict[str,
         return MORNING_SENSOR_CALIBRATION_TIME
     if (
         observed_at.hour == 18
-        and number(day_profile.get("max_temperature_c"), 20.0) > 32.0
+        and soil.number(day_profile.get("max_temperature_c"), 20.0) > 32.0
     ):
         return EVENING_SENSOR_CALIBRATION_TIME
     return None
@@ -93,8 +90,8 @@ def apply_calibration_reading(
     observed_at: datetime,
 ) -> dict[str, Any]:
     reading = dict(reading)
-    sensor_moisture = number(reading["soil_moisture_pct"], state.moisture)
-    state.moisture = clamp(sensor_moisture, 0.0, 100.0)
+    sensor_moisture = soil.number(reading["soil_moisture_pct"], state.moisture)
+    state.moisture = soil.clamp(sensor_moisture, 0.0, 100.0)
     if reading.get("association_source") == "associated_sensor":
         reading["soil_moisture_pct"] = round(state.moisture, 2)
         reading["sensor_blend_weight"] = 1.0
@@ -169,7 +166,7 @@ def forecast_sensor_reading_for_pot(
     slot_time = sensor_lookup_time(observed_at)
     reading = {
         "sensor_id": pot_id,
-        "source": SPARSE_FORECAST_SENSOR_SOURCE,
+        "source": SensorSource.SPARSE_FORECAST.value,
         "soil_moisture_pct": round(reference_state.moisture, 2),
         "local_date": experiment_date,
         "local_time": slot_time,
@@ -214,13 +211,13 @@ def associated_sensor_reading(
     sensor_pot: dict[str, Any],
     sensor_reading: dict[str, Any],
 ) -> dict[str, Any]:
-    sensor_moisture = number(sensor_reading["soil_moisture_pct"], pot["moisture_target_pct"])
+    sensor_moisture = soil.number(sensor_reading["soil_moisture_pct"], pot["moisture_target_pct"])
     target_adjustment = (float(pot["moisture_target_pct"]) - float(sensor_pot["moisture_target_pct"])) * 0.45
     min_adjustment = (float(pot["moisture_min_pct"]) - float(sensor_pot["moisture_min_pct"])) * 0.2
     exposure_adjustment = (pot_exposure_index(sensor_pot) - pot_exposure_index(pot)) * 2.2
     retention_adjustment = (float(pot["retention_factor"]) - float(sensor_pot["retention_factor"])) * 4.0
     volume_adjustment = math.log(max(float(pot["volume_l"]), 0.1) / max(float(sensor_pot["volume_l"]), 0.1)) * 0.8
-    inferred_moisture = clamp(
+    inferred_moisture = soil.clamp(
         sensor_moisture
         + target_adjustment
         + min_adjustment
@@ -244,7 +241,7 @@ def pot_exposure_index(pot: dict[str, Any]) -> float:
         "partially_exposed": 0.5,
         "fully_exposed": 1.0,
     }.get(str(pot.get("rain_exposure") or "partially_exposed"), 0.5)
-    return rain + (sun_factor(pot) - 1.0) * 1.6 + (wind_factor(pot) - 1.0) * 1.2
+    return rain + (soil.sun_factor(pot) - 1.0) * 1.6 + (soil.wind_factor(pot) - 1.0) * 1.2
 
 
 def latest_sensor_state_for_pot(sensor_context: dict[str, Any], pot: dict[str, Any]) -> dict[str, Any] | None:

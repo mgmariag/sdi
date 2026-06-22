@@ -1,9 +1,9 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
 
-from digital_twin.core.config import get_settings
+from digital_twin.infrastructure.config import get_settings
 from digital_twin.infrastructure.database.repositories.overview._common import freshness_percent as _freshness_percent
 
 

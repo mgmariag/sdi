@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import json
@@ -7,12 +7,12 @@ import os
 from datetime import date
 from typing import Any
 
-from digital_twin.application.anfis_training.anfis_training_service import (
+from digital_twin.application.experiments.anfis_model_service import (
     DEFAULT_ANFIS_GENERATIONS,
     DEFAULT_ANFIS_POPULATION,
     AnfisModelService,
 )
-from digital_twin.core.config import get_settings
+from digital_twin.infrastructure.config import get_settings
 from digital_twin.infrastructure.database.repositories.anfis_model_repository import (
     DEFAULT_MODEL_KEY,
 )

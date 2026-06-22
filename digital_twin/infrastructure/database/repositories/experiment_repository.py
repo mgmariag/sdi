@@ -7,14 +7,15 @@ from typing import Any
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from digital_twin.core.time import local_timezone, now_local
+from digital_twin.application.clock import ApplicationClock
 from digital_twin.infrastructure.database.connection import get_connection
 
 PHYSICAL_ACTUATION_EXPERIMENT_TYPE = "baseline"
+_clock = ApplicationClock()
 
 
 def _today_window(current: datetime | None = None) -> tuple[datetime, datetime, datetime]:
-    now = _local_datetime(current or now_local())
+    now = _local_datetime(current or _clock.now())
     today_start = datetime.combine(now.date(), time.min, tzinfo=now.tzinfo)
     return now, today_start, today_start + timedelta(days=1)
 
@@ -25,8 +26,8 @@ def _local_datetime(value: str | datetime) -> datetime:
     else:
         local_value = value
     if local_value.tzinfo is None:
-        return local_value.replace(tzinfo=local_timezone())
-    return local_value.astimezone(local_timezone())
+        return local_value.replace(tzinfo=_clock.local_timezone())
+    return local_value.astimezone(_clock.local_timezone())
 
 
 def _first_int(values: Any) -> int | None:
@@ -82,7 +83,7 @@ def _experiment_run_row(
     result: dict[str, Any],
 ) -> dict[str, Any]:
     summary = result.get("summary") or {}
-    completed_at = now_local()
+    completed_at = _clock.now()
     execution_seconds = max(0.0, _float(summary.get("execution_time_seconds"), 0.0))
     started_at = completed_at - timedelta(seconds=execution_seconds)
     return {

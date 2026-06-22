@@ -240,7 +240,7 @@ sap.ui.define([
                         overviewStateRowHtml("moisture", "Average soil moisture", state.currentMoistureLabel) +
                         overviewStateRowHtml("rain", "Forecast rain (next 3 days)", state.forecastRainLabel) +
                         overviewStateRowHtml("irrigation", "Irrigation recommendation", state.irrigationRecommendation) +
-                        overviewStateRowHtml("clock", state.irrigationActivityLabel, state.irrigationActivityValue) +
+                        overviewStateRowHtmlValueHtml("clock", state.irrigationActivityLabel, state.compactIrrigationActivityHtml) +
                     "</section>" +
                     "<section class=\"overviewRailCard overviewLatestIrrigationCard\">" +
                         "<h3>Recent Activity</h3>" +

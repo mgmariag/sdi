@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from digital_twin.api.main import create_app
-from digital_twin.core.config import get_settings
+from digital_twin.infrastructure.config import get_settings
 
 
 class ArchitectureTests(unittest.TestCase):
@@ -20,6 +20,7 @@ class ArchitectureTests(unittest.TestCase):
             "/api/sensors/summary",
             "/api/weather/cluj-napoca/summary",
             "/api/weather/cluj-napoca/hourly",
+            "/api/weather/cluj-napoca/import-csv",
             "/api/experiment",
             "/api/experiment/sampling",
             "/api/experiment/anfis",

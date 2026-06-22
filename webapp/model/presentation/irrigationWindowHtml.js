@@ -92,7 +92,12 @@ sap.ui.define([
         }
         const match = String(window.label).match(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s+-\s+(\d{2}:\d{2})$/);
         return match
-            ? `${escapeHtml(match[1])} ${escapeHtml(`${match[2]}-${match[3]}`)}`
+            ? (
+                "<span class=\"overviewIrrigationWindow\">" +
+                    `<span class="overviewIrrigationWindowDate">${escapeHtml(match[1])}</span> ` +
+                    `<span class="overviewIrrigationWindowTime">${escapeHtml(`${match[2]} - ${match[3]}`)}</span>` +
+                "</span>"
+            )
             : escapeHtml(window.label);
     }
 

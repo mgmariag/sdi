@@ -5,7 +5,7 @@ from typing import Any
 
 from digital_twin.simulation.irrigation_controller.delivery import apply_event_delivery
 from digital_twin.simulation.shared.types import PotState
-from digital_twin.simulation.soil_model import number
+from digital_twin.domain.soil import DEFAULT_SOIL_MODEL as soil
 from digital_twin.simulation.valves.zones import (
     is_valve_managed_pot,
     valve_managed_zone_pots,
@@ -23,7 +23,7 @@ def execute_valve_zone_distribution(
     request_builder,
     event_metadata: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    minimum_runtime_min = max(0.0, number(event_metadata.get("minimum_valve_runtime_min"), 0.0))
+    minimum_runtime_min = max(0.0, soil.number(event_metadata.get("minimum_valve_runtime_min"), 0.0))
     public_event_metadata = {
         key: value
         for key, value in event_metadata.items()

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from digital_twin.domain.valves import VALVE_COUNT
+from digital_twin.domain.valve import DEFAULT_VALVE_LAYOUT
 
 SAFE_TAP_FLOW_L_MIN = 2.0
 VALVE_SWITCH_PAUSE_MIN = 1.0
@@ -39,7 +39,7 @@ def freshness_percent(latest_at: datetime | None, now: datetime) -> int:
 
 
 def confidence_score(freshness_percent: int, sensor_count: int, weather_rows: int) -> float:
-    sensor_factor = min(1.0, sensor_count / max(VALVE_COUNT, 1))
+    sensor_factor = min(1.0, sensor_count / max(DEFAULT_VALVE_LAYOUT.count, 1))
     weather_factor = min(1.0, weather_rows / 72.0)
     freshness_factor = max(0.0, min(1.0, freshness_percent / 100.0))
     return round(0.2 + 0.45 * freshness_factor + 0.25 * sensor_factor + 0.1 * weather_factor, 2)

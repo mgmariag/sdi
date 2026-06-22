@@ -1,11 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import math
 from dataclasses import dataclass
 from typing import Any
 
 from digital_twin.simulation.anfis.model import ANFIS
-from digital_twin.simulation.soil_model import clamp
+from digital_twin.domain.soil import DEFAULT_SOIL_MODEL as soil
 
 
 @dataclass
@@ -16,8 +16,8 @@ class AnfisProbabilityCalibrator:
     def fit(cls, model: ANFIS, dataset: list[dict[str, float | str]], max_bins: int = 8) -> "AnfisProbabilityCalibrator":
         pairs = sorted(
             (
-                clamp(model.predict(item), 0.0, 1.0),
-                clamp(float(item["target_probability"]), 0.0, 1.0),
+                soil.clamp(model.predict(item), 0.0, 1.0),
+                soil.clamp(float(item["target_probability"]), 0.0, 1.0),
             )
             for item in dataset
             if item.get("target_probability") is not None
@@ -51,11 +51,11 @@ class AnfisProbabilityCalibrator:
                     ]
                 )
 
-        points = [(float(raw), clamp(float(target), 0.0, 1.0)) for raw, target, _ in pooled]
+        points = [(float(raw), soil.clamp(float(target), 0.0, 1.0)) for raw, target, _ in pooled]
         return cls(points)
 
     def predict(self, raw_probability: float) -> float:
-        raw = clamp(float(raw_probability), 0.0, 1.0)
+        raw = soil.clamp(float(raw_probability), 0.0, 1.0)
         if not self.points:
             return raw
         if raw <= self.points[0][0]:
@@ -68,7 +68,7 @@ class AnfisProbabilityCalibrator:
             if raw <= right_raw:
                 span = max(right_raw - left_raw, 1e-9)
                 ratio = (raw - left_raw) / span
-                return clamp(left_target + (right_target - left_target) * ratio, 0.0, 1.0)
+                return soil.clamp(left_target + (right_target - left_target) * ratio, 0.0, 1.0)
         return raw
 
     def summary(self) -> dict[str, Any]:

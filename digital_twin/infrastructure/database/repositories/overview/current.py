@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta
+from decimal import Decimal
 from typing import Any
 
 from psycopg.rows import dict_row
 
-from digital_twin.core.time import now_local
+from digital_twin.application.clock import ApplicationClock
 from digital_twin.infrastructure.database.connection import get_connection
-from digital_twin.infrastructure.database.repositories._utils import _json_ready
 from digital_twin.infrastructure.database.repositories.overview._common import (
     NO_IRRIGATION_PLANNED_LABEL,
     NO_IRRIGATION_RECORDED_LABEL,
@@ -31,8 +31,11 @@ from digital_twin.infrastructure.database.repositories.overview.valve_plan impor
 class OverviewRepository:
     """Read model for the dashboard shown before an experiment is selected."""
 
+    def __init__(self, clock: ApplicationClock | None = None) -> None:
+        self.clock = clock or ApplicationClock()
+
     def current(self) -> dict[str, Any]:
-        now = now_local().replace(tzinfo=None)
+        now = self.clock.now().replace(tzinfo=None)
         today = now.date()
         with get_connection(row_factory=dict_row) as conn:
             active_pots = int(
@@ -207,3 +210,15 @@ class OverviewRepository:
                 }
             )
         return {"total_pots": total, "items": items}
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_ready(item) for key, item in value.items()}
+    if isinstance(value, Decimal):
+        return float(value)
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value

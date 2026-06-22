@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import datetime, time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
-from digital_twin.infrastructure.weather import open_meteo
-
-CLUJ_NAPOCA = open_meteo.LOCATION
+from digital_twin.infrastructure.open_meteo import OpenMeteoClient
 
 WEATHER_INSERT_COLUMNS = [
     "location_name",
@@ -62,92 +59,72 @@ WEATHER_COMPARISON_COLUMNS = [
 ]
 
 
-def filter_weather_rows_by_date(rows: list[dict[str, Any]], start: date, end: date) -> list[dict[str, Any]]:
-    return open_meteo.filter_weather_rows_by_date(rows, start, end)
+class WeatherRows:
+    """Builds and normalizes weather row payloads."""
 
+    def __init__(self, open_meteo: OpenMeteoClient | None = None) -> None:
+        self.open_meteo = open_meteo or OpenMeteoClient()
 
-def fill_missing_local_weather_hours(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not rows:
-        return rows
+    def fill_missing_local_weather_hours(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not rows:
+            return rows
 
-    by_bucket = {row["observed_local_at"]: row for row in rows}
-    dates = sorted({bucket.date() for bucket in by_bucket})
-    for cursor in dates:
-        for hour in range(24):
-            bucket = datetime.combine(cursor, time(hour, 0))
-            if bucket not in by_bucket:
-                buckets = sorted(by_bucket)
-                by_bucket[bucket] = _synthetic_local_weather_row(bucket, buckets, by_bucket)
+        by_bucket = {row["observed_local_at"]: row for row in rows}
+        dates = sorted({bucket.date() for bucket in by_bucket})
+        for cursor in dates:
+            for hour in range(24):
+                bucket = datetime.combine(cursor, time(hour, 0))
+                if bucket not in by_bucket:
+                    buckets = sorted(by_bucket)
+                    by_bucket[bucket] = self._synthetic_local_weather_row(bucket, buckets, by_bucket)
 
-    return [by_bucket[bucket] for bucket in sorted(by_bucket)]
+        return [by_bucket[bucket] for bucket in sorted(by_bucket)]
 
+    def parse_open_meteo_csv(self, csv_path: str | Path) -> dict[str, Any]:
+        parsed = self.open_meteo.parse_csv(csv_path)
+        return {
+            **parsed,
+            "rows": self.fill_missing_local_weather_hours(parsed["rows"]),
+        }
 
-def parse_open_meteo_csv(csv_path: str | Path) -> dict[str, Any]:
-    parsed = open_meteo.parse_csv(csv_path)
-    return {
-        **parsed,
-        "rows": fill_missing_local_weather_hours(parsed["rows"]),
-    }
+    def _synthetic_local_weather_row(
+        self,
+        bucket: datetime,
+        sorted_buckets: list[datetime],
+        by_bucket: dict[datetime, dict[str, Any]],
+    ) -> dict[str, Any]:
+        previous_bucket = max((item for item in sorted_buckets if item < bucket), default=None)
+        next_bucket = min((item for item in sorted_buckets if item > bucket), default=None)
+        previous = by_bucket.get(previous_bucket) if previous_bucket else None
+        following = by_bucket.get(next_bucket) if next_bucket else None
+        template = previous or following
+        if template is None:
+            raise ValueError("Cannot synthesize weather row without a neighboring row")
 
+        row = dict(template)
+        row["observed_local_at"] = bucket
+        row["observed_date"] = bucket.date()
+        row["observed_hour"] = bucket.hour
+        row["observed_at"] = bucket.replace(tzinfo=self.open_meteo.location.timezone_info())
+        row["raw_payload"] = {
+            **(template.get("raw_payload") or {}),
+            "synthetic_local_hour": True,
+            "filled_from_previous": previous_bucket.isoformat() if previous_bucket else None,
+            "filled_from_next": next_bucket.isoformat() if next_bucket else None,
+        }
 
-def year_chunks(start: date, end: date):
-    return open_meteo.year_chunks(start, end)
+        if previous and following:
+            for column in WEATHER_COMPARISON_COLUMNS:
+                row[column] = self._interpolated_weather_value(previous.get(column), following.get(column), template.get(column))
+        return row
 
-
-def local_bucket(day: date) -> datetime:
-    return open_meteo.local_bucket(day)
-
-
-def today_local() -> date:
-    return open_meteo.today_local()
-
-
-def local_bucket_from_observed_at(value: datetime) -> datetime:
-    return open_meteo.local_bucket_from_observed_at(value)
-
-
-def json_ready(value):
-    return open_meteo.json_ready(value)
-
-
-def _synthetic_local_weather_row(
-    bucket: datetime,
-    sorted_buckets: list[datetime],
-    by_bucket: dict[datetime, dict[str, Any]],
-) -> dict[str, Any]:
-    previous_bucket = max((item for item in sorted_buckets if item < bucket), default=None)
-    next_bucket = min((item for item in sorted_buckets if item > bucket), default=None)
-    previous = by_bucket.get(previous_bucket) if previous_bucket else None
-    following = by_bucket.get(next_bucket) if next_bucket else None
-    template = previous or following
-    if template is None:
-        raise ValueError("Cannot synthesize weather row without a neighboring row")
-
-    row = dict(template)
-    row["observed_local_at"] = bucket
-    row["observed_date"] = bucket.date()
-    row["observed_hour"] = bucket.hour
-    row["observed_at"] = bucket.replace(tzinfo=ZoneInfo(CLUJ_NAPOCA["timezone"]))
-    row["raw_payload"] = {
-        **(template.get("raw_payload") or {}),
-        "synthetic_local_hour": True,
-        "filled_from_previous": previous_bucket.isoformat() if previous_bucket else None,
-        "filled_from_next": next_bucket.isoformat() if next_bucket else None,
-    }
-
-    if previous and following:
-        for column in WEATHER_COMPARISON_COLUMNS:
-            row[column] = _interpolated_weather_value(previous.get(column), following.get(column), template.get(column))
-    return row
-
-
-def _interpolated_weather_value(previous, following, default):
-    if previous is None or following is None:
+    def _interpolated_weather_value(self, previous, following, default):
+        if previous is None or following is None:
+            return default
+        if isinstance(previous, bool) and isinstance(following, bool):
+            return previous or following
+        if isinstance(previous, Decimal) or isinstance(following, Decimal):
+            return (Decimal(str(previous)) + Decimal(str(following))) / Decimal("2")
+        if isinstance(previous, (int, float)) and isinstance(following, (int, float)):
+            return (previous + following) / 2
         return default
-    if isinstance(previous, bool) and isinstance(following, bool):
-        return previous or following
-    if isinstance(previous, Decimal) or isinstance(following, Decimal):
-        return (Decimal(str(previous)) + Decimal(str(following))) / Decimal("2")
-    if isinstance(previous, (int, float)) and isinstance(following, (int, float)):
-        return (previous + following) / 2
-    return default

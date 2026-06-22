@@ -1,41 +1,52 @@
 from __future__ import annotations
 
-DEFAULT_WEATHER_LOCATION_NAME = "Cluj-Napoca"
-DEFAULT_WEATHER_LATITUDE = 46.7712
-DEFAULT_WEATHER_LONGITUDE = 23.6236
-DEFAULT_LOCAL_TIMEZONE = "Europe/Bucharest"
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
+from zoneinfo import ZoneInfo
 
-DEFAULT_WEATHER_LOCATION = {
-    "location_name": DEFAULT_WEATHER_LOCATION_NAME,
-    "latitude": DEFAULT_WEATHER_LATITUDE,
-    "longitude": DEFAULT_WEATHER_LONGITUDE,
-    "timezone": DEFAULT_LOCAL_TIMEZONE,
-}
 
-OPEN_METEO_ARCHIVE_SOURCE = "open-meteo-archive"
-OPEN_METEO_FORECAST_SOURCE = "open-meteo-forecast"
-ESTIMATED_WEATHER_SOURCE = "estimated-weather"
+@dataclass(frozen=True)
+class WeatherLocation:
+    name: str
+    latitude: float
+    longitude: float
+    timezone: str
 
-WEATHER_REFRESH_STATUS_RUNNING = "running"
-WEATHER_REFRESH_STATUS_COMPLETED = "completed"
-WEATHER_REFRESH_STATUS_FAILED = "failed"
-WEATHER_REFRESH_STATUSES = (
-    WEATHER_REFRESH_STATUS_RUNNING,
-    WEATHER_REFRESH_STATUS_COMPLETED,
-    WEATHER_REFRESH_STATUS_FAILED,
+    def as_dict(self) -> dict[str, float | str]:
+        return {
+            "location_name": self.name,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "timezone": self.timezone,
+        }
+
+    def open_meteo_params(self) -> dict[str, float | str]:
+        return {
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "timezone": self.timezone,
+        }
+
+    def timezone_info(self) -> ZoneInfo:
+        return ZoneInfo(self.timezone)
+
+DEFAULT_WEATHER_LOCATION = WeatherLocation(
+    name="Cluj-Napoca",
+    latitude=46.7712,
+    longitude=23.6236,
+    timezone="Europe/Bucharest",
 )
+_LOCAL_TZ = DEFAULT_WEATHER_LOCATION.timezone_info()
 
-__all__ = [
-    "DEFAULT_LOCAL_TIMEZONE",
-    "DEFAULT_WEATHER_LATITUDE",
-    "DEFAULT_WEATHER_LOCATION",
-    "DEFAULT_WEATHER_LOCATION_NAME",
-    "DEFAULT_WEATHER_LONGITUDE",
-    "ESTIMATED_WEATHER_SOURCE",
-    "OPEN_METEO_ARCHIVE_SOURCE",
-    "OPEN_METEO_FORECAST_SOURCE",
-    "WEATHER_REFRESH_STATUSES",
-    "WEATHER_REFRESH_STATUS_COMPLETED",
-    "WEATHER_REFRESH_STATUS_FAILED",
-    "WEATHER_REFRESH_STATUS_RUNNING",
-]
+
+def local_observed_at(weather: dict[str, Any]) -> datetime:
+    observed_local_at = weather.get("observed_local_at")
+    if observed_local_at is not None:
+        if observed_local_at.tzinfo is None:
+            return observed_local_at.replace(tzinfo=_LOCAL_TZ)
+        return observed_local_at.astimezone(_LOCAL_TZ)
+    observed_at = weather["observed_at"]
+    if observed_at.tzinfo is None:
+        return observed_at.replace(tzinfo=_LOCAL_TZ)
+    return observed_at.astimezone(_LOCAL_TZ)

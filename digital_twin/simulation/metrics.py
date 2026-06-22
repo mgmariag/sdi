@@ -8,10 +8,8 @@ from digital_twin.simulation.irrigation_controller.defaults import (
     DEFAULT_IRRIGATION_POLICY,
 )
 from digital_twin.simulation.shared.constants import HOURLY_CHART_MAX_RANGE_DAYS
-from digital_twin.simulation.soil_model import (
-    local_observed_at,
-    number,
-)
+from digital_twin.domain.soil import DEFAULT_SOIL_MODEL as soil
+from digital_twin.domain.weather import local_observed_at
 
 
 def uses_hourly_chart(start_date: date, end_date: date) -> bool:
@@ -38,7 +36,7 @@ def daily_moisture_snapshot_label(day: date, observed_at: datetime, day_profile:
         return f"before_{slot}"
 
     hour = observed_at.hour
-    max_temp = number(day_profile.get("max_temperature_c"), 20.0)
+    max_temp = soil.number(day_profile.get("max_temperature_c"), 20.0)
     if day.month in {12, 1, 2, 3} and hour == 13:
         return "after_winter_check"
     if hour == 9:
@@ -143,13 +141,16 @@ def sampling_moisture_chart_summary(
     has_sample_flags = any("sparse_sensor_sample" in row for row in rows)
 
     for index, row in enumerate(rows):
-        raw_sparse = number(row.get("sparse_moisture"), None)
+        raw_sparse = soil.number(row.get("sparse_moisture"), None)
         if raw_sparse is not None:
             row["sparse_moisture_raw"] = round(raw_sparse, 2)
 
         sample_now = bool(row.get("sparse_sensor_sample")) if has_sample_flags else index % sample_interval_rows == 0
         if sample_now:
             sample_count += 1
+            baseline_moisture = soil.number(row.get("baseline_moisture"), None)
+            if baseline_moisture is not None:
+                row["sparse_moisture"] = round(baseline_moisture, 2)
 
     return {"sample_count": sample_count, "sample_interval_rows": sample_interval_rows}
 

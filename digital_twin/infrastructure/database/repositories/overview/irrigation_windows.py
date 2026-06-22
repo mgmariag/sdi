@@ -3,13 +3,15 @@ from __future__ import annotations
 from datetime import datetime, time, timedelta
 from typing import Any
 
-from digital_twin.core.config import get_settings
-from digital_twin.core.time import local_timezone
+from digital_twin.application.clock import ApplicationClock
+from digital_twin.infrastructure.config import get_settings
 from digital_twin.infrastructure.database.repositories.overview._common import (
     PHYSICAL_ACTUATION_EXPERIMENT_TYPE,
     number as _number,
 )
 from digital_twin.infrastructure.database.repositories.overview.activity import activity_window
+
+_clock = ApplicationClock()
 
 
 def next_planned_irrigation(conn, now: datetime) -> dict[str, Any] | None:
@@ -174,7 +176,7 @@ def _parse_local_datetime(value: Any) -> datetime | None:
         return None
     if parsed.tzinfo is None:
         return parsed
-    return parsed.astimezone(local_timezone()).replace(tzinfo=None)
+    return parsed.astimezone(_clock.local_timezone()).replace(tzinfo=None)
 
 
 def _event_end_at(event: dict[str, Any], start: datetime) -> datetime:

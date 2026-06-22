@@ -3,11 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import date, datetime, time
 
-from digital_twin.domain.sensors import (
-    ACTUAL_SENSOR_SOURCE,
-    DEFAULT_SENSOR_SOURCE,
-)
-from digital_twin.domain.sensors import SPARSE_FORECAST_SENSOR_SOURCE
+from digital_twin.domain.sensor import SensorSource
 from digital_twin.simulation.metrics import (
     daily_moisture_summary,
     new_daily_moisture_tracker,
@@ -17,9 +13,7 @@ from digital_twin.simulation.metrics import (
 )
 from digital_twin.simulation.shared.constants import LOCAL_TZ
 from digital_twin.simulation.shared.types import PotState
-from digital_twin.simulation.state.projection import (
-    initialize_states_from_first_day_sensor_readings,
-)
+from digital_twin.simulation.state.projection import StateProjector
 from digital_twin.simulation.sensors.calibration import (
     apply_calibration_reading,
     apply_sensor_calibration_marker,
@@ -37,7 +31,7 @@ from digital_twin.simulation.valves.rollups import (
 class SimulationSensorStateTests(unittest.TestCase):
     def test_simulated_sensor_reading_does_not_override_physical_state(self) -> None:
         state = PotState(moisture=31.0)
-        reading = _sensor_reading(DEFAULT_SENSOR_SOURCE, 52.0)
+        reading = _sensor_reading(SensorSource.DEFAULT.value, 52.0)
 
         result = apply_sensor_reading(
             state,
@@ -52,7 +46,7 @@ class SimulationSensorStateTests(unittest.TestCase):
 
     def test_actual_sensor_reading_overrides_physical_state(self) -> None:
         state = PotState(moisture=31.0)
-        reading = _sensor_reading(ACTUAL_SENSOR_SOURCE, 52.0)
+        reading = _sensor_reading(SensorSource.ACTUAL.value, 52.0)
 
         apply_sensor_reading(
             state,
@@ -66,7 +60,7 @@ class SimulationSensorStateTests(unittest.TestCase):
 
     def test_stored_sensor_marker_calibrates_state_at_530_anchor(self) -> None:
         state = PotState(moisture=31.0)
-        reading = _sensor_reading(DEFAULT_SENSOR_SOURCE, 52.0)
+        reading = _sensor_reading(SensorSource.DEFAULT.value, 52.0)
 
         apply_sensor_calibration_marker(
             state,
@@ -81,7 +75,7 @@ class SimulationSensorStateTests(unittest.TestCase):
 
     def test_hot_day_evening_marker_calibrates_state(self) -> None:
         state = PotState(moisture=31.0)
-        reading = _sensor_reading(DEFAULT_SENSOR_SOURCE, 44.0)
+        reading = _sensor_reading(SensorSource.DEFAULT.value, 44.0)
 
         apply_sensor_calibration_marker(
             state,
@@ -96,7 +90,7 @@ class SimulationSensorStateTests(unittest.TestCase):
 
     def test_stored_associated_sensor_calibration_replaces_prior_state(self) -> None:
         state = PotState(moisture=12.0)
-        reading = _sensor_reading(DEFAULT_SENSOR_SOURCE, 52.0)
+        reading = _sensor_reading(SensorSource.DEFAULT.value, 52.0)
         sensor_context = {
             "available": True,
             "lookup": {
@@ -125,7 +119,7 @@ class SimulationSensorStateTests(unittest.TestCase):
     def test_initial_state_anchor_uses_associated_sensor_readings(self) -> None:
         start_date = date(2026, 5, 21)
         states = {1: PotState(moisture=12.0), 2: PotState(moisture=18.0)}
-        reading = _sensor_reading(DEFAULT_SENSOR_SOURCE, 52.0)
+        reading = _sensor_reading(SensorSource.DEFAULT.value, 52.0)
         sensor_context = {
             "available": True,
             "lookup": {
@@ -140,7 +134,7 @@ class SimulationSensorStateTests(unittest.TestCase):
             },
         }
 
-        anchor = initialize_states_from_first_day_sensor_readings(
+        anchor = StateProjector().initialize_from_first_day_sensor_readings(
             states,
             [_associated_pot(1), _associated_pot(2)],
             sensor_context,
@@ -153,7 +147,7 @@ class SimulationSensorStateTests(unittest.TestCase):
 
     def test_evening_marker_is_skipped_when_day_is_not_hot(self) -> None:
         state = PotState(moisture=31.0)
-        reading = _sensor_reading(DEFAULT_SENSOR_SOURCE, 44.0)
+        reading = _sensor_reading(SensorSource.DEFAULT.value, 44.0)
 
         apply_sensor_calibration_marker(
             state,
@@ -206,23 +200,24 @@ class SimulationSensorStateTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(applied)
-        self.assertEqual(applied["source"], SPARSE_FORECAST_SENSOR_SOURCE)
+        self.assertEqual(applied["source"], SensorSource.SPARSE_FORECAST.value)
         self.assertEqual(applied["associated_sensor_id"], 1)
         self.assertEqual(applied["association_source"], "default_strategy_reference")
         self.assertEqual(sparse_states[2].moisture, 37.0)
         self.assertEqual(applied["sensor_blend_weight"], 1.0)
 
-    def test_sampling_chart_summary_keeps_simulated_sparse_moisture(self) -> None:
+    def test_sampling_chart_summary_syncs_sample_points_and_keeps_raw_sparse_moisture(self) -> None:
         rows = [
             {"baseline_moisture": 40.0, "sparse_moisture": 40.0, "sparse_sensor_sample": True},
             {"baseline_moisture": 42.0, "sparse_moisture": 39.25, "sparse_sensor_sample": False},
-            {"baseline_moisture": 43.0, "sparse_moisture": 38.75, "sparse_sensor_sample": False},
+            {"baseline_moisture": 43.0, "sparse_moisture": 38.75, "sparse_sensor_sample": True},
         ]
 
         summary = sampling_moisture_chart_summary(rows, sample_interval_hours=72, hourly=False)
 
-        self.assertEqual([row["sparse_moisture"] for row in rows], [40.0, 39.25, 38.75])
-        self.assertEqual(summary["sample_count"], 1)
+        self.assertEqual([row["sparse_moisture"] for row in rows], [40.0, 39.25, 43.0])
+        self.assertEqual([row["sparse_moisture_raw"] for row in rows], [40.0, 39.25, 38.75])
+        self.assertEqual(summary["sample_count"], 2)
 
     def test_sparse_daily_summary_uses_post_morning_marker(self) -> None:
         rows = [_weather_hour(date(2026, 5, 21), hour) for hour in range(7, 11)]

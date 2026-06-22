@@ -5,8 +5,8 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-COPY requirements-backend.txt .
-RUN pip install --no-cache-dir -r requirements-backend.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY digital_twin ./digital_twin
 

@@ -3,9 +3,9 @@ from __future__ import annotations
 from datetime import date, datetime, time
 from typing import Any
 
-from digital_twin.domain.sensors import ACTUAL_SENSOR_SOURCE, DEFAULT_SENSOR_SOURCE
+from digital_twin.domain.sensor import SensorSource
 from digital_twin.simulation.shared.constants import LOCAL_TZ
-from digital_twin.simulation.soil_model import local_observed_at
+from digital_twin.domain.weather import local_observed_at
 from digital_twin.simulation.sensors.calibration import (
     _sensor_hour_is_future,
     lookup_sensor_reading,
@@ -71,7 +71,7 @@ def _sensor_line_metadata_for_hour(sensor_context: dict[str, Any], experiment_da
     slot_time = sensor_lookup_time(observed_at)
     for sensor_id in sensor_ids:
         reading = lookup_sensor_reading(lookup, experiment_date, slot_time, int(sensor_id))
-        if reading is None or reading.get("source") != ACTUAL_SENSOR_SOURCE:
+        if reading is None or reading.get("source") != SensorSource.ACTUAL.value:
             return sensor_metadata(simulated=True, prediction=False, has_reading_for_day=has_reading_for_day)
     return sensor_metadata(simulated=False, prediction=False, has_reading_for_day=has_reading_for_day)
 
@@ -99,9 +99,9 @@ def _sensor_line_metadata_for_day(sensor_context: dict[str, Any], experiment_dat
     actual_sensor_ids = {
         int(row["sensor_id"])
         for row in rows
-        if row.get("source") == ACTUAL_SENSOR_SOURCE
+        if row.get("source") == SensorSource.ACTUAL.value
     }
-    has_non_actual = any(row.get("source") != ACTUAL_SENSOR_SOURCE for row in rows)
+    has_non_actual = any(row.get("source") != SensorSource.ACTUAL.value for row in rows)
     simulated = has_non_actual or actual_sensor_ids != sensor_ids
     return sensor_metadata(simulated=simulated, prediction=False, has_reading_for_day=has_reading_for_day)
 
@@ -160,7 +160,7 @@ def sensor_summary_fields(sensor_context: dict[str, Any]) -> dict[str, Any]:
     future_dates = sensor_context.get("future_dates", [])
     fields = {
         "sensorDataUsed": bool(sensor_context.get("available")),
-        "sensorSource": sensor_context.get("source", DEFAULT_SENSOR_SOURCE),
+        "sensorSource": sensor_context.get("source", SensorSource.DEFAULT.value),
         "sensorRows": sensor_context.get("row_count", 0),
         "sensorLocationCount": len(sensor_context.get("sensor_ids", [])),
         "sensorAssociatedPotCount": sensor_context.get("associated_pot_count", 0),

@@ -5,14 +5,10 @@ from datetime import datetime
 
 from digital_twin.simulation.irrigation_controller.defaults import (
     DEFAULT_FUZZY_POLICY,
+    DEFAULT_IRRIGATION_REQUEST_BUILDER,
     DEFAULT_IRRIGATION_POLICY,
 )
-from digital_twin.simulation.irrigation_controller.fuzzy_decision import (
-    make_fuzzy_dt_decision,
-)
-from digital_twin.simulation.irrigation_controller.requests import (
-    apply_baseline_irrigation_event,
-)
+from digital_twin.simulation.irrigation_controller.delivery import apply_event_delivery
 from digital_twin.simulation.shared.constants import LOCAL_TZ
 from digital_twin.simulation.shared.types import PotState
 
@@ -20,24 +16,28 @@ from digital_twin.simulation.shared.types import PotState
 class BaselineIrrigationControllerTests(unittest.TestCase):
     def test_baseline_event_doses_from_actual_current_moisture(self) -> None:
         state = PotState(moisture=5.0)
-
-        event = apply_baseline_irrigation_event(
+        pot = _pot()
+        weather = {"observed_local_at": datetime(2026, 5, 21, 6, 0, tzinfo=LOCAL_TZ)}
+        decision = {
+            "slot": "morning",
+            "target_moisture_pct": 35.0,
+            "current_moisture_pct": 5.0,
+            "dose_factor": 1.0,
+        }
+        request = DEFAULT_IRRIGATION_REQUEST_BUILDER.build(pot, weather, decision)
+        event = apply_event_delivery(
             state,
-            _pot(),
-            {"observed_local_at": datetime(2026, 5, 21, 6, 0, tzinfo=LOCAL_TZ)},
-            {
-                "slot": "morning",
-                "target_moisture_pct": 35.0,
-                "current_moisture_pct": 5.0,
-                "dose_factor": 1.0,
-            },
+            pot,
+            request,
+            request["requested_volume_ml"],
+            request.get("duration_min"),
         )
 
         self.assertGreater(event["planned_volume_ml"], 0.0)
         self.assertAlmostEqual(state.moisture, 35.0, places=2)
 
-    def test_domain_policy_exposes_neutral_irrigation_request(self) -> None:
-        event = DEFAULT_IRRIGATION_POLICY.irrigation_request(
+    def test_request_builder_exposes_neutral_irrigation_request(self) -> None:
+        event = DEFAULT_IRRIGATION_REQUEST_BUILDER.build(
             _pot(),
             {"observed_local_at": datetime(2026, 5, 21, 6, 0, tzinfo=LOCAL_TZ)},
             {
@@ -51,8 +51,41 @@ class BaselineIrrigationControllerTests(unittest.TestCase):
         self.assertGreater(event["planned_volume_ml"], 0.0)
         self.assertEqual(event["slot"], "morning")
 
+    def test_domain_policy_owns_safety_threshold(self) -> None:
+        pot = {
+            **_pot(),
+            "plant_type_code": "herbs",
+            "size_class": "small",
+        }
+
+        threshold = DEFAULT_IRRIGATION_POLICY.safety_threshold(
+            pot,
+            {**day_profile(max_temperature_c=32.0), "heatwave_day": True, "dry_windy_day": True},
+            "morning",
+        )
+
+        self.assertEqual(threshold, 27.0)
+
+    def test_domain_policy_detects_emergency_dryness(self) -> None:
+        self.assertTrue(
+            DEFAULT_IRRIGATION_POLICY.has_emergency_dryness(
+                PotState(moisture=10.0),
+                _pot(),
+                datetime(2026, 7, 21).date(),
+                datetime(2026, 7, 21, 12, 0, tzinfo=LOCAL_TZ),
+            )
+        )
+        self.assertFalse(
+            DEFAULT_IRRIGATION_POLICY.has_emergency_dryness(
+                PotState(moisture=10.0),
+                _pot(),
+                datetime(2026, 7, 21).date(),
+                datetime(2026, 7, 21, 8, 0, tzinfo=LOCAL_TZ),
+            )
+        )
+
     def test_fuzzy_prescription_signal_can_activate_above_fixed_threshold(self) -> None:
-        decision = make_fuzzy_dt_decision(
+        decision = DEFAULT_FUZZY_POLICY.make_decision(
             PotState(moisture=38.0),
             _pot(),
             {"id": 1, "observed_local_at": datetime(2026, 5, 21, 8, 0, tzinfo=LOCAL_TZ), "temperature_c": 32.0},
@@ -65,7 +98,7 @@ class BaselineIrrigationControllerTests(unittest.TestCase):
         self.assertGreater(decision["planned_volume_ml"], 0.0)
 
     def test_fuzzy_prescribes_when_moisture_is_below_trigger_threshold(self) -> None:
-        decision = make_fuzzy_dt_decision(
+        decision = DEFAULT_FUZZY_POLICY.make_decision(
             PotState(moisture=15.0),
             _pot(),
             {"id": 1, "observed_local_at": datetime(2026, 5, 21, 8, 0, tzinfo=LOCAL_TZ), "temperature_c": 30.0},

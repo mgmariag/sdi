@@ -198,7 +198,7 @@ sap.ui.define([
         const placementKey = Array.isArray(items)
             ? items.map((item) => item.pot_id || item.sensor_id || item.id).join(",")
             : "";
-        return [experiment, "weather-popover-v7-backend-score", range.start, range.end, placementKey, extraKey || ""].join("|");
+        return [experiment, "sampling-sync-v17", range.start, range.end, placementKey, extraKey || ""].join("|");
     }
 
     function experimentResultCache(controller) {

@@ -3,8 +3,8 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
-from digital_twin.domain.valves import VALVE_ZONE_DESIGN, VALVE_ZONE_ORDER
-from digital_twin.simulation.irrigation_controller.environment import is_outdoor
+from digital_twin.domain.pot import Pot
+from digital_twin.domain.valve import DEFAULT_VALVE_LAYOUT
 
 
 def pots_by_valve_zone(pots: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -15,7 +15,7 @@ def pots_by_valve_zone(pots: list[dict[str, Any]]) -> dict[str, list[dict[str, A
 
 
 def is_valve_managed_pot(pot: dict[str, Any], day: date) -> bool:
-    return is_outdoor(pot, day)
+    return Pot.from_mapping(pot).is_outdoor(day)
 
 
 def valve_managed_zone_pots(zone_pots: dict[str, list[dict[str, Any]]], zone: str, day: date) -> list[dict[str, Any]]:
@@ -23,7 +23,5 @@ def valve_managed_zone_pots(zone_pots: dict[str, list[dict[str, Any]]], zone: st
 
 
 def valve_number_for_zone(zone: str) -> int:
-    if zone in VALVE_ZONE_ORDER:
-        return VALVE_ZONE_ORDER[zone]
-    return len(VALVE_ZONE_DESIGN) + 1
+    return DEFAULT_VALVE_LAYOUT.fallback_valve_number_for_zone(zone)
 

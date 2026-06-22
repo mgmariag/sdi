@@ -1,0 +1,1 @@
+"""Sensor application use cases."""

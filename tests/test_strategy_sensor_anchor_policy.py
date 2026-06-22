@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import unittest
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from unittest.mock import patch
 
-from digital_twin.domain.sensors import ACTUAL_SENSOR_SOURCE
-from digital_twin.simulation import engine
+from digital_twin.domain.sensor import SensorSource
 from digital_twin.simulation.anfis.controller import (
     AnfisModelController,
     AnfisProbabilityCalibrator,
 )
+from digital_twin.simulation.engine import SimulationEngine
 from digital_twin.simulation.anfis.model import ANFIS
+from digital_twin.simulation.sampling.execution import SparseSamplingRunner
 from digital_twin.simulation.shared.constants import LOCAL_TZ
 from digital_twin.simulation.shared.types import (
     ExperimentSnapshot,
@@ -23,13 +24,14 @@ from digital_twin.simulation.sensors.context import sensor_control_pots
 
 
 class StrategySensorAnchorPolicyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = SimulationEngine()
+
     def test_fuzzy_dt_uses_initial_sensor_anchor_without_continuous_calibration(self) -> None:
         snapshot = _snapshot()
+        engine = _NoWarmupSimulationEngine()
 
         with patch(
-            "digital_twin.simulation.engine.resolve_simulation_snapshot",
-            side_effect=AssertionError("strategy comparison should start from selected snapshot"),
-        ), patch(
             "digital_twin.simulation.sensors.calibration.apply_sensor_calibration_marker",
             side_effect=AssertionError("continuous calibration should not run"),
         ):
@@ -49,11 +51,9 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
 
     def test_anfis_uses_initial_sensor_anchor_without_continuous_calibration(self) -> None:
         snapshot = _snapshot()
+        engine = _NoWarmupSimulationEngine()
 
         with patch(
-            "digital_twin.simulation.engine.resolve_simulation_snapshot",
-            side_effect=AssertionError("strategy comparison should start from selected snapshot"),
-        ), patch(
             "digital_twin.simulation.sensors.calibration.apply_sensor_calibration_marker",
             side_effect=AssertionError("continuous calibration should not run"),
         ):
@@ -74,12 +74,10 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
 
     def test_fuzzy_comparison_baseline_uses_calibrated_reference_policy(self) -> None:
         snapshot = _snapshot()
+        engine = _ExperimentStartSimulationEngine()
 
         with patch(
-            "digital_twin.simulation.engine.state_simulation_start",
-            return_value=snapshot.start_date,
-        ), patch(
-            "digital_twin.simulation.baseline.execution.sensor_calibration.apply_sensor_calibration_marker",
+            "digital_twin.simulation.daily_irrigation.sensor_calibration.apply_sensor_calibration_marker",
             wraps=apply_sensor_calibration_marker,
         ) as calibration_marker:
             result = engine.run_daily_fuzzy_dt_experiment(
@@ -100,12 +98,10 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
 
     def test_anfis_comparison_baseline_uses_calibrated_reference_policy(self) -> None:
         snapshot = _snapshot()
+        engine = _ExperimentStartSimulationEngine()
 
         with patch(
-            "digital_twin.simulation.engine.state_simulation_start",
-            return_value=snapshot.start_date,
-        ), patch(
-            "digital_twin.simulation.baseline.execution.sensor_calibration.apply_sensor_calibration_marker",
+            "digital_twin.simulation.daily_irrigation.sensor_calibration.apply_sensor_calibration_marker",
             wraps=apply_sensor_calibration_marker,
         ) as calibration_marker:
             result = engine.run_daily_anfis_experiment(
@@ -128,6 +124,7 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
 
     def test_sampling_reuses_baseline_warmed_start_state(self) -> None:
         snapshot = _snapshot()
+        engine = _NoWarmupSimulationEngine()
         baseline_result = {
             "summary": {
                 "stateSimulationStartDate": "2026-04-01",
@@ -142,17 +139,13 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
             },
         }
 
-        with patch(
-            "digital_twin.simulation.engine.resolve_simulation_snapshot",
-            side_effect=AssertionError("sampling should reuse baseline warm-up state"),
-        ):
-            result = engine.run_sparse_daily_irrigation_with_snapshot(
-                snapshot.start_date,
-                snapshot.end_date,
-                sample_interval_hours=48,
-                snapshot=snapshot,
-                baseline_result=baseline_result,
-            )
+        result = engine.run_sparse_daily_irrigation_with_snapshot(
+            snapshot.start_date,
+            snapshot.end_date,
+            sample_interval_hours=48,
+            snapshot=snapshot,
+            baseline_result=baseline_result,
+        )
 
         summary = result["summary"]
         self.assertEqual(summary["stateAnchorPolicy"], "baseline_warmup_reuse")
@@ -162,17 +155,118 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
         self.assertEqual(summary["stateSensorAnchor"]["anchored_pots"], 1)
         self.assertEqual(summary["baselineWarmupStateSimulationStartDate"], "2026-04-01")
 
+    def test_sampling_forecast_sample_calibrates_associated_pot_from_probe_state(self) -> None:
+        snapshot = _two_pot_snapshot(sensor_moisture=35.0, nonsensor_moisture=12.0)
+        sensor_pot, associated_pot = snapshot.pots
+        snapshot.sensor_context.update(
+            {
+                "lookup": {},
+                "future_dates": [snapshot.start_date],
+                "associations": {
+                    1: {"sensor_id": 1, "direct": True, "distance": 0.0},
+                    2: {"sensor_id": 1, "direct": False, "distance": 1.0},
+                },
+                "sensor_pots": {1: sensor_pot},
+            }
+        )
+        runner = SparseSamplingRunner(
+            start_date=snapshot.start_date,
+            end_date=snapshot.end_date,
+            sample_interval_hours=72,
+            persist=False,
+            selected_snapshot=snapshot,
+            simulation_start_date=snapshot.start_date,
+            simulation_snapshot=snapshot,
+            state_anchor_policy="baseline_warmup_reuse",
+            warmup_reuse_policy="baseline_start_state_reuse",
+        )
+        runner.states[associated_pot["id"]].moisture = 12.0
+        runner.probe_states[associated_pot["id"]].moisture = 47.0
+
+        sample_sensor_ids = runner._refresh_sample_states_from_sensor(
+            snapshot.start_date,
+            datetime.combine(snapshot.start_date, time(6, 0), tzinfo=LOCAL_TZ),
+            day_profile(),
+            sample_now=True,
+        )
+
+        self.assertEqual(sample_sensor_ids, {1})
+        self.assertEqual(runner.states[associated_pot["id"]].moisture, 47.0)
+
+    def test_sampling_chart_entries_use_forecast_calibrated_associated_pot(self) -> None:
+        snapshot = _two_pot_snapshot(sensor_moisture=35.0, nonsensor_moisture=12.0)
+        sensor_pot, associated_pot = snapshot.pots
+        for pot in snapshot.pots:
+            pot["moisture_min_pct"] = 10.0
+            pot["moisture_target_pct"] = 15.0
+            pot["winter_moisture_target_pct"] = 10.0
+        snapshot.sensor_context.update(
+            {
+                "lookup": {},
+                "future_dates": [snapshot.start_date],
+                "associations": {
+                    1: {"sensor_id": 1, "direct": True, "distance": 0.0},
+                    2: {"sensor_id": 1, "direct": False, "distance": 1.0},
+                },
+                "sensor_pots": {1: sensor_pot},
+            }
+        )
+        runner = SparseSamplingRunner(
+            start_date=snapshot.start_date,
+            end_date=snapshot.end_date,
+            sample_interval_hours=72,
+            persist=False,
+            selected_snapshot=snapshot,
+            simulation_start_date=snapshot.start_date,
+            simulation_snapshot=snapshot,
+            state_anchor_policy="baseline_warmup_reuse",
+            warmup_reuse_policy="baseline_start_state_reuse",
+        )
+        runner.states[associated_pot["id"]].moisture = 12.0
+        runner.probe_states[associated_pot["id"]].moisture = 47.0
+
+        result = runner.run()
+        chart_by_hour = {entry["hour"]: entry for entry in result["chartEntries"]}
+
+        self.assertLess(chart_by_hour["05:00"]["average_moisture"], 30.0)
+        self.assertGreater(chart_by_hour["06:00"]["average_moisture"], 38.0)
+        self.assertTrue(chart_by_hour["06:00"]["sparse_sensor_sample"])
+        self.assertEqual(chart_by_hour["06:00"]["sparse_sensor_samples"], 1)
+
+    def test_sampling_forecast_decision_slots_sync_to_baseline_reference(self) -> None:
+        snapshot = _hot_forecast_snapshot()
+        hot_sample_day = snapshot.start_date + timedelta(days=3)
+        baseline = self.engine.run_default_dt_irrigation_control(
+            snapshot.start_date,
+            snapshot.end_date,
+            snapshot=snapshot,
+            state_anchor_policy="experiment_start_sensor_anchor",
+        )
+
+        result = self.engine.run_daily_sampling_experiment(
+            snapshot.start_date,
+            snapshot.end_date,
+            sample_interval_hours=72,
+            snapshot=snapshot,
+            baseline_result=baseline,
+        )
+
+        row = {entry["date"]: entry for entry in result["entries"]}[hot_sample_day.isoformat()]
+        self.assertTrue(row["sparse_sensor_sample"])
+        self.assertEqual(row["baseline_moisture"], row["sparse_moisture"])
+        self.assertEqual(row["baseline_water_usage_l"], row["sparse_water_usage_l"])
+
     def test_fuzzy_and_anfis_first_point_uses_shared_experiment_start_state(self) -> None:
         snapshot = _snapshot()
         baseline_result = _baseline_result_for_shared_t0(snapshot, shared_moisture=37.5)
 
-        fuzzy = engine.run_daily_fuzzy_dt_experiment(
+        fuzzy = self.engine.run_daily_fuzzy_dt_experiment(
             snapshot.start_date,
             snapshot.end_date,
             snapshot=snapshot,
             baseline_result=baseline_result,
         )
-        anfis = engine.run_daily_anfis_experiment(
+        anfis = self.engine.run_daily_anfis_experiment(
             snapshot.start_date,
             snapshot.end_date,
             snapshot=snapshot,
@@ -201,7 +295,7 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
     def test_baseline_ignores_non_sensor_pot_as_decision_trigger(self) -> None:
         snapshot = _two_pot_snapshot(sensor_moisture=45.0, nonsensor_moisture=8.0)
 
-        result = engine.run_default_dt_irrigation_control(
+        result = self.engine.run_default_dt_irrigation_control(
             snapshot.start_date,
             snapshot.end_date,
             snapshot=snapshot,
@@ -216,7 +310,7 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
     def test_sensor_pot_trigger_waters_whole_valve_zone(self) -> None:
         snapshot = _two_pot_snapshot(sensor_moisture=20.0, nonsensor_moisture=45.0)
 
-        result = engine.run_default_dt_irrigation_control(
+        result = self.engine.run_default_dt_irrigation_control(
             snapshot.start_date,
             snapshot.end_date,
             snapshot=snapshot,
@@ -250,12 +344,12 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
     def test_fuzzy_and_anfis_use_sensor_pots_as_decision_inputs(self) -> None:
         snapshot = _two_pot_snapshot(sensor_moisture=45.0, nonsensor_moisture=8.0)
 
-        fuzzy = engine.run_fuzzy_dt_daily_irrigation_with_snapshot(
+        fuzzy = self.engine.run_fuzzy_dt_daily_irrigation_with_snapshot(
             snapshot.start_date,
             snapshot.end_date,
             snapshot=snapshot,
         )
-        anfis = engine.run_anfis_daily_irrigation_with_snapshot(
+        anfis = self.engine.run_anfis_daily_irrigation_with_snapshot(
             snapshot.start_date,
             snapshot.end_date,
             ANFIS(),
@@ -290,13 +384,28 @@ class StrategySensorAnchorPolicyTests(unittest.TestCase):
         self.assertEqual(control_pots[0]["sensor_threshold_override"]["moisture_target_pct"], 48.0)
 
 
+class _NoWarmupSimulationEngine(SimulationEngine):
+    def resolve_simulation_snapshot(
+        self,
+        start_date: date,
+        end_date: date,
+        selected_snapshot: ExperimentSnapshot,
+    ) -> tuple[date, ExperimentSnapshot]:
+        raise AssertionError("strategy should not resolve an independent warm-up snapshot")
+
+
+class _ExperimentStartSimulationEngine(SimulationEngine):
+    def state_simulation_start(self, start_date: date, end_date: date) -> date:
+        return start_date
+
+
 def _snapshot() -> ExperimentSnapshot:
     day = date(2026, 5, 24)
     weather_rows = [_weather_row(day, hour) for hour in range(24)]
     pot = _pot()
     sensor_reading = {
         "sensor_id": 1,
-        "source": ACTUAL_SENSOR_SOURCE,
+        "source": SensorSource.ACTUAL.value,
         "soil_moisture_pct": 24.0,
         "air_temperature_c": 22.0,
     }
@@ -331,7 +440,7 @@ def _two_pot_snapshot(sensor_moisture: float, nonsensor_moisture: float) -> Expe
     nonsensor_pot = _pot(pot_id=2, pot_code="P2")
     sensor_reading = {
         "sensor_id": 1,
-        "source": ACTUAL_SENSOR_SOURCE,
+        "source": SensorSource.ACTUAL.value,
         "soil_moisture_pct": sensor_moisture,
         "air_temperature_c": 22.0,
     }
@@ -359,6 +468,75 @@ def _two_pot_snapshot(sensor_moisture: float, nonsensor_moisture: float) -> Expe
         estimated_selected_weather_rows=0,
         estimated_lookahead_weather_rows=0,
         loaded_at=datetime.combine(day, time(0, 0), tzinfo=LOCAL_TZ),
+    )
+
+
+def _hot_forecast_snapshot() -> ExperimentSnapshot:
+    start = date(2026, 6, 22)
+    end = start + timedelta(days=4)
+    weather_rows = []
+    weather_by_day = {}
+    day_profiles = {}
+    for offset in range((end - start).days + 1):
+        day = start + timedelta(days=offset)
+        rows = []
+        for hour in range(24):
+            row = _weather_row(day, hour)
+            row["temperature_c"] = 36.0 if 8 <= hour <= 20 else 24.0
+            row["evapotranspiration_mm"] = 0.08 if 8 <= hour <= 20 else 0.02
+            rows.append(row)
+        profile = day_profile()
+        profile.update(
+            {
+                "avg_temperature_c": 32.0,
+                "max_temperature_c": 36.0,
+                "min_temperature_c": 24.0,
+                "heatwave_day": True,
+                "reference_evapotranspiration_mm": 1.2,
+            }
+        )
+        weather_rows.extend(rows)
+        weather_by_day[day] = rows
+        day_profiles[day] = profile
+
+    pots = [_pot(pot_id=1, pot_code="P1"), _pot(pot_id=2, pot_code="P2")]
+    for pot in pots:
+        pot["moisture_min_pct"] = 30.0
+        pot["moisture_target_pct"] = 42.0
+        pot["winter_moisture_target_pct"] = 16.0
+        pot["plant_type_code"] = "vegetables"
+        pot["allows_second_watering"] = True
+        pot["water_need_level"] = "high"
+        pot["sun_exposure"] = "full"
+        pot["_sun_factor"] = 1.24
+
+    sensor_context = {
+        "available": True,
+        "lookup": {},
+        "sensor_ids": [1],
+        "sensor_reading_dates": [],
+        "future_dates": [start + timedelta(days=offset) for offset in range((end - start).days + 1)],
+        "associations": {
+            1: {"sensor_id": 1, "direct": True, "distance": 0.0},
+            2: {"sensor_id": 1, "direct": False, "distance": 1.0},
+        },
+        "sensor_pots": {1: pots[0]},
+    }
+    return ExperimentSnapshot(
+        start_date=start,
+        end_date=end,
+        pot_count=2,
+        pots=pots,
+        weather_rows=weather_rows,
+        selected_weather_rows=weather_rows,
+        weather_by_day=weather_by_day,
+        day_profiles=day_profiles,
+        sensor_context=sensor_context,
+        initial_pot_states={1: PotState(moisture=26.0), 2: PotState(moisture=26.0)},
+        estimated_weather_rows=0,
+        estimated_selected_weather_rows=0,
+        estimated_lookahead_weather_rows=0,
+        loaded_at=datetime.combine(start, time(0, 0), tzinfo=LOCAL_TZ),
     )
 
 

@@ -1,27 +1,41 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import unittest
 from datetime import date
+from unittest.mock import patch
 
-import digital_twin.application.experiments.cache_keys as cache_keys
-import digital_twin.application.experiments.experiment_service as experiments
-from digital_twin.application.anfis_training.anfis_training_service import (
+from digital_twin.application.clock import ApplicationClock
+from digital_twin.application.experiments.anfis_model_service import (
     DEFAULT_ANFIS_GENERATIONS,
     DEFAULT_ANFIS_POPULATION,
     AnfisModelService,
 )
+from digital_twin.application.experiments.experiments import AnfisIrrigationExperiment
 from digital_twin.simulation.anfis.model import DEFAULT_INPUTS
 from digital_twin.simulation.anfis.modeling import ANFIS_TRAINING_DATASET_VERSION
 
 
 class AnfisModelServiceTests(unittest.TestCase):
     def test_anfis_default_training_range_uses_one_year_history(self) -> None:
-        start, end = AnfisModelService._resolve_training_range(None, date(2026, 6, 26))
+        start, end = AnfisModelService().resolve_training_range(None, date(2026, 6, 26))
+
+        self.assertEqual(start, date(2025, 6, 26))
+        self.assertEqual(end, date(2026, 6, 26))
+
+    def test_anfis_training_range_uses_injected_clock_when_weather_has_no_end_date(self) -> None:
+        service = AnfisModelService(clock=_FixedClock(date(2026, 6, 26)))
+
+        with patch(
+            "digital_twin.application.experiments.anfis_model_service.get_connection",
+            return_value=_FakeConnection(None),
+        ):
+            start, end = service.resolve_training_range(None, None)
 
         self.assertEqual(start, date(2025, 6, 26))
         self.assertEqual(end, date(2026, 6, 26))
 
     def test_anfis_staleness_detects_new_sensor_watermark(self) -> None:
+        service = AnfisModelService()
         latest = {
             "sensor_source": "simulated_sensor",
             "sensor_reading_count": 10,
@@ -45,7 +59,7 @@ class AnfisModelServiceTests(unittest.TestCase):
         }
 
         self.assertFalse(
-            AnfisModelService._needs_training(
+            service.needs_training(
                 latest,
                 {
                     "sensor_reading_count": 10,
@@ -62,7 +76,7 @@ class AnfisModelServiceTests(unittest.TestCase):
             },
         }
         self.assertTrue(
-            AnfisModelService._needs_training(
+            service.needs_training(
                 stale_dataset,
                 {
                     "sensor_reading_count": 10,
@@ -87,7 +101,7 @@ class AnfisModelServiceTests(unittest.TestCase):
             },
         }
         self.assertTrue(
-            AnfisModelService._needs_training(
+            service.needs_training(
                 stale_features,
                 {
                     "sensor_reading_count": 10,
@@ -97,7 +111,7 @@ class AnfisModelServiceTests(unittest.TestCase):
             )
         )
         self.assertTrue(
-            AnfisModelService._needs_training(
+            service.needs_training(
                 latest,
                 {
                     "sensor_reading_count": 11,
@@ -105,21 +119,21 @@ class AnfisModelServiceTests(unittest.TestCase):
                 },
                 config,
             )
-        )
+    )
 
     def test_anfis_model_key_is_selected_from_start_year(self) -> None:
-        current_year = experiments.today_local().year
+        current_year = ApplicationClock().today().year
 
         self.assertEqual(
-            cache_keys.resolve_anfis_model_key(date(current_year, 1, 1)),
+            AnfisIrrigationExperiment.resolve_model_key(date(current_year, 1, 1)),
             "anfis-default",
         )
         self.assertEqual(
-            cache_keys.resolve_anfis_model_key(date(2023, 5, 1)),
+            AnfisIrrigationExperiment.resolve_model_key(date(2023, 5, 1)),
             "anfis-2023-simulated",
         )
         self.assertEqual(
-            cache_keys.resolve_anfis_model_key(date(2025, 5, 1)),
+            AnfisIrrigationExperiment.resolve_model_key(date(2025, 5, 1)),
             "anfis-default",
         )
 
@@ -133,14 +147,38 @@ class AnfisModelServiceTests(unittest.TestCase):
             "anfis_input_features": list(DEFAULT_INPUTS),
         }
 
-        self.assertFalse(experiments._persisted_anfis_model_matches(metadata, 2026))
+        self.assertFalse(AnfisIrrigationExperiment._persisted_model_matches(metadata, 2026))
         self.assertTrue(
-            experiments._persisted_anfis_model_matches(
+            AnfisIrrigationExperiment._persisted_model_matches(
                 metadata,
                 2026,
                 strict_training_config=False,
             )
         )
+
+class _FixedClock(ApplicationClock):
+    def __init__(self, today: date) -> None:
+        self._today = today
+
+    def today(self) -> date:
+        return self._today
+
+
+class _FakeConnection:
+    def __init__(self, latest_weather_date: date | None) -> None:
+        self.latest_weather_date = latest_weather_date
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    def execute(self, _query: str):
+        return self
+
+    def fetchone(self):
+        return (self.latest_weather_date,)
 
 
 if __name__ == "__main__":

@@ -6,28 +6,43 @@ from typing import Any
 
 from psycopg.rows import dict_row
 
-from digital_twin.application.sensor_history.readings.availability import load_sensor_readings_for_experiment
-from digital_twin.application.sensor_history.readings.core import ensure_sensor_readings_for_experiment_range
-from digital_twin.domain.sensors import DEFAULT_SENSOR_SOURCE
+from digital_twin.application.sensors.availability import SensorAvailabilityService
+from digital_twin.application.sensors.maintenance import SensorReadingMaintenanceService
+from digital_twin.domain.sensor import SensorSource
 from digital_twin.infrastructure.database.connection import get_connection
-from digital_twin.simulation.soil_model import clamp, number
+from digital_twin.domain.soil import DEFAULT_SOIL_MODEL as soil
+
+_sensor_availability_service = SensorAvailabilityService()
+_sensor_reading_maintenance_service = SensorReadingMaintenanceService(_sensor_availability_service)
 
 
-def load_sensor_context(start_date: date, end_date: date, pots: list[dict[str, Any]]) -> dict[str, Any]:
+def load_sensor_context(
+    start_date: date,
+    end_date: date,
+    pots: list[dict[str, Any]],
+    availability_service: SensorAvailabilityService | None = None,
+    maintenance_service: SensorReadingMaintenanceService | None = None,
+) -> dict[str, Any]:
+    availability_service = availability_service or _sensor_availability_service
+    maintenance_service = maintenance_service or _sensor_reading_maintenance_service
     sensor_ids = [pot["id"] for pot in pots]
     try:
-        ensure_sensor_readings_for_experiment_range(start_date, end_date, source=DEFAULT_SENSOR_SOURCE)
-        sensor_context = load_sensor_readings_for_experiment(
+        maintenance_service.ensure_sensor_readings_for_experiment_range(
+            start_date,
+            end_date,
+            source=SensorSource.DEFAULT.value,
+        )
+        sensor_context = availability_service.load_sensor_readings_for_experiment(
             start_date=start_date,
             end_date=end_date,
             sensor_ids=sensor_ids,
-            source=DEFAULT_SENSOR_SOURCE,
+            source=SensorSource.DEFAULT.value,
         )
         return with_sensor_associations(sensor_context, pots)
     except Exception as exc:
         return {
             "available": False,
-            "source": DEFAULT_SENSOR_SOURCE,
+            "source": SensorSource.DEFAULT.value,
             "lookup": {},
             "mapped_dates": {},
             "sensor_reading_dates": set(),
@@ -149,10 +164,10 @@ def normalize_sensor_threshold_config(raw_config: dict[str, Any]) -> dict[str, f
     for source_key, target_key in aliases.items():
         if source_key not in raw_config:
             continue
-        value = number(raw_config.get(source_key), None)
+        value = soil.number(raw_config.get(source_key), None)
         if value is None:
             continue
-        overrides[target_key] = round(clamp(value, 0.0, 100.0), 2)
+        overrides[target_key] = round(soil.clamp(value, 0.0, 100.0), 2)
     return overrides
 
 

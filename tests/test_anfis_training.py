@@ -10,15 +10,14 @@ from digital_twin.simulation.anfis.controller import (
     serialize_trained_anfis_model,
 )
 from digital_twin.simulation.anfis.model import ANFIS, DEFAULT_INPUTS
-from digital_twin.simulation.anfis.modeling import (
-    anfis_training_signals,
-    anfis_training_target_probability,
-    generate_database_anfis_dataset,
-)
+from digital_twin.simulation.anfis.modeling import AnfisDatasetBuilder
 from digital_twin.simulation.shared.constants import LOCAL_TZ
 
 
 class AnfisTrainingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dataset_builder = AnfisDatasetBuilder()
+
     def test_default_anfis_uses_three_weather_aware_inputs(self) -> None:
         model = ANFIS()
 
@@ -32,7 +31,7 @@ class AnfisTrainingTests(unittest.TestCase):
             )
 
     def test_dry_hot_no_rain_and_recovery_reading_get_extra_weight(self) -> None:
-        signals, weight = anfis_training_signals(
+        signals, weight = self.dataset_builder.training_signals(
             _pot(),
             {"soil_moisture_pct": 39.0},
             {"max_temperature_c": 33.0, "precipitation_mm": 0.0},
@@ -46,14 +45,14 @@ class AnfisTrainingTests(unittest.TestCase):
         self.assertGreaterEqual(weight, 4.0)
 
     def test_rain_and_temperature_are_learned_through_anfis_target_probability(self) -> None:
-        dry_warm_no_rain = anfis_training_target_probability(
+        dry_warm_no_rain = self.dataset_builder.target_probability(
             {
                 "moisture": 34.0,
                 "temperature": 29.0,
                 "rain": 0.0,
             }
         )
-        same_moisture_heavy_rain = anfis_training_target_probability(
+        same_moisture_heavy_rain = self.dataset_builder.target_probability(
             {
                 "moisture": 34.0,
                 "temperature": 29.0,
@@ -103,7 +102,7 @@ class AnfisTrainingTests(unittest.TestCase):
             "evapotranspiration_mm": 0.05,
         }
 
-        dataset = generate_database_anfis_dataset(
+        dataset = self.dataset_builder.generate_database_dataset(
             [weather],
             [{**_pot(), "id": 1}],
             0,

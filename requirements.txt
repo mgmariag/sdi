@@ -1,7 +1,3 @@
-easyocr
-torch
-matplotlib
-pandas
 fastapi
-uvicorn
+uvicorn[standard]
 psycopg[binary]

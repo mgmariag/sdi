@@ -7,13 +7,16 @@ from psycopg.rows import dict_row
 
 from digital_twin.infrastructure.database.connection import get_connection
 from digital_twin.infrastructure.database.schema.lifecycle import initialize_database
-from digital_twin.simulation.soil_model import sun_factor, wind_factor
+from digital_twin.domain.soil import DEFAULT_SOIL_MODEL as soil
 from digital_twin.simulation.sensors.context import load_sensor_context
-from digital_twin.simulation.weather_model import load_weather
+from digital_twin.simulation.weather_model import SimulationWeatherRepository
 
 
 class SensingStage:
     """Loads stored pot, sensor, and weather inputs for a control-loop window."""
+
+    def __init__(self, weather_repository: SimulationWeatherRepository | None = None) -> None:
+        self.weather_repository = weather_repository or SimulationWeatherRepository()
 
     def initialize_storage(self) -> None:
         initialize_database()
@@ -48,7 +51,7 @@ class SensingStage:
         return load_sensor_context(start_date, end_date, pots)
 
     def load_weather(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
-        return load_weather(start_date, end_date)
+        return self.weather_repository.load_weather(start_date, end_date)
 
 
 def _prepare_pot_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -65,6 +68,6 @@ def _prepare_pot_row(row: dict[str, Any]) -> dict[str, Any]:
     ):
         if pot.get(field) is not None:
             pot[field] = float(pot[field])
-    pot["_sun_factor"] = sun_factor(pot)
-    pot["_wind_factor"] = wind_factor(pot)
+    pot["_sun_factor"] = soil.sun_factor(pot)
+    pot["_wind_factor"] = soil.wind_factor(pot)
     return pot

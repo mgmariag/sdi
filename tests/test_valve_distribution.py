@@ -6,6 +6,7 @@ from datetime import date
 from digital_twin.simulation.shared.types import PotState
 from digital_twin.simulation.valves.distribution import execute_valve_zone_distribution
 from digital_twin.simulation.valves.rollups import (
+    DEFAULT_VALVE_PRIORITY_POLICY,
     apply_valve_counts,
     valve_event_from_group,
 )
@@ -122,6 +123,24 @@ class ValveDistributionTests(unittest.TestCase):
         self.assertEqual(events[0]["zone_runtime_request_flow_ml_min"], 15.0)
         self.assertEqual(events[0]["zone_runtime_flow_ml_min"], 35.0)
         self.assertEqual(round(sum(delivered_by_pot.values()), 2), 200.0)
+
+    def test_valve_priority_policy_ranks_dry_high_need_pots(self) -> None:
+        pot = {
+            **_pot(1, "P1", 5.0),
+            "water_need_level": "high",
+            "heat_sensitive": True,
+            "sun_exposure": "reflected_heat",
+        }
+        decision = {
+            "current_moisture_pct": 15.0,
+            "target_moisture_pct": 35.0,
+        }
+
+        self.assertEqual(DEFAULT_VALVE_PRIORITY_POLICY.decision_priority(decision, pot), 52.0)
+        self.assertEqual(
+            DEFAULT_VALVE_PRIORITY_POLICY.event_priority({"planned_volume_ml": 300.0}, pot),
+            23.0,
+        )
 
 
 def _request_event(pot: dict, requested_volume_ml: float) -> dict:

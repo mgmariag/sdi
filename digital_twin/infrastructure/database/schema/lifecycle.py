@@ -6,10 +6,6 @@ import time
 import psycopg
 
 from digital_twin.infrastructure.database.connection import get_connection
-from digital_twin.infrastructure.database.schema.constants import (
-    DATABASE_INITIALIZATION_LOCK_ID,
-    DEFAULT_POT_COUNT,
-)
 from digital_twin.infrastructure.database.schema.ddl import (
     _schema_is_current,
     create_schema,
@@ -19,6 +15,8 @@ from digital_twin.infrastructure.database.schema.seeding import (
     seed_reference_data,
     sync_generated_pot_flow_rates,
 )
+
+DATABASE_INITIALIZATION_LOCK_ID = 2026052601
 
 _initialize_lock = threading.Lock()
 _database_initialized = False
@@ -37,7 +35,7 @@ def wait_for_database(max_attempts: int = 20, delay_seconds: float = 1.0) -> Non
     raise RuntimeError("Database did not become available") from last_error
 
 
-def initialize_database(pot_count: int = DEFAULT_POT_COUNT) -> None:
+def initialize_database(pot_count: int | None = None) -> None:
     global _database_initialized
     if _database_initialized:
         return
@@ -55,7 +53,11 @@ def initialize_database(pot_count: int = DEFAULT_POT_COUNT) -> None:
             if not _schema_is_current(conn):
                 create_schema(conn)
                 seed_reference_data(conn)
-                seed_pots(conn, target_count=pot_count)
-                sync_generated_pot_flow_rates(conn, target_count=pot_count)
+                if pot_count is None:
+                    seed_pots(conn)
+                    sync_generated_pot_flow_rates(conn)
+                else:
+                    seed_pots(conn, target_count=pot_count)
+                    sync_generated_pot_flow_rates(conn, target_count=pot_count)
                 conn.commit()
             _database_initialized = True

@@ -4,7 +4,7 @@ from contextlib import contextmanager
 
 import psycopg
 
-from digital_twin.core.config import get_settings
+from digital_twin.infrastructure.config import get_settings
 
 
 # Get the database URL from the application settings

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from digital_twin.domain.valves import VALVE_ZONE_DESIGN, VALVE_ZONE_ORDER
+from digital_twin.domain.valve import DEFAULT_VALVE_LAYOUT
 from digital_twin.infrastructure.database.repositories.overview._common import (
     SAFE_TAP_FLOW_L_MIN,
     VALVE_SWITCH_PAUSE_MIN,
@@ -233,14 +233,7 @@ def _valve_candidate(row: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _zone_design_for(zones: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
-    design = [item for item in VALVE_ZONE_DESIGN if item["zone"] in zones]
-    unknown_zones = sorted(zone for zone in zones if zone not in VALVE_ZONE_ORDER)
-    next_valve = len(VALVE_ZONE_DESIGN) + 1
-    design.extend(
-        {"valve_number": next_valve + index, "zone": zone}
-        for index, zone in enumerate(unknown_zones)
-    )
-    return design
+    return DEFAULT_VALVE_LAYOUT.design_for_zones(zones)
 
 
 def _fit_valve_schedule(

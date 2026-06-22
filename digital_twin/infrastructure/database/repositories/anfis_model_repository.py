@@ -7,18 +7,10 @@ from typing import Any
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from digital_twin.domain.sensor import SensorSource
 from digital_twin.infrastructure.database.connection import get_connection
 
 DEFAULT_MODEL_KEY = "anfis-default"
-DEFAULT_SENSOR_SOURCE = "simulated_sensor"
-ACTUAL_SENSOR_SOURCE = "actual_sensor"
-ACTUATOR_FEEDBACK_SOURCE = "actuator_feedback"
-
-
-def _query_sources(source: str | None) -> list[str]:
-    if source == DEFAULT_SENSOR_SOURCE or source is None:
-        return [DEFAULT_SENSOR_SOURCE, ACTUAL_SENSOR_SOURCE, ACTUATOR_FEEDBACK_SOURCE]
-    return [source]
 
 
 class AnfisModelRepository:
@@ -38,7 +30,7 @@ class AnfisModelRepository:
             ).fetchone()
         return _json_ready(row) if row else None
 
-    def sensor_watermark(self, source: str = DEFAULT_SENSOR_SOURCE) -> dict[str, Any]:
+    def sensor_watermark(self, source: str = SensorSource.DEFAULT.value) -> dict[str, Any]:
         with get_connection(row_factory=dict_row) as conn:
             row = conn.execute(
                 """
@@ -48,7 +40,7 @@ class AnfisModelRepository:
                 FROM sensor_readings
                 WHERE source = ANY(%(sources)s)
                 """,
-                {"sources": _query_sources(source)},
+                {"sources": SensorSource.query_values(source)},
             ).fetchone()
         return _json_ready(row or {})
 
